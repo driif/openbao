@@ -204,23 +204,47 @@ func (ns *NamespaceStore) DeleteNamespace(ctx context.Context, path string) erro
 	ns.modifyLock.Lock()
 	defer ns.modifyLock.Unlock()
 
+	// Get the current namespace from context
+	currentNS, err := namespace.FromContext(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get current namespace context: %w", err)
+	}
+
+	// Construct full path
+	fullPath := path
+	if currentNS.Path != "" {
+		fullPath = strings.TrimSuffix(currentNS.Path, "/") + "/" + path
+	}
+
 	// Namespaces are normalized to lower-case
 	path = ns.sanitizeName(path)
 	view, err := ns.getStorageView(ctx)
 	if err != nil || view == nil {
-		return fmt.Errorf("unable to get the barrier subview for namespace: %v", err)
+		return fmt.Errorf("unable to access namespace at path %q: %v", fullPath, err)
 	}
 
 	if strutil.StrListContains(immutableNamespaces, path) || strings.Contains(path, "/") {
-		return fmt.Errorf("cannot delete %q namespace", path)
+		return fmt.Errorf("namespace at path %q is protected and cannot be deleted", fullPath)
 	}
 
 	if path == namespace.RootNamespaceID {
 		return fmt.Errorf(`cannot delete "root" namespace`)
 	}
 
+	childNamespaces, err := ns.ListNamespaces(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check child namespaces for path %q: %w", fullPath, err)
+	}
+
+	for _, child := range childNamespaces {
+		if strings.HasPrefix(child, path+"/") {
+			childPath := fullPath + "/" + strings.TrimPrefix(child, path+"/")
+			return fmt.Errorf("cannot delete namespace at path %q: contains child namespace %q", fullPath, childPath)
+		}
+	}
+
 	if err := view.Delete(ctx, path); err != nil {
-		return fmt.Errorf("failed to delete namespace: %w", err)
+		return fmt.Errorf("failed to delete namespace at path %q: %w", fullPath, err)
 	}
 
 	return nil

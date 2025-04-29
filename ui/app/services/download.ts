@@ -9,6 +9,7 @@ import timestamp from 'core/utils/timestamp';
 interface Extensions {
   csv: string;
   hcl: string;
+  sentinel: string;
   json: string;
   pem: string;
   txt: string;
@@ -18,6 +19,7 @@ interface Extensions {
 const EXTENSION_TO_MIME: Extensions = {
   csv: 'txt/csv',
   hcl: 'text/plain',
+  sentinel: 'text/plain',
   json: 'application/json',
   pem: 'application/x-pem-file',
   txt: 'text/plain',
@@ -26,9 +28,9 @@ const EXTENSION_TO_MIME: Extensions = {
 export default class DownloadService extends Service {
   download(filename: string, content: string, extension: string) {
     // replace spaces with hyphens, append extension to filename
-    const formattedFilename = filename
-      ? `${filename.replace(/\s+/g, '-')}.${extension}`
-      : `vault-data-${timestamp.now().toISOString()}.${extension}`;
+    const formattedFilename =
+      `${filename?.replace(/\s+/g, '-')}.${extension}` ||
+      `vault-data-${timestamp.now().toISOString()}.${extension}`;
 
     // map extension to MIME type or use default
     const mimetype = EXTENSION_TO_MIME[extension as keyof Extensions] || 'text/plain';

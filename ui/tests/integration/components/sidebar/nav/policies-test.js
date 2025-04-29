@@ -23,7 +23,12 @@ module('Integration | Component | sidebar-nav-policies', function (hooks) {
   });
 
   test('it should render nav headings and links', async function (assert) {
-    const links = ['Back to main navigation', 'ACL Policies'];
+    const links = [
+      'Back to main navigation',
+      'ACL Policies',
+      'Role-Governing Policies',
+      'Endpoint Governing Policies',
+    ];
     stubFeaturesAndPermissions(this.owner);
     await renderComponent();
 

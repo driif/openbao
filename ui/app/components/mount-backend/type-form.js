@@ -6,7 +6,7 @@
 import Component from '@glimmer/component';
 import { inject as service } from '@ember/service';
 import { methods } from 'vault/helpers/mountable-auth-methods';
-import { mountableEngines } from 'vault/helpers/mountable-secret-engines';
+import { allEngines, mountableEngines } from 'vault/helpers/mountable-secret-engines';
 import { tracked } from '@glimmer/tracking';
 
 /**
@@ -28,7 +28,7 @@ export default class MountBackendTypeForm extends Component {
   @tracked selection;
 
   get secretEngines() {
-    return mountableEngines();
+    return this.version.isEnterprise ? allEngines() : mountableEngines();
   }
 
   get mountTypes() {

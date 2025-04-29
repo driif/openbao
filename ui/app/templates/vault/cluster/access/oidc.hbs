@@ -8,14 +8,16 @@
   </PageHeader>
   <div class="box is-fullwidth is-sideless is-flex-between is-shadowless is-marginless" data-test-oidc-header>
     <p>
-      Configure OpenBao to act as an OIDC identity provider, and offer
-      {{"OpenBao’s"}}
+      Configure Vault to act as an OIDC identity provider, and offer
+      {{"Vault’s"}}
       various authentication
       {{#if this.isCta}}
         <br />
       {{/if}}
       methods and source of identity to any client applications.
-      {{! TODO Add a link to a tutorial for 'auth-methods/oidc-identity-provider' }}
+      <DocLink @path="/vault/tutorials/auth-methods/oidc-identity-provider">
+        Learn more
+      </DocLink>
     </p>
     {{#if this.isCta}}
       <button

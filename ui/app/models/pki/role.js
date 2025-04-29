@@ -112,7 +112,7 @@ export default class PkiRoleModel extends Model {
   @attr({
     label: 'Backdate validity',
     detailsLabel: 'Issued certificate backdating',
-    helperTextDisabled: 'OpenBao will use the default value, 30s',
+    helperTextDisabled: 'Vault will use the default value, 30s',
     helperTextEnabled:
       'Also called the not_before_duration property. Allows certificates to be valid for a certain time period before now. This is useful to correct clock misalignment on various systems when setting up your CA.',
     editType: 'ttl',
@@ -132,9 +132,9 @@ export default class PkiRoleModel extends Model {
   @attr('boolean', {
     label: 'Generate lease with certificate',
     subText:
-      'Specifies if certificates issued/signed against this role will have OpenBao leases attached to them.',
+      'Specifies if certificates issued/signed against this role will have Vault leases attached to them.',
     editType: 'boolean',
-    docLink: '/api-docs/secret/pki#create-update-role',
+    docLink: '/vault/api-docs/secret/pki#create-update-role',
   })
   generateLease;
 
@@ -144,7 +144,7 @@ export default class PkiRoleModel extends Model {
     subText:
       'This can improve performance when issuing large numbers of certificates. However, certificates issued in this way cannot be enumerated or revoked.',
     editType: 'boolean',
-    docLink: '/api-docs/secret/pki#create-update-role',
+    docLink: '/vault/api-docs/secret/pki#create-update-role',
   })
   noStore;
 
@@ -216,7 +216,7 @@ export default class PkiRoleModel extends Model {
     label: 'URI Subject Alternative Names (URI SANs)',
     subText: 'Defines allowed URI Subject Alternative Names.',
     editType: 'stringArray',
-    docLink: '/docs/concepts/policies',
+    docLink: '/vault/docs/concepts/policies',
   })
   allowedUriSans;
 
@@ -224,7 +224,7 @@ export default class PkiRoleModel extends Model {
     label: 'Allow URI SANs template',
     subText: 'If true, the URI SANs above may contain templates, as with ACL Path Templating.',
     editType: 'boolean',
-    docLink: '/docs/concepts/policies',
+    docLink: '/vault/docs/concepts/policies',
   })
   allowUriSansTemplate;
 
@@ -337,7 +337,7 @@ export default class PkiRoleModel extends Model {
         footer: {
           text: 'These options can interact intricately with one another. For more information,',
           docText: 'learn more here.',
-          docLink: '/api-docs/secret/pki#allowed_domains',
+          docLink: '/vault/api-docs/secret/pki#allowed_domains',
         },
       },
       'Key parameters': {
@@ -347,12 +347,12 @@ export default class PkiRoleModel extends Model {
       },
       'Subject Alternative Name (SAN) Options': {
         header: {
-          text: `Subject Alternative Names (SANs) are identities (domains, IP addresses, and URIs) OpenBao attaches to the requested certificates.`,
+          text: `Subject Alternative Names (SANs) are identities (domains, IP addresses, and URIs) Vault attaches to the requested certificates.`,
         },
       },
       'Additional subject fields': {
         header: {
-          text: `Additional identity metadata OpenBao can attach to the requested certificates.`,
+          text: `Additional identity metadata Vault can attach to the requested certificates.`,
         },
       },
     };

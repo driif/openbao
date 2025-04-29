@@ -31,6 +31,14 @@ const SUPPORTED_AUTH_BACKENDS = [
     formAttributes: ['username', 'password'],
   },
   {
+    type: 'okta',
+    typeDisplay: 'Okta',
+    description: 'Authenticate with your Okta username and password.',
+    tokenPath: 'client_token',
+    displayNamePath: 'metadata.username',
+    formAttributes: ['username', 'password'],
+  },
+  {
     type: 'jwt',
     typeDisplay: 'JWT',
     description: 'Authenticate using JWT or OIDC provider.',
@@ -53,6 +61,14 @@ const SUPPORTED_AUTH_BACKENDS = [
     tokenPath: 'client_token',
     displayNamePath: 'metadata.username',
     formAttributes: ['username', 'password'],
+  },
+  {
+    type: 'github',
+    typeDisplay: 'GitHub',
+    description: 'GitHub authentication.',
+    tokenPath: 'client_token',
+    displayNamePath: ['metadata.org', 'metadata.username'],
+    formAttributes: ['token'],
   },
 ];
 

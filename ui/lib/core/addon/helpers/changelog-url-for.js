@@ -19,10 +19,10 @@ etc.
 */
 
 export function changelogUrlFor([version]) {
-  const url = 'https://www.github.com/openbao/openbao/blob/main/CHANGELOG.md#';
+  const url = 'https://www.github.com/hashicorp/vault/blob/main/CHANGELOG.md#';
   if (!version) return url;
   try {
-    // strip the '+something' from versions and remove periods
+    // strip the '+prem' from enterprise versions and remove periods
     const versionNumber = version.split('+')[0].split('.').join('');
 
     // only recent versions have a predictable url

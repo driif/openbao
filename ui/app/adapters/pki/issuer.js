@@ -46,7 +46,7 @@ export default class PkiIssuerAdapter extends ApplicationAdapter {
         isRoot,
         parsedCertificate: { common_name: parsedCertificate.common_name },
       };
-    } catch {
+    } catch (e) {
       return { ...keyInfo, issuer_id: id };
     }
   }

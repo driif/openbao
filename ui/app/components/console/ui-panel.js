@@ -67,7 +67,7 @@ export default Component.extend({
     // parse to verify it's valid
     try {
       serviceArgs = parseCommand(command);
-    } catch {
+    } catch (e) {
       if (shouldThrow) {
         this.logAndOutput(command, { type: 'help' });
       }
@@ -102,7 +102,7 @@ export default Component.extend({
       this.store.clearAllDatasets();
       yield this.router.transitionTo(currentRoute);
       this.logAndOutput(null, { type: 'success', content: 'The current screen has been refreshed!' });
-    } catch {
+    } catch (error) {
       this.logAndOutput(null, { type: 'error', content: 'The was a problem refreshing the current screen.' });
     }
   }),
@@ -110,9 +110,9 @@ export default Component.extend({
   routeToExplore: task(function* (command) {
     const filter = command.replace('api', '').trim();
     let content =
-      'Welcome to the OpenBao API explorer! \nYou can search for endpoints, see what parameters they accept, and even execute requests with your current token.';
+      'Welcome to the Vault API explorer! \nYou can search for endpoints, see what parameters they accept, and even execute requests with your current token.';
     if (filter) {
-      content = `Welcome to the OpenBao API explorer! \nWe've filtered the list of endpoints for '${filter}'.`;
+      content = `Welcome to the Vault API explorer! \nWe've filtered the list of endpoints for '${filter}'.`;
     }
     try {
       yield this.router.transitionTo('vault.cluster.open-api-explorer.index', {

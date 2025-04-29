@@ -16,6 +16,9 @@
 @import './utils/mixins';
 @import './utils/animations';
 
+// Open-api styling
+@import './utils/swagger';
+
 // Core Styles: each file styles a class that is not associated with a component. Ex: box and not box-label.
 @import './core/alert-banner';
 @import './core/box';
@@ -70,17 +73,17 @@
 @import './components/features-selection';
 @import './components/form-section';
 @import './components/global-flash';
-@import './components/header';
 @import './components/hover-copy-button';
 @import './components/icon';
 @import './components/init-illustration';
 @import './components/info-table-row';
+@import './components/kmip-role-edit';
 @import './components/known-secondaries-card.scss';
+@import './components/license-banners';
 @import './components/linkable-item';
 @import './components/linked-block';
 @import './components/list-item-row';
 @import './components/list-pagination';
-@import './components/logo-edition';
 @import './components/loader';
 @import './components/login-form';
 @import './components/masked-input';
@@ -95,6 +98,11 @@
 @import './components/raft-join';
 @import './components/read-more';
 @import './components/regex-validator';
+@import './components/replication-dashboard';
+@import './components/replication-mode-summary';
+@import './components/replication-page';
+@import './components/replication-primary-card';
+@import './components/replication-summary';
 @import './components/role-item';
 @import './components/search-select';
 @import './components/selectable-card';
@@ -111,10 +119,11 @@
 @import './components/token-expire-warning';
 @import './components/toolbar';
 @import './components/tool-tip';
+@import './components/transform-edit';
 @import './components/transit-card';
 @import './components/ttl-picker';
 @import './components/unseal-warning';
 // @import './components/ui-wizard'; // remove, see PR https://github.com/hashicorp/vault/pull/19220
-@import './components/openbao-loading';
+@import './components/vault-loading';
 @import './components/vlt-radio';
 @import './components/vlt-table';

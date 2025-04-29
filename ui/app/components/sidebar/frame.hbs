@@ -4,8 +4,8 @@
       <:header>
         <Hds::SideNav::Header>
           <:logo>
-            <Sidebar::Header::HomeLink
-              @icon="openbao"
+            <Hds::SideNav::Header::HomeLink
+              @icon="vault"
               @route="vault.cluster"
               @model={{this.currentCluster.cluster.name}}
               @ariaLabel="home link"
@@ -14,7 +14,6 @@
           </:logo>
           <:actions>
             <Hds::SideNav::Header::IconButton
-              class="sidebar-button"
               @icon="terminal-screen"
               @ariaLabel="Console toggle"
               data-test-console-toggle
@@ -29,11 +28,21 @@
       <:body>
         <Hds::SideNav::Portal::Target aria-label="sidebar navigation links" />
       </:body>
+
+      <:footer>
+        {{#if (has-feature "Namespaces")}}
+          <NamespacePicker
+            @namespace={{this.clusterController.namespaceQueryParam}}
+            class="hds-side-nav-hide-when-minimized"
+          />
+        {{/if}}
+      </:footer>
     </Hds::SideNav>
   </Frame.Sidebar>
   <Frame.Main id="app-main-content" class={{if this.console.isOpen "main--console-open"}}>
     {{! outlet for app content }}
     <div id="modal-wormhole"></div>
+    <LinkStatus @status={{this.currentCluster.cluster.hcpLinkStatus}} />
     {{yield}}
     <div data-test-console-panel class={{if this.console.isOpen "panel-open"}}>
       <Console::UiPanel @isFullscreen={{this.consoleFullscreen}} />

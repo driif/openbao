@@ -26,7 +26,7 @@ module('Acceptance | settings', function (hooks) {
   });
 
   test('settings', async function (assert) {
-    const type = 'pki';
+    const type = 'consul';
     const path = `settings-path-${this.uid}`;
 
     // mount unsupported backend
@@ -49,13 +49,7 @@ module('Acceptance | settings', function (hooks) {
       `Successfully mounted '${type}' at '${path}'!`
     );
     await settled();
-    assert.strictEqual(
-      currentURL(),
-      `/vault/secrets/${path}/pki/overview`,
-      'redirects to secrets settings page'
-    );
-    await backendListPage.visit();
-    await settled();
+    assert.strictEqual(currentURL(), `/vault/secrets`, 'redirects to secrets page');
     const row = backendListPage.rows.filterBy('path', path + '/')[0];
     await row.menu();
     await backendListPage.configLink();

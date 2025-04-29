@@ -45,7 +45,7 @@ export default class PagePkiIssuerRotateRootComponent extends Component<Args> {
         key: RADIO_BUTTON_KEY.oldSettings,
         icon: 'certificate',
         label: 'Use old root settings',
-        description: `Provide only a new common name and issuer name, using the old root’s settings. Selecting this option generates a root with OpenBao-internal key material.`,
+        description: `Provide only a new common name and issuer name, using the old root’s settings. Selecting this option generates a root with Vault-internal key material.`,
       },
       {
         key: RADIO_BUTTON_KEY.customizeNew,
@@ -103,15 +103,15 @@ export default class PagePkiIssuerRotateRootComponent extends Component<Args> {
     const endpoint = `/v1/${this.secretMountPath.currentPath}/issuer/${this.args.newRootModel.issuerId}/${format}`;
     const adapter = this.store.adapterFor('application');
     try {
-      return adapter.rawRequest(endpoint, 'GET', { unauthenticated: true }).then(function (
-        response: Response
-      ) {
-        if (format === 'der') {
-          return response.blob();
-        }
-        return response.text();
-      });
-    } catch {
+      return adapter
+        .rawRequest(endpoint, 'GET', { unauthenticated: true })
+        .then(function (response: Response) {
+          if (format === 'der') {
+            return response.blob();
+          }
+          return response.text();
+        });
+    } catch (e) {
       return null;
     }
   }

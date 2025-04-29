@@ -3,7 +3,9 @@
 </div>
 {{#if this.featureComponent}}
   {{#component
-    (if this.shouldRender this.tutorialComponent) onAdvance=(action "advanceWizard") onDismiss=(action "dismissWizard")
+    (if this.shouldRender this.tutorialComponent)
+    onAdvance=(action "advanceWizard")
+    onDismiss=(action "dismissWizard")
   }}
     {{component
       this.featureComponent

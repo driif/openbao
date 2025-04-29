@@ -27,6 +27,8 @@
       Edit
       {{lowercase (humanize @model.identityType)}}
     </LinkTo>
-    {{! TODO Add a link to a tutorial for 'auth-methods/identity' }}
+    <DocLink @path="/vault/tutorials/auth-methods/identity">
+      Learn more
+    </DocLink>
   </EmptyState>
 {{/each-in}}

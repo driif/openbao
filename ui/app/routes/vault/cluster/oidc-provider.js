@@ -85,7 +85,7 @@ export default class VaultClusterOidcProviderRoute extends Route {
         }
       });
       return url;
-    } catch {
+    } catch (e) {
       console.debug('DEBUG: parsing url failed for', urlString); // eslint-disable-line
       throw new Error('Invalid URL');
     }
@@ -94,17 +94,17 @@ export default class VaultClusterOidcProviderRoute extends Route {
   _handleSuccess(response, baseUrl, state) {
     const { code } = response;
     const redirectUrl = this._buildUrl(baseUrl, { code, state });
-    if (!Ember.testing) {
-      this.win.location.replace(redirectUrl);
+    if (Ember.testing) {
+      return { redirectUrl };
     }
-    return { redirectUrl };
+    this.win.location.replace(redirectUrl);
   }
   _handleError(errorResp, baseUrl) {
     const redirectUrl = this._buildUrl(baseUrl, { ...errorResp });
-    if (!Ember.testing) {
-      this.win.location.replace(redirectUrl);
+    if (Ember.testing) {
+      return { redirectUrl };
     }
-    return { redirectUrl };
+    this.win.location.replace(redirectUrl);
   }
 
   /**

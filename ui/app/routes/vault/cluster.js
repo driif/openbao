@@ -57,7 +57,7 @@ export default Route.extend(ModelBoundaryRoute, ClusterRoute, {
     const managedRoot = this.featureFlagService.managedNamespaceRoot;
     if (managedRoot && this.version.isOSS) {
       // eslint-disable-next-line no-console
-      console.error('Cannot use Cloud Admin Namespace flag with OpenBao');
+      console.error('Cannot use Cloud Admin Namespace flag with OSS Vault');
     }
     if (!namespace && currentTokenName && !Ember.testing) {
       // if no namespace queryParam and user authenticated,
@@ -107,7 +107,7 @@ export default Route.extend(ModelBoundaryRoute, ClusterRoute, {
         /* eslint-disable-next-line ember/no-controller-access-in-routes */
         yield this.controller.model.reload();
         yield this.transitionToTargetRoute();
-      } catch {
+      } catch (e) {
         // we want to keep polling here
       }
     }

@@ -57,7 +57,7 @@ export default Service.extend({
           return fullNS.replace(/\/$/, '');
         })
       );
-    } catch {
+    } catch (e) {
       //do nothing here
     }
   }).drop(),

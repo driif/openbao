@@ -12,6 +12,7 @@ import kms from './kms';
 import mfaConfig from './mfa-config';
 import mfaLogin from './mfa-login';
 import oidcConfig from './oidc-config';
+import hcpLink from './hcp-link';
 import kubernetes from './kubernetes';
 
-export { base, clients, db, kms, mfaConfig, mfaLogin, oidcConfig, kubernetes };
+export { base, clients, db, kms, mfaConfig, mfaLogin, oidcConfig, hcpLink, kubernetes };

@@ -45,6 +45,7 @@ export default class TtlPickerComponent extends Component {
   @tracked recalculateSeconds = false;
   @tracked time = ''; // if defaultValue is NOT set, then do not display a defaultValue.
   @tracked unit = 's';
+  @tracked recalculateSeconds = false;
   @tracked errorMessage = '';
 
   /* Used internally */
@@ -86,7 +87,7 @@ export default class TtlPickerComponent extends Component {
     } else {
       try {
         seconds = Duration.parse(initialValue).seconds();
-      } catch {
+      } catch (e) {
         // if parsing fails leave it empty
         return;
       }

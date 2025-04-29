@@ -63,7 +63,7 @@ export default Component.extend({
 
       try {
         yield model.save();
-      } catch {
+      } catch (err) {
         // err will display via model state
         return;
       }

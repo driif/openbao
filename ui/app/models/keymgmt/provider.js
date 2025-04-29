@@ -48,8 +48,7 @@ export default class KeymgmtProviderModel extends Model {
   @attr('string') backend;
   @attr('string', {
     label: 'Provider name',
-    subText:
-      'This is the name of the provider that will be displayed in OpenBao. This cannot be edited later.',
+    subText: 'This is the name of the provider that will be displayed in Vault. This cannot be edited later.',
   })
   name;
 
@@ -94,8 +93,8 @@ export default class KeymgmtProviderModel extends Model {
     const value = l
       ? `${l} ${l > 1 ? 'keys' : 'key'}`
       : this.canListKeys
-        ? 'None'
-        : 'You do not have permission to list keys';
+      ? 'None'
+      : 'You do not have permission to list keys';
     attrs.push({ hasBlock: true, isLink: l, label: 'Keys', value });
     return attrs;
   }

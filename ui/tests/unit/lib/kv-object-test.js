@@ -47,7 +47,7 @@ module('Unit | Lib | kv object', function () {
       () => {
         KVObject.create({ content: [] }).fromJSON(input);
       },
-      /OpenBao expects data to be formatted as an JSON object/,
+      /Vault expects data to be formatted as an JSON object/,
       'throws when non-object input is used to construct the KVObject'
     );
   });

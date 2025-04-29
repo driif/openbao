@@ -34,14 +34,16 @@ const mount = async () => {
   return path;
 };
 
-const newConnection = async (backend, plugin = 'mysql-database-plugin') => {
+const newConnection = async (
+  backend,
+  plugin = 'mongodb-database-plugin',
+  connectionUrl = `mongodb://127.0.0.1:4321/${name}`
+) => {
   const name = `connection-${Date.now()}`;
   await connectionPage.visitCreate({ backend });
   await connectionPage.dbPlugin(plugin);
   await connectionPage.name(name);
-  await connectionPage.connectionUrl(`{{username}}:{{password}}@tcp(127.0.0.1:3306)/${name}`);
-  await connectionPage.username('user');
-  await connectionPage.password('so-secure');
+  await connectionPage.connectionUrl(connectionUrl);
   await connectionPage.toggleVerify();
   await connectionPage.save();
   await connectionPage.enable();
@@ -49,6 +51,61 @@ const newConnection = async (backend, plugin = 'mysql-database-plugin') => {
 };
 
 const connectionTests = [
+  {
+    name: 'elasticsearch-connection',
+    plugin: 'elasticsearch-database-plugin',
+    elasticUser: 'username',
+    elasticPassword: 'password',
+    url: 'http://127.0.0.1:9200',
+    requiredFields: async (assert, name) => {
+      assert.dom('[data-test-input="username"]').exists(`Username field exists for ${name}`);
+      assert.dom('[data-test-input="password"]').exists(`Password field exists for ${name}`);
+      assert.dom('[data-test-input="ca_cert"]').exists(`CA certificate field exists for ${name}`);
+      assert.dom('[data-test-input="ca_path"]').exists(`CA path field exists for ${name}`);
+      assert.dom('[data-test-input="client_cert"]').exists(`Client certificate field exists for ${name}`);
+      assert.dom('[data-test-input="client_key"]').exists(`Client key field exists for ${name}`);
+      assert.dom('[data-test-input="tls_server_name"]').exists(`TLS server name field exists for ${name}`);
+      assert.dom('[data-test-input="insecure"]').exists(`Insecure checkbox exists for ${name}`);
+      assert
+        .dom('[data-test-toggle-input="show-username_template"]')
+        .exists(`Username template toggle exists for ${name}`);
+    },
+  },
+  {
+    name: 'mongodb-connection',
+    plugin: 'mongodb-database-plugin',
+    url: `mongodb://127.0.0.1:4321/test`,
+    requiredFields: async (assert, name) => {
+      assert.dom('[data-test-input="username"]').exists(`Username field exists for ${name}`);
+      assert.dom('[data-test-input="password"]').exists(`Password field exists for ${name}`);
+      assert.dom('[data-test-input="write_concern"]').exists(`Write concern field exists for ${name}`);
+      assert.dom('[data-test-toggle-group="TLS options"]').exists('TLS options toggle exists');
+      assert
+        .dom('[data-test-input="root_rotation_statements"]')
+        .exists(`Root rotation statements exists for ${name}`);
+    },
+  },
+  {
+    name: 'mssql-connection',
+    plugin: 'mssql-database-plugin',
+    url: `mssql://127.0.0.1:4321/test`,
+    requiredFields: async (assert, name) => {
+      assert.dom('[data-test-input="username"]').exists(`Username field exists for ${name}`);
+      assert.dom('[data-test-input="password"]').exists(`Password field exists for ${name}`);
+      assert
+        .dom('[data-test-input="max_open_connections"]')
+        .exists(`Max open connections exists for ${name}`);
+      assert
+        .dom('[data-test-input="max_idle_connections"]')
+        .exists(`Max idle connections exists for ${name}`);
+      assert
+        .dom('[data-test-input="max_connection_lifetime"]')
+        .exists(`Max connection lifetime exists for ${name}`);
+      assert
+        .dom('[data-test-input="root_rotation_statements"]')
+        .exists(`Root rotation statements exists for ${name}`);
+    },
+  },
   {
     name: 'mysql-connection',
     plugin: 'mysql-database-plugin',
@@ -161,6 +218,34 @@ const connectionTests = [
         .exists(`Username template toggle exists for ${name}`);
     },
   },
+  // keep oracle as last DB because it is skipped in some tests (line 285) the UI doesn't return to empty state after
+  {
+    name: 'oracle-connection',
+    plugin: 'vault-plugin-database-oracle',
+    url: `{{username}}/{{password}}@localhost:1521/OraDoc.localhost`,
+    requiredFields: async (assert, name) => {
+      assert.dom('[data-test-input="username"]').exists(`Username field exists for ${name}`);
+      assert.dom('[data-test-input="password"]').exists(`Password field exists for ${name}`);
+      assert
+        .dom('[data-test-input="max_open_connections"]')
+        .exists(`Max open connections exists for ${name}`);
+      assert
+        .dom('[data-test-input="max_idle_connections"]')
+        .exists(`Max idle connections exists for ${name}`);
+      assert
+        .dom('[data-test-input="max_connection_lifetime"]')
+        .exists(`Max connection lifetime exists for ${name}`);
+      assert
+        .dom('[data-test-input="root_rotation_statements"]')
+        .exists(`Root rotation statements exists for ${name}`);
+      assert
+        .dom('[data-test-alert-banner="alert"]')
+        .hasTextContaining(
+          `Warning Please ensure that your Oracle plugin has the default name of vault-plugin-database-oracle. Custom naming is not supported in the UI at this time. If the plugin is already named vault-plugin-database-oracle, disregard this warning.`,
+          'warning banner displays about connections with SSL.'
+        );
+    },
+  },
 ];
 
 module('Acceptance | secrets/database/*', function (hooks) {
@@ -194,7 +279,7 @@ module('Acceptance | secrets/database/*', function (hooks) {
   });
 
   test('Connection create and edit form for each plugin', async function (assert) {
-    assert.expect(95);
+    assert.expect(161);
     const backend = await mount();
     for (const testCase of connectionTests) {
       await connectionPage.visitCreate({ backend });
@@ -205,7 +290,18 @@ module('Acceptance | secrets/database/*', function (hooks) {
       await connectionPage.dbPlugin(testCase.plugin);
       assert.dom('[data-test-empty-state]').doesNotExist('Empty state goes away after plugin selected');
       await connectionPage.name(testCase.name);
-      await connectionPage.connectionUrl(testCase.url);
+      if (testCase.plugin === 'elasticsearch-database-plugin') {
+        await connectionPage.url(testCase.url);
+        await connectionPage.username(testCase.elasticUser);
+        await connectionPage.password(testCase.elasticPassword);
+      } else {
+        await connectionPage.connectionUrl(testCase.url);
+      }
+      // skip adding oracle db connection since plugin doesn't exist
+      if (testCase.plugin === 'vault-plugin-database-oracle') {
+        testCase.requiredFields(assert, testCase.name);
+        continue;
+      }
       testCase.requiredFields(assert, testCase.name);
       await connectionPage.toggleVerify();
       await connectionPage.save();
@@ -247,17 +343,14 @@ module('Acceptance | secrets/database/*', function (hooks) {
   test('Can create and delete a connection', async function (assert) {
     const backend = await mount();
     const connectionDetails = {
-      plugin: 'mysql-database-plugin',
+      plugin: 'mongodb-database-plugin',
       id: 'horses-db',
       fields: [
         { label: 'Connection name', name: 'name', value: 'horses-db' },
-        {
-          label: 'Connection URL',
-          name: 'connection_url',
-          value: '{{username}}:{{password}}@tcp(127.0.0.1:3306)/',
-        },
+        { label: 'Connection URL', name: 'connection_url', value: 'mongodb://127.0.0.1:235/horses' },
         { label: 'Username', name: 'username', value: 'user', hideOnShow: true },
         { label: 'Password', name: 'password', password: 'so-secure', hideOnShow: true },
+        { label: 'Write concern', name: 'write_concern' },
       ],
     };
     assert.strictEqual(
@@ -371,6 +464,19 @@ module('Acceptance | secrets/database/*', function (hooks) {
     // confirm get credentials card is an option to select. Regression bug.
     await typeIn('.ember-text-field', 'blah');
     assert.dom('[data-test-get-credentials]').isEnabled();
+  });
+
+  test('connection_url must be decoded', async function (assert) {
+    const backend = await mount();
+    const connection = await newConnection(
+      backend,
+      'mongodb-database-plugin',
+      '{{username}}/{{password}}@oracle-xe:1521/XEPDB1'
+    );
+    await connectionPage.visitShow({ backend, id: connection });
+    assert
+      .dom('[data-test-row-value="Connection URL"]')
+      .hasText('{{username}}/{{password}}@oracle-xe:1521/XEPDB1');
   });
 
   test('Role create form', async function (assert) {

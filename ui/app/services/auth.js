@@ -57,10 +57,10 @@ export default Service.extend({
   isActiveSession: computed(
     'router.currentRouteName',
     'currentToken',
-    'activeCluster.{needsInit,sealed,name}',
+    'activeCluster.{dr.isSecondary,needsInit,sealed,name}',
     function () {
       if (this.activeCluster) {
-        if (this.activeCluster.needsInit || this.activeCluster.sealed) {
+        if (this.activeCluster.dr?.isSecondary || this.activeCluster.needsInit || this.activeCluster.sealed) {
           return false;
         }
         if (

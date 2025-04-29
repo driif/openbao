@@ -14,7 +14,7 @@ export default Route.extend(UnloadModelRoute, UnsavedModelRoute, {
 
   model() {
     const policyType = this.policyType();
-    if (policyType !== 'acl') {
+    if (!this.version.hasSentinel && policyType !== 'acl') {
       return this.transitionTo('vault.cluster.policies', policyType);
     }
     return this.store.createRecord(`policy/${policyType}`, {});

@@ -88,7 +88,7 @@ module('Acceptance | auth backend list', function (hooks) {
   });
 
   test('auth methods are linkable and link to correct view', async function (assert) {
-    assert.expect(12);
+    assert.expect(16);
     const uid = uuidv4();
     await visit('/vault/access');
 
@@ -113,7 +113,7 @@ module('Acceptance | auth backend list', function (hooks) {
         assert.dom('[data-test-doc-link] .doc-link').exists(`includes doc link for ${type} auth method`);
       } else {
         let expectedTabs = 2;
-        if (type == 'ldap') {
+        if (type == 'ldap' || type === 'okta') {
           expectedTabs = 3;
         }
         assert
@@ -123,5 +123,21 @@ module('Acceptance | auth backend list', function (hooks) {
         await consoleComponent.runCommands(`delete sys/auth/${path}`);
       }
     }
+  });
+
+  test('enterprise: token config within namespace', async function (assert) {
+    const ns = 'ns-wxyz';
+    await consoleComponent.runCommands(`write sys/namespaces/${ns} -f`);
+    await authPage.loginNs(ns);
+    // go directly to token configure route
+    await visit('/vault/settings/auth/configure/token/options');
+    await fillIn('[data-test-input="description"]', 'My custom description');
+    await click('[data-test-save-config="true"]');
+    assert.strictEqual(currentURL(), '/vault/access', 'successfully saves and navigates away');
+    await click('[data-test-auth-backend-link="token"]');
+    assert
+      .dom('[data-test-row-value="Description"]')
+      .hasText('My custom description', 'description was saved');
+    await consoleComponent.runCommands(`delete sys/namespaces/${ns}`);
   });
 });

@@ -1,9 +1,14 @@
-{{#if (or (eq this.policyType "acl"))}}
+{{#if (or (eq this.policyType "acl") (has-feature "Sentinel"))}}
   <PageHeader as |p|>
     <p.levelLeft>
       <h1 class="title is-3">
         {{uppercase this.policyType}}
         Policies
+        {{#if (not-eq this.policyType "acl")}}
+          <span class="tag" aria-label="Enforcement level: {{this.model.enforcementLevel}}">
+            Sentinel
+          </span>
+        {{/if}}
       </h1>
     </p.levelLeft>
   </PageHeader>
@@ -58,7 +63,7 @@
             <p class="help has-text-grey">
               The
               <code>root</code>
-              policy does not contain any rules but can do anything within OpenBao. It should be used with extreme care.
+              policy does not contain any rules but can do anything within Vault. It should be used with extreme care.
             </p>
           </div>
         </div>
@@ -161,7 +166,12 @@
         policy
         <Chevron />
       </LinkTo>
-      {{! TODO Add a link to a tutorial for 'getting-started/getting-started-policies' }}
+      <DocLink @path="/vault/tutorials/getting-started/getting-started-policies">
+        Learn more
+        <Chevron />
+      </DocLink>
     </EmptyState>
   {{/if}}
+{{else}}
+  <UpgradePage @title="Sentinel" @minimumEdition="Vault Enterprise Premium" />
 {{/if}}

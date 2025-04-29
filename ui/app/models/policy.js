@@ -26,7 +26,7 @@ export default Model.extend({
       if (parsed) {
         isJSON = true;
       }
-    } catch {
+    } catch (e) {
       // can't parse JSON
       isJSON = false;
     }

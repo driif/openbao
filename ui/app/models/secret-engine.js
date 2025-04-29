@@ -43,6 +43,19 @@ export default class SecretEngineModel extends Model {
   description;
   @belongsTo('mount-config', { async: false, inverse: null }) config;
 
+  // Enterprise options (still available on OSS)
+  @attr('boolean', {
+    helpText:
+      'When Replication is enabled, a local mount will not be replicated across clusters. This can only be specified at mount time.',
+  })
+  local;
+  @attr('boolean', {
+    helpText:
+      'When enabled - if a seal supporting seal wrapping is specified in the configuration, all critical security parameters (CSPs) in this backend will be seal wrapped. (For K/V mounts, all values will be seal wrapped.) This can only be specified at mount time.',
+  })
+  sealWrap;
+  @attr('boolean') externalEntropyAccess;
+
   // options.version
   @attr('number', {
     label: 'Version',
@@ -74,7 +87,7 @@ export default class SecretEngineModel extends Model {
     defaultValue: 0,
     label: 'Maximum number of versions',
     subText:
-      'The number of versions to keep per key. Once the number of keys exceeds the maximum number set here, the oldest version will be permanently deleted. This value applies to all keys, but a key’s metadata settings can overwrite this value. When 0 is used or the value is unset, OpenBao will keep 10 versions.',
+      'The number of versions to keep per key. Once the number of keys exceeds the maximum number set here, the oldest version will be permanently deleted. This value applies to all keys, but a key’s metadata settings can overwrite this value. When 0 is used or the value is unset, Vault will keep 10 versions.',
   })
   maxVersions;
   @attr('boolean', {
@@ -147,13 +160,20 @@ export default class SecretEngineModel extends Model {
     return 'vault.cluster.secrets.backend.list-root';
   }
 
+  get accessor() {
+    if (this.version === 2) {
+      return `v2 ${this.accessor}`;
+    }
+    return this.accessor;
+  }
+
   get localDisplay() {
-    return 'replicated';
+    return this.local ? 'local' : 'replicated';
   }
 
   get formFields() {
     const type = this.engineType;
-    const fields = ['type', 'path', 'description', 'accessor'];
+    const fields = ['type', 'path', 'description', 'accessor', 'local', 'sealWrap'];
     // no ttl options for keymgmt
     if (type !== 'keymgmt') {
       fields.push('config.defaultLeaseTtl', 'config.maxLeaseTtl');
@@ -178,7 +198,7 @@ export default class SecretEngineModel extends Model {
   get formFieldGroups() {
     let defaultFields = ['path'];
     let optionFields;
-    const CORE_OPTIONS = ['description', 'config.listingVisibility'];
+    const CORE_OPTIONS = ['description', 'config.listingVisibility', 'local', 'sealWrap'];
     const STANDARD_CONFIG = [
       'config.auditNonHmacRequestKeys',
       'config.auditNonHmacResponseKeys',

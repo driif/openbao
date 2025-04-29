@@ -89,7 +89,7 @@ module('Integration | Component | page/pki-configuration-edit', function (hooks)
       assert.propEqual(
         JSON.parse(req.requestBody),
         {
-          path: 'https://pr-a.openbao.example.com/v1/ns1/pki-root',
+          path: 'https://pr-a.vault.example.com/v1/ns1/pki-root',
           aia_path: 'http://another-path.com',
         },
         'it updates cluster config model attributes'
@@ -149,7 +149,7 @@ module('Integration | Component | page/pki-configuration-edit', function (hooks)
     assert.dom(SELECTORS.urlFieldInput('ocspServers')).hasValue('ocsp-stuff.com');
 
     // cluster config
-    await fillIn(SELECTORS.configInput('path'), 'https://pr-a.openbao.example.com/v1/ns1/pki-root');
+    await fillIn(SELECTORS.configInput('path'), 'https://pr-a.vault.example.com/v1/ns1/pki-root');
     await fillIn(SELECTORS.configInput('aiaPath'), 'http://another-path.com');
 
     // acme config;
@@ -183,14 +183,14 @@ module('Integration | Component | page/pki-configuration-edit', function (hooks)
     assert
       .dom(SELECTORS.crlFieldLabel('autoRebuildGracePeriod'))
       .hasTextContaining(
-        'Auto-rebuild on OpenBao will rebuild the CRL in the below grace period before expiration',
+        'Auto-rebuild on Vault will rebuild the CRL in the below grace period before expiration',
         'it renders auto rebuild toggled on text'
       );
     await click(SELECTORS.crlToggleInput('deltaRebuildInterval'));
     assert
       .dom(SELECTORS.crlFieldLabel('deltaRebuildInterval'))
       .hasTextContaining(
-        'Delta CRL building on OpenBao will rebuild the delta CRL at the interval below:',
+        'Delta CRL building on Vault will rebuild the delta CRL at the interval below:',
         'it renders delta crl build toggled on text'
       );
 
@@ -270,6 +270,105 @@ module('Integration | Component | page/pki-configuration-edit', function (hooks)
         'it renders correct toggled off text'
       );
 
+    await click(SELECTORS.saveButton);
+  });
+
+  test('it renders enterprise only params', async function (assert) {
+    assert.expect(6);
+    this.version = this.owner.lookup('service:version');
+    this.version.version = '1.13.1+ent';
+    this.server.post(`/${this.backend}/config/acme`, () => {});
+    this.server.post(`/${this.backend}/config/cluster`, () => {});
+    this.server.post(`/${this.backend}/config/crl`, (schema, req) => {
+      assert.ok(true, 'request made to save crl config');
+      assert.propEqual(
+        JSON.parse(req.requestBody),
+        {
+          auto_rebuild: false,
+          auto_rebuild_grace_period: '12h',
+          delta_rebuild_interval: '15m',
+          disable: false,
+          enable_delta: false,
+          expiry: '72h',
+          ocsp_disable: false,
+          ocsp_expiry: '12h',
+          cross_cluster_revocation: true,
+          unified_crl: true,
+          unified_crl_on_existing_paths: true,
+        },
+        'crl payload includes enterprise params'
+      );
+    });
+    this.server.post(`/${this.backend}/config/urls`, () => {
+      assert.ok(true, 'request made to save urls config');
+    });
+    await render(
+      hbs`
+      <Page::PkiConfigurationEdit
+        @acme={{this.acme}}
+        @cluster={{this.cluster}}
+        @urls={{this.urls}}
+        @crl={{this.crl}}
+        @backend={{this.backend}}
+      />
+    `,
+      this.context
+    );
+
+    assert.dom(SELECTORS.groupHeader('Certificate Revocation List (CRL)')).exists();
+    assert.dom(SELECTORS.groupHeader('Online Certificate Status Protocol (OCSP)')).exists();
+    assert.dom(SELECTORS.groupHeader('Unified Revocation')).exists();
+    await click(SELECTORS.checkboxInput('crossClusterRevocation'));
+    await click(SELECTORS.checkboxInput('unifiedCrl'));
+    await click(SELECTORS.checkboxInput('unifiedCrlOnExistingPaths'));
+    await click(SELECTORS.saveButton);
+  });
+
+  test('it does not render enterprise only params for OSS', async function (assert) {
+    assert.expect(9);
+    this.version = this.owner.lookup('service:version');
+    this.version.version = '1.13.1';
+    this.server.post(`/${this.backend}/config/acme`, () => {});
+    this.server.post(`/${this.backend}/config/cluster`, () => {});
+    this.server.post(`/${this.backend}/config/crl`, (schema, req) => {
+      assert.ok(true, 'request made to save crl config');
+      assert.propEqual(
+        JSON.parse(req.requestBody),
+        {
+          auto_rebuild: false,
+          auto_rebuild_grace_period: '12h',
+          delta_rebuild_interval: '15m',
+          disable: false,
+          enable_delta: false,
+          expiry: '72h',
+          ocsp_disable: false,
+          ocsp_expiry: '12h',
+        },
+        'crl payload does not include enterprise params'
+      );
+    });
+    this.server.post(`/${this.backend}/config/urls`, () => {
+      assert.ok(true, 'request made to save urls config');
+    });
+    await render(
+      hbs`
+      <Page::PkiConfigurationEdit
+        @acme={{this.acme}}
+        @cluster={{this.cluster}}
+        @urls={{this.urls}}
+        @crl={{this.crl}}
+        @backend={{this.backend}}
+      />
+    `,
+      this.context
+    );
+
+    assert.dom(SELECTORS.checkboxInput('crossClusterRevocation')).doesNotExist();
+    assert.dom(SELECTORS.checkboxInput('unifiedCrl')).doesNotExist();
+    assert.dom(SELECTORS.checkboxInput('unifiedCrlOnExistingPaths')).doesNotExist();
+    assert.dom(SELECTORS.groupHeader('Certificate Revocation List (CRL)')).exists();
+    assert.dom(SELECTORS.groupHeader('Online Certificate Status Protocol (OCSP)')).exists();
+    assert.dom(SELECTORS.groupHeader('Unified Revocation')).doesNotExist();
     await click(SELECTORS.saveButton);
   });
 

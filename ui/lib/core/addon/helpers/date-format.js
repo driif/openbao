@@ -22,7 +22,7 @@ export function dateFormat([date, style], { isFormatted = false, withTimeZone = 
   try {
     // passing undefined means default to the browser's locale
     zone = ' ' + number.toLocaleTimeString(undefined, { timeZoneName: 'short' }).split(' ')[2];
-  } catch {
+  } catch (e) {
     zone = '';
   }
   zone = withTimeZone ? zone : '';

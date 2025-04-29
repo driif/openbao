@@ -395,6 +395,15 @@ func (c *Core) runStandby(doneCh, manualStepDownCh, stopCh chan struct{}) {
 	defer close(manualStepDownCh)
 	c.logger.Info("entering standby mode")
 
+	// If performance standby is enabled, initialize the performance standby
+	if !c.disablePerformanceStandby {
+		if err := c.initPerformanceStandby(c.activeContext); err != nil {
+			c.logger.Error("failed to initialize performance standby mode", "error", err)
+		} else {
+			c.logger.Info("performance standby mode initialized successfully")
+		}
+	}
+
 	var g run.Group
 	newLeaderCh := addEnterpriseHaActors(c, &g)
 	{

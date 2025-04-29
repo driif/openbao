@@ -638,6 +638,9 @@ type Core struct {
 
 	// Config value for "detect_deadlocks".
 	detectDeadlocks []string
+
+	// disablePerformanceStandby is used to disable performance standby mode
+	disablePerformanceStandby bool
 }
 
 // c.stateLock needs to be held in read mode before calling this function.
@@ -961,6 +964,7 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		numRollbackWorkers:             conf.NumRollbackWorkers,
 		impreciseLeaseRoleTracking:     conf.ImpreciseLeaseRoleTracking,
 		detectDeadlocks:                detectDeadlocks,
+		disablePerformanceStandby:      conf.DisablePerformanceStandby,
 	}
 
 	c.standbyStopCh.Store(make(chan struct{}))
@@ -3870,4 +3874,27 @@ func (c *Core) DetectStateLockDeadlocks() bool {
 		return true
 	}
 	return false
+}
+
+func (c *Core) initPerformanceStandby(ctx context.Context) error {
+	c.logger.Info("initializing performance standby mode")
+
+	// load necessary state for read operations
+	if err := c.setupNamespaceStore(ctx); err != nil {
+		return err
+	}
+
+	if err := c.loadMounts(ctx); err != nil {
+		return err
+	}
+
+	if err := c.setupMounts(ctx); err != nil {
+		return err
+	}
+
+	if err := c.setupPolicyStore(ctx); err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package forwarding;
+
+option go_package = "github.com/openbao/openbao/helper/forwarding";
+
+// ForwardedHeader represents HTTP-like headers.
+message ForwardedHeader {
+    map<string, StringArray> header = 1;
+}
+
+message StringArray {
+    repeated string values = 1;
+}
+
+// ForwardedSecret mirrors parts of logical.Secret.
+message ForwardedSecret {
+    bytes data = 1;                 // JSON serialized map[string]interface{} from Secret.Data
+    int64 ttl = 2;                  // in seconds
+    string lease_id = 3;
+    bool renewable = 4;
+    string display_name = 5;
+    // LeaseOptions are not included for now for simplicity. Add if specific fields become necessary.
+}
+
+// ForwardedAuth mirrors parts of logical.Auth.
+message ForwardedAuth {
+    string client_token = 1;
+    string accessor = 2;
+    string display_name = 3;
+    repeated string policies = 4;
+    map<string, string> metadata = 5;
+    int64 lease_duration = 6; // Corresponds to TTL in logical.Auth, in seconds
+    bool renewable = 7;
+    string entity_id = 8;
+    string token_type = 9; // e.g., "service", "batch"
+    int64 num_uses = 10;
+    int64 explicit_max_ttl = 11; // in seconds
+    int64 period = 12;           // in seconds
+    repeated string identity_policies = 13;
+    map<string, StringArray> external_namespace_policies = 14;
+}
+
+// ForwardedConnectionInfo contains minimal necessary connection details.
+message ForwardedConnectionInfo {
+    string remote_addr = 1;
+    // TLS ConnectionState is not forwarded.
+}
+
+// ForwardedRequestWrapper mirrors helper/wrapping.RequestWrapper
+message ForwardedRequestWrapper {
+    bytes serialized_wrapper_info = 1; // JSON serialized RequestWrapper
+}
+
+// ForwardedLogicalRequest mirrors parts of logical.Request.
+message ForwardedLogicalRequest {
+    string path = 1;
+    string operation = 2;         // e.g., "read", "write", "delete", "list", "help"
+    bytes data = 3;               // JSON serialized map[string]interface{} from Request.Data
+    map<string, string> forward_meta = 4; // For metadata like request_id, original_remote_addr
+    string client_token = 5;
+    ForwardedHeader headers = 6;
+    ForwardedRequestWrapper wrap_info = 7;
+    ForwardedConnectionInfo connection = 8;
+    string entity_id = 9;
+    string display_name = 10;
+    bool unauthenticated = 11;
+    bytes mfa_creds = 12;             // JSON serialized *mfa.MFACreds
+    bytes login_mfa = 13;             // JSON serialized *logical.LoginMFARequest
+    bytes quota_request = 14;         // JSON serialized *quota.Request
+}
+
+// ForwardedResponseWrapInfo mirrors helper/wrapping.ResponseWrapInfo
+message ForwardedResponseWrapInfo {
+    string token = 1;
+    int64 ttl = 2;                  // in seconds
+    string format = 3;
+    string creation_path = 4;
+    bool seal_wrap = 5;
+    string wrapped_accessor = 6;
+}
+
+// ForwardedLogicalResponse mirrors parts of logical.Response.
+message ForwardedLogicalResponse {
+    ForwardedSecret secret = 1;
+    ForwardedAuth auth = 2;
+    bytes data = 3;               // JSON serialized map[string]interface{} from Response.Data
+    string redirect = 4;
+    repeated string warnings = 5;
+    ForwardedResponseWrapInfo wrap_info = 6;
+    bytes mfa_login_response = 7;    // JSON serialized *logical.MFALoginResponse
+    bytes quota_error_response = 8; // JSON serialized *quota.ErrorResponse
+}
+
+// ForwardingService defines the RPC service for request forwarding.
+service ForwardingService {
+    rpc ForwardLogicalRequest(ForwardedLogicalRequest) returns (ForwardedLogicalResponse);
+}

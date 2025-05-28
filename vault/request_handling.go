@@ -7,6 +7,8 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/base64"
+
+	// "encoding/json" // No longer directly needed in this file for forwardRequest
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,6 +27,7 @@ import (
 
 	"github.com/openbao/openbao/api/v2"
 	"github.com/openbao/openbao/command/server"
+	"github.com/openbao/openbao/helper/forwarding"
 	"github.com/openbao/openbao/helper/identity"
 	"github.com/openbao/openbao/helper/identity/mfa"
 	"github.com/openbao/openbao/helper/metricsutil"
@@ -38,6 +41,8 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/pathmanager"
 	"github.com/openbao/openbao/sdk/v2/helper/policyutil"
 	"github.com/openbao/openbao/sdk/v2/helper/wrapping"
+
+	// "github.com/openbao/openbao/sdk/v2/helper/wrapping" // No longer directly needed in forwardRequest
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/vault/tokens"
 )
@@ -48,6 +53,8 @@ const (
 
 	// coreLockedUsersPath is a base path to store locked users
 	coreLockedUsersPath = "core/login/lockedUsers/"
+	// DefaultForwardingTimeout is the default timeout for forwarded requests.
+	DefaultForwardingTimeout = 45 * time.Second
 )
 
 var (
@@ -544,6 +551,86 @@ func (c *Core) HandleRequest(httpCtx context.Context, req *logical.Request) (res
 	return c.switchedLockHandleRequest(httpCtx, req, true)
 }
 
+// forwardRequest handles sending the request to the active node.
+// This function assumes that c.stateLock is RLock'd by the caller.
+func (c *Core) forwardRequest(ctx context.Context, req *logical.Request) (*logical.Response, error) {
+	c.requestForwardingConnectionLock.RLock()
+	// Ensure rpcForwardingClient is the correct type for the call
+	rpcClient, ok := c.rpcForwardingClient.(forwarding.ForwardingServiceClient)
+	if !ok || c.rpcForwardingClient == nil {
+		c.requestForwardingConnectionLock.RUnlock()
+		c.logger.Warn("cannot forward request, RPC client not available or of wrong type")
+		if c.perfStandbyRequestsForwardedFailedCounter != nil {
+			c.perfStandbyRequestsForwardedFailedCounter.Incr(1)
+		}
+		return nil, logical.ErrPerfStandbyPleaseForward
+	}
+	c.requestForwardingConnectionLock.RUnlock()
+
+	// Prepare context with timeout for the forwarded request.
+	forwardCtx, forwardCancel := context.WithTimeout(ctx, DefaultForwardingTimeout)
+	defer forwardCancel()
+
+	// Populate metadata for forwarding.
+	forwardMeta := make(map[string]string)
+	if req.Connection != nil {
+		forwardMeta["original_request_remote_addr"] = req.Connection.RemoteAddr
+	}
+	if reqIDVal := ctx.Value(logical.CtxKeyInFlightRequestID{}); reqIDVal != nil {
+		if reqID, okConv := reqIDVal.(string); okConv {
+			forwardMeta["request_id"] = reqID
+		}
+	}
+	forwardMeta["original_request_path"] = req.Path
+
+	// Serialize logical.Request to forwarding.ForwardedLogicalRequest
+	rpcRequestProto, err := forwarding.ToRPCRequest(req, forwardMeta)
+	if err != nil {
+		c.logger.Error("failed to serialize request for forwarding", "path", req.Path, "error", err)
+		if c.perfStandbyRequestsForwardedFailedCounter != nil {
+			c.perfStandbyRequestsForwardedFailedCounter.Incr(1)
+		}
+		// Return an error that indicates to the client/SDK that the request might be retried
+		// or that the standby node could not fulfill it due to an internal issue.
+		return nil, fmt.Errorf("failed to serialize request for forwarding: %w", err)
+	}
+
+	c.logger.Debug("forwarding request to active node", "path", req.Path, "request_id", forwardMeta["request_id"])
+
+	rpcResponseProto, errRpcCall := rpcClient.ForwardLogicalRequest(forwardCtx, rpcRequestProto)
+
+	if errRpcCall != nil {
+		c.logger.Error("failed to forward request to active node", "path", req.Path, "request_id", forwardMeta["request_id"], "error", errRpcCall)
+		if c.perfStandbyRequestsForwardedFailedCounter != nil {
+			c.perfStandbyRequestsForwardedFailedCounter.Incr(1)
+		}
+		return nil, logical.ErrPerfStandbyPleaseForward
+	}
+
+	if rpcResponseProto == nil { // Should not happen if errRpcCall is nil, but good for safety
+		c.logger.Error("RPC call succeeded but response was nil", "path", req.Path, "request_id", forwardMeta["request_id"])
+		if c.perfStandbyRequestsForwardedFailedCounter != nil {
+			c.perfStandbyRequestsForwardedFailedCounter.Incr(1)
+		}
+		return nil, logical.ErrPerfStandbyPleaseForward
+	}
+
+	// Deserialize forwarding.ForwardedLogicalResponse to logical.Response
+	logicalResponse, err := forwarding.FromRPCResponse(rpcResponseProto)
+	if err != nil {
+		c.logger.Error("failed to deserialize response from forwarded request", "path", req.Path, "error", err)
+		if c.perfStandbyRequestsForwardedFailedCounter != nil {
+			c.perfStandbyRequestsForwardedFailedCounter.Incr(1)
+		}
+		return nil, fmt.Errorf("failed to deserialize response from forwarded request: %w", err)
+	}
+
+	if c.perfStandbyRequestsForwardedCounter != nil {
+		c.perfStandbyRequestsForwardedCounter.Incr(1)
+	}
+	return logicalResponse, nil
+}
+
 func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.Request, doLocking bool) (resp *logical.Response, err error) {
 	if doLocking {
 		c.stateLock.RLock()
@@ -552,8 +639,29 @@ func (c *Core) switchedLockHandleRequest(httpCtx context.Context, req *logical.R
 	if c.Sealed() {
 		return nil, consts.ErrSealed
 	}
-	if c.standby {
-		return nil, consts.ErrStandby
+
+	// Handle different standby states
+	if c.standby || c.perfStandby {
+		coreConfig := c.CoreConfig()
+		isPerfStandbyEnabled := coreConfig != nil && coreConfig.EnablePerformanceStandby
+
+		if c.perfStandby && isPerfStandbyEnabled && c.canProcessRequestLocally(req) {
+			// Performance standby can handle this request locally
+			c.logger.Debug("handling request locally on performance standby",
+				"path", req.Path,
+				"operation", req.Operation)
+			// Continue with local processing below
+		} else if c.perfStandby && isPerfStandbyEnabled {
+			// Performance standby should forward this request
+			c.logger.Debug("forwarding request from performance standby",
+				"path", req.Path,
+				"operation", req.Operation)
+			return c.forwardRequest(httpCtx, req)
+		} else if c.standby {
+			// Regular standby cannot handle requests
+			return nil, consts.ErrStandby
+		}
+		// If we get here, we're a performance standby handling locally
 	}
 
 	if c.activeContext == nil || c.activeContext.Err() != nil {
@@ -766,8 +874,18 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
 	var auth *logical.Auth
 	if c.isLoginRequest(ctx, req) {
 		resp, auth, err = c.handleLoginRequest(ctx, req)
+		if err == nil && c.CoreConfig().EnablePerformanceStandby {
+			if c.perfStandbyLoginRequestsCounter != nil {
+				c.perfStandbyLoginRequestsCounter.Incr(1)
+			}
+		}
 	} else {
 		resp, auth, err = c.handleRequest(ctx, req)
+		if err == nil && c.CoreConfig().EnablePerformanceStandby {
+			if c.perfStandbyRequestsHandledLocallyCounter != nil {
+				c.perfStandbyRequestsHandledLocallyCounter.Incr(1)
+			}
+		}
 	}
 
 	if err == nil && c.requestResponseCallback != nil {
@@ -2287,6 +2405,133 @@ func (c *Core) DecodeSSCTokenInternal(token string) (*tokens.Token, error) {
 	return plainToken, nil
 }
 
+// checkSSCTokenForward returns true if the SSC token should be forwarded from a standby to the active node.
+// This function assumes that the token is an SSC token.
+func (c *Core) checkSSCTokenForward(req *logical.Request) (bool, error) {
+	// If SSC tokens are disabled, we can't forward them.
+	if c.DisableSSCTokens() {
+		return false, nil
+	}
+	// If the request doesn't have a client token, we can't forward it.
+	if req.ClientToken == "" {
+		return false, nil
+	}
+
+	// localAuthToken determines if this node *can* validate the token.
+	// If localAuthToken returns false (e.g., on a performance standby, or if the token is old on an active node),
+	// then this function returns true, indicating the token validation should be forwarded.
+	// This ensures that performance standbys always forward SSC token validation,
+	// and active nodes only validate "recent enough" tokens locally.
+	return !c.localAuthToken(context.Background(), req.ClientToken), nil
+}
+
+// localAuthToken returns true if the token is considered "local enough" for this node to validate.
+// The primary goal is to ensure performance standby nodes are conservative.
+func (c *Core) localAuthToken(ctx context.Context, token string) bool {
+	// Performance standby nodes (c.perfStandby == true) must always forward SSC token validation
+	// to the active node. This is critical because the active node holds the sole authoritative
+	// state for tokens, associated policies, entity aliases, and group memberships. Performance
+	// standbys, by design, have a replicated state that might have a slight lag. Forwarding ensures
+	// that all decisions involving SSC tokens are based on the most current and globally consistent
+	// data, preventing potential security issues that could arise from validating against
+	// (potentially) stale local data (e.g., a token that was just revoked on the active node
+	// might still appear valid locally for a short window). This conservative approach prioritizes
+	// consistency and correctness for all SSC token operations on performance standbys.
+	// We use c.perfStandby directly as it reflects the current operational state set by HA logic.
+	if c.perfStandby {
+		return false
+	}
+
+	// If we don't have a token store (e.g., during early startup or certain error states),
+	// we cannot determine if the token was created locally.
+	if c.tokenStore == nil {
+		return false
+	}
+
+	// For active nodes (c.HAStateWithLock() == consts.Active), a time-based heuristic is used.
+	// The active node is the source of truth, so this check is less about consistency with another
+	// node and more about whether the token information is likely to be fully settled within its
+	// own data structures. If a token exists and was created very recently (within 5 seconds),
+	// it's considered safe for the active node to validate it locally. This is a best-effort
+	// heuristic to avoid unnecessary "forwarding" (though an active node doesn't forward to itself)
+	// for tokens that were just created on this node.
+	if c.HAStateWithLock() == consts.Active {
+		entry, err := c.tokenStore.LookupToken(ctx, token)
+		if err != nil || entry == nil {
+			return false
+		}
+		// If the token was created within the last 5 seconds on the active node,
+		// assume it's "local" for validation purposes.
+		return time.Now().Unix()-entry.CreationTime < 5
+	}
+
+	// For traditional standbys (i.e., c.standby is true but c.perfStandby is false),
+	// they are not designed for serving reads that require up-to-the-second consistency
+	// for tokens. Similar to performance standbys, they should conservatively assume tokens
+	// are not local to ensure that any sensitive operation relying on token validity
+	// is decided by the active node. Returning false is the safe default, ensuring that
+	// if checkSSCTokenForward is called, it would suggest forwarding.
+	return false
+}
+
+// validateWrappingToken is used to validate a wrapping token
+func (c *Core) validateWrappingToken(ctx context.Context, req *logical.Request) (bool, error) {
+	token := req.ClientToken
+	if token == "" {
+		return false, nil
+	}
+
+	te, err := c.tokenStore.Lookup(ctx, token)
+	if err != nil {
+		return false, err
+	}
+	if te == nil {
+		return false, nil
+	}
+
+	if len(te.Policies) != 1 || te.Policies[0] != responseWrappingPolicyName {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// wrapInCubbyhole is a helper to perform response wrapping
+func (c *Core) wrapInCubbyhole(ctx context.Context, req *logical.Request, resp *logical.Response, auth *logical.Auth) (*logical.Response, error) {
+	// If there is no auth block and we're wrapping, then the wrapping path
+	// is unauthenticated. This can happen if a wrapping token is used to
+	// wrap a response.
+	if auth == nil {
+		auth = &logical.Auth{}
+	}
+
+	// Create the wrapping token
+	wrapInfo := resp.WrapInfo
+	token, err := c.cubbyholeBackend.Wrap(ctx, req.Path, wrapInfo.TTL, resp, auth)
+	if err != nil {
+		c.logger.Error("failed to wrap response", "error", err)
+		return nil, ErrInternalError
+	}
+	if token == "" {
+		c.logger.Error("empty token returned from cubbyhole wrapping")
+		return nil, ErrInternalError
+	}
+
+	// Return the wrapping token
+	resp.WrapInfo.Token = token
+	resp.WrapInfo.WrappedAccessor = auth.Accessor
+
+	return resp, nil
+}
+
+// CheckSSCToken is used to validate a server side consistent token. It will return the inner token
+// if it is valid, or an error if it is not.
+// If the token is not an SSC token, it will be returned as-is.
+// If the token is an SSC token but it is disabled, it will return an error.
+// If the token is an SSC token and it is enabled, it will check the HMAC and WAL index.
+// If the HMAC is invalid, it will return an error.
+// If the WAL index is not present, it will return an error that indicates the request should be forwarded.
+// If the WAL index is present and valid, it will return the inner token.
 func (c *Core) checkSSCTokenInternal(ctx context.Context, token string) (string, error) {
 	signedToken := &tokens.SignedToken{}
 

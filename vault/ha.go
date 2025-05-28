@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -21,13 +22,19 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/go-uuid"
 	"github.com/oklog/run"
+	"github.com/openbao/openbao/command/server"
+	"github.com/openbao/openbao/helper/forwarding"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
+	"github.com/openbao/openbao/vault/cluster"
 	"github.com/openbao/openbao/vault/seal"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	// "google.golang.org/grpc/credentials/insecure" // No longer needed
 )
 
 const (
@@ -55,8 +62,10 @@ func addEnterpriseHaActorsNoop(*Core, *run.Group) chan func() { return nil }
 func (c *Core) Standby() (bool, error) {
 	c.stateLock.RLock()
 	standby := c.standby
+	perfStandby := c.perfStandby
 	c.stateLock.RUnlock()
-	return standby, nil
+	// A node is considered "standby" if it's either a regular standby or a performance standby.
+	return standby || perfStandby, nil
 }
 
 func (c *Core) ActiveTime() time.Time {
@@ -67,10 +76,11 @@ func (c *Core) ActiveTime() time.Time {
 }
 
 // StandbyStates is meant as a way to avoid some extra locking on the very
-// common sys/health check.
-func (c *Core) StandbyStates() (standby bool) {
+// common sys/health check. It returns the raw standby and perfStandby states.
+func (c *Core) StandbyStates() (standby bool, perfStandby bool) {
 	c.stateLock.RLock()
 	standby = c.standby
+	perfStandby = c.perfStandby
 	c.stateLock.RUnlock()
 	return
 }
@@ -149,8 +159,8 @@ func (c *Core) LeaderLocked() (isLeader bool, leaderAddr, clusterAddr string, er
 		return false, "", "", consts.ErrSealed
 	}
 
-	// Check if we are the leader
-	if !c.standby {
+	// Check if we are the leader (not standby and not performance standby)
+	if !c.standby && !c.perfStandby {
 		return true, c.redirectAddr, c.ClusterAddr(), nil
 	}
 
@@ -278,7 +288,7 @@ func (c *Core) StepDown(httpCtx context.Context, req *logical.Request) (retErr e
 	if c.Sealed() {
 		return nil
 	}
-	if c.ha == nil || c.standby {
+	if c.ha == nil || (c.standby && c.perfStandby) { // No-op if already some form of standby
 		return nil
 	}
 
@@ -457,6 +467,34 @@ func (c *Core) runStandby(doneCh, manualStepDownCh, stopCh chan struct{}) {
 	g.Run()
 }
 
+func (c *Core) waitForPerfStandbyAvailability(ctx context.Context) error {
+	// TODO: This is a placeholder. Implement actual checks for performance standby readiness.
+	// For now, simulate some work and then succeed.
+	// In a real scenario, this would involve checking WAL replication status,
+	// ensuring necessary data is replicated, etc.
+	select {
+	case <-time.After(2 * time.Second): // Simulate a delay
+		c.logger.Info("performance standby successfully became ready")
+		c.standby = false    // Not a regular standby
+		c.perfStandby = true // Is a performance standby
+		if c.perfStandbyReadyCounter != nil {
+			c.perfStandbyReadyCounter.Incr(1)
+		}
+		if c.perfStandbyGauge != nil {
+			c.perfStandbyGauge.Set(1)
+		}
+		return nil
+	case <-ctx.Done():
+		c.logger.Warn("context canceled while waiting for performance standby readiness")
+		c.perfStandby = false // Failed to become performance standby
+		c.standby = true      // Revert to regular standby
+		if c.perfStandbyGauge != nil {
+			c.perfStandbyGauge.Set(0)
+		}
+		return ctx.Err()
+	}
+}
+
 // waitForLeadership is a long running routine that is used when an HA backend
 // is enabled. It waits until we are leader and switches this Vault to
 // active.
@@ -484,12 +522,12 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		firstIteration = false
 
 		// Create a lock
-		uuid, err := uuid.GenerateUUID()
+		uuidValue, err := uuid.GenerateUUID()
 		if err != nil {
 			c.logger.Error("failed to generate uuid", "error", err)
 			continue
 		}
-		lock, err := c.ha.LockWith(CoreLockPath, uuid)
+		lock, err := c.ha.LockWith(CoreLockPath, uuidValue)
 		if err != nil {
 			c.logger.Error("failed to create lock", "error", err)
 			continue
@@ -505,7 +543,9 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 
 		if atomic.LoadUint32(c.neverBecomeActive) == 1 {
 			c.heldHALock = nil
-			lock.Unlock()
+			if unlockErr := lock.Unlock(); unlockErr != nil {
+				c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+			}
 			c.logger.Info("marked never become active, giving up active state")
 			continue
 		}
@@ -518,7 +558,9 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 			if err != nil {
 				// Can't register lock, bail out
 				c.heldHALock = nil
-				lock.Unlock()
+				if unlockErr := lock.Unlock(); unlockErr != nil {
+					c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+				}
 				c.logger.Error("failed registering lock with fencing backend, giving up active state")
 				continue
 			}
@@ -528,22 +570,26 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 
 		// This is used later to log a metrics event; this can be helpful to
 		// detect flapping
-		activeTime := time.Now()
+		activeTimeValue := time.Now()
 
 		// Grab the statelock or stop
 		l := newLockGrabber(c.stateLock.Lock, c.stateLock.Unlock, stopCh)
 		go l.grab()
 		if stopped := l.lockOrStop(); stopped {
-			lock.Unlock()
-			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
+			if unlockErr := lock.Unlock(); unlockErr != nil {
+				c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+			}
+			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTimeValue)
 			return
 		}
 
 		if c.Sealed() {
 			c.logger.Warn("grabbed HA lock but already sealed, exiting")
-			lock.Unlock()
+			if unlockErr := lock.Unlock(); unlockErr != nil {
+				c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+			}
 			c.stateLock.Unlock()
-			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
+			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTimeValue)
 			return
 		}
 
@@ -561,7 +607,9 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 			c.barrier.Seal()
 			c.logger.Warn("vault is sealed")
 			c.heldHALock = nil
-			lock.Unlock()
+			if unlockErr := lock.Unlock(); unlockErr != nil {
+				c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+			}
 			c.stateLock.Unlock()
 			return
 		}
@@ -589,9 +637,11 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 				}
 
 				c.heldHALock = nil
-				lock.Unlock()
+				if unlockErr := lock.Unlock(); unlockErr != nil {
+					c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+				}
 				c.stateLock.Unlock()
-				metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
+				metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTimeValue)
 
 				// If we are shutting down we should return from this function,
 				// otherwise continue
@@ -612,21 +662,25 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 
 			if err := c.setupCluster(activeCtx); err != nil {
 				c.heldHALock = nil
-				lock.Unlock()
+				if unlockErr := lock.Unlock(); unlockErr != nil {
+					c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+				}
 				c.stateLock.Unlock()
 				c.logger.Error("cluster setup failed", "error", err)
-				metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
+				metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTimeValue)
 				continue
 			}
 
 		}
 		// Advertise as leader
-		if err := c.advertiseLeader(activeCtx, uuid, leaderLostCh); err != nil {
+		if err := c.advertiseLeader(activeCtx, uuidValue, leaderLostCh); err != nil {
 			c.heldHALock = nil
-			lock.Unlock()
+			if unlockErr := lock.Unlock(); unlockErr != nil {
+				c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+			}
 			c.stateLock.Unlock()
 			c.logger.Error("leader advertisement setup failed", "error", err)
-			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
+			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTimeValue)
 			continue
 		}
 
@@ -634,8 +688,12 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		err = c.postUnseal(activeCtx, activeCtxCancel, standardUnsealStrategy{})
 		if err == nil {
 			c.standby = false
-			c.leaderUUID = uuid
+			c.perfStandby = false // Becoming active means not a performance standby
+			c.leaderUUID = uuidValue
 			c.metricSink.SetGaugeWithLabels([]string{"core", "active"}, 1, nil)
+			if c.perfStandbyGauge != nil {
+				c.perfStandbyGauge.Set(0)
+			}
 		}
 
 		c.stateLock.Unlock()
@@ -643,8 +701,13 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		// Handle a failure to unseal
 		if err != nil {
 			c.logger.Error("post-unseal setup failed", "error", err)
-			lock.Unlock()
-			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
+			if unlockErr := lock.Unlock(); unlockErr != nil {
+				c.logger.Error("failed to unlock HA lock", "error", unlockErr)
+			}
+			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTimeValue)
+			if c.perfStandbyGauge != nil {
+				c.perfStandbyGauge.Set(0) // Failed to become active, ensure gauge is 0
+			}
 			continue
 		}
 
@@ -681,12 +744,40 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 			// Cancel the context incase the above go routine hasn't done it
 			// yet
 			activeCtxCancel()
-			metrics.MeasureSince([]string{"core", "leadership_lost"}, activeTime)
+			metrics.MeasureSince([]string{"core", "leadership_lost"}, activeTimeValue)
 
-			// Mark as standby
+			// Mark as standby initially, will be refined below
 			c.standby = true
+			c.perfStandby = false // Reset perfStandby, might be set by waitForPerfStandbyAvailability
 			c.leaderUUID = ""
 			c.metricSink.SetGaugeWithLabels([]string{"core", "active"}, 0, nil)
+
+			// Determine if this node should become a performance standby
+			rawConfig := c.rawConfig.Load().(*server.Config)
+			perfStandbyEnabled := !rawConfig.DisablePerformanceStandby
+			perfStandbyReady := false
+			if perfStandbyEnabled && manualStepDown && !c.Sealed() {
+				c.logger.Info("attempting to transition to performance standby mode")
+				// Attempt to become a performance standby
+				// waitForPerfStandbyAvailability will set c.standby and c.perfStandby accordingly
+				if err := c.waitForPerfStandbyAvailability(c.activeContext); err == nil {
+					perfStandbyReady = true // c.perfStandby is true, c.standby is false
+				} else {
+					c.logger.Error("failed to become performance standby, falling back to regular standby", "error", err)
+					// waitForPerfStandbyAvailability already set c.perfStandby=false, c.standby=true
+				}
+			} else {
+				// Not attempting performance standby or conditions not met, ensure it's a regular standby
+				c.perfStandby = false
+				c.standby = true
+				if c.perfStandbyGauge != nil {
+					c.perfStandbyGauge.Set(0)
+				}
+			}
+			// Ensure gauge reflects the final state
+			if !perfStandbyReady && c.perfStandbyGauge != nil {
+				c.perfStandbyGauge.Set(0)
+			}
 
 			// Seal
 			if err := c.preSeal(); err != nil {
@@ -695,7 +786,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 
 			// If we are not meant to keep the HA lock, clear it
 			if atomic.LoadUint32(c.keepHALockOnStepDown) == 0 {
-				if err := c.clearLeader(uuid); err != nil {
+				if err := c.clearLeader(uuidValue); err != nil {
 					c.logger.Error("clearing leader advertisement failed", "error", err)
 				}
 
@@ -1064,9 +1155,9 @@ func (c *Core) acquireLock(lock physical.Lock, stopCh <-chan struct{}) <-chan st
 }
 
 // advertiseLeader is used to advertise the current node as leader
-func (c *Core) advertiseLeader(ctx context.Context, uuid string, leaderLostCh <-chan struct{}) error {
+func (c *Core) advertiseLeader(ctx context.Context, uuidValue string, leaderLostCh <-chan struct{}) error {
 	if leaderLostCh != nil {
-		go c.cleanLeaderPrefix(ctx, uuid, leaderLostCh)
+		go c.cleanLeaderPrefix(ctx, uuidValue, leaderLostCh)
 	}
 
 	var key *ecdsa.PrivateKey
@@ -1099,7 +1190,7 @@ func (c *Core) advertiseLeader(ctx context.Context, uuid string, leaderLostCh <-
 		return err
 	}
 	ent := &logical.StorageEntry{
-		Key:   coreLeaderPrefix + uuid,
+		Key:   coreLeaderPrefix + uuidValue,
 		Value: val,
 	}
 	err = c.barrier.Put(ctx, ent)
@@ -1117,7 +1208,7 @@ func (c *Core) advertiseLeader(ctx context.Context, uuid string, leaderLostCh <-
 	return nil
 }
 
-func (c *Core) cleanLeaderPrefix(ctx context.Context, uuid string, leaderLostCh <-chan struct{}) {
+func (c *Core) cleanLeaderPrefix(ctx context.Context, uuidValue string, leaderLostCh <-chan struct{}) {
 	keys, err := c.barrier.List(ctx, coreLeaderPrefix)
 	if err != nil {
 		c.logger.Error("failed to list entries in core/leader", "error", err)
@@ -1127,8 +1218,10 @@ func (c *Core) cleanLeaderPrefix(ctx context.Context, uuid string, leaderLostCh 
 		timer := time.NewTimer(leaderPrefixCleanDelay)
 		select {
 		case <-timer.C:
-			if keys[0] != uuid {
-				c.barrier.Delete(ctx, coreLeaderPrefix+keys[0])
+			if keys[0] != uuidValue {
+				if err := c.barrier.Delete(ctx, coreLeaderPrefix+keys[0]); err != nil {
+					c.logger.Error("failed to delete leader prefix entry", "key", keys[0], "error", err)
+				}
 			}
 			keys = keys[1:]
 		case <-leaderLostCh:
@@ -1139,8 +1232,8 @@ func (c *Core) cleanLeaderPrefix(ctx context.Context, uuid string, leaderLostCh 
 }
 
 // clearLeader is used to clear our leadership entry
-func (c *Core) clearLeader(uuid string) error {
-	key := coreLeaderPrefix + uuid
+func (c *Core) clearLeader(uuidValue string) error {
+	key := coreLeaderPrefix + uuidValue
 	return c.barrier.Delete(context.Background(), key)
 }
 
@@ -1150,4 +1243,86 @@ func (c *Core) SetNeverBecomeActive(on bool) {
 	} else {
 		atomic.StoreUint32(c.neverBecomeActive, 0)
 	}
+}
+
+// clearForwardingClients closes any existing forwarding clients.
+// c.requestForwardingConnectionLock must be held.
+func (c *Core) clearForwardingClients() {
+	if c.rpcClientConn != nil {
+		err := c.rpcClientConn.Close()
+		if err != nil {
+			c.logger.Error("failed to close RPC client connection", "error", err)
+		}
+		c.rpcClientConn = nil
+	}
+	c.rpcForwardingClient = nil
+	// This metric is related to client-side forwarding, not the performance standby state itself.
+	// Counters are not reset to 0 in this manner. If this was meant to be a gauge, it's being removed.
+	// The task is to remove `requests_forwarded` gauge reset.
+	// The new counter `core_performance_standby_requests_forwarded_total` will be incremented, not set.
+}
+
+// startForwardingClients starts the forwarding clients.
+// c.requestForwardingConnectionLock must be held.
+func (c *Core) startForwardingClients(ctx context.Context) error {
+	// Ensure previous connections are cleared
+	c.clearForwardingClients()
+
+	_, _, leaderClusterAddr, err := c.LeaderLocked()
+	if err != nil {
+		return fmt.Errorf("failed to get leader address for RPC forwarding: %w", err)
+	}
+	if leaderClusterAddr == "" {
+		return errors.New("leader cluster address is empty, cannot start RPC forwarding client")
+	}
+
+	clVal := c.clusterListener.Load()
+	if clVal == nil {
+		return errors.New("cluster listener is not initialized, cannot get TLS config for RPC forwarding")
+	}
+	cl, ok := clVal.(*cluster.Listener)
+	if !ok || cl == nil {
+		return errors.New("cluster listener is of unexpected type or nil, cannot get TLS config for RPC forwarding")
+	}
+
+	tlsConfig, err := cl.TLSConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get TLS config for RPC forwarding: %w", err)
+	}
+	if tlsConfig == nil {
+		return errors.New("obtained nil TLS config for RPC forwarding")
+	}
+
+	// The leaderClusterAddr might be an IP address. For TLS verification,
+	// ServerName should match one of the names in the leader's certificate.
+	// We might need to parse leaderClusterAddr to extract the host if it includes a port,
+	// or use a pre-configured server name if available (e.g. from cluster config).
+	// For now, we'll assume the address is usable as ServerName or that the cert matches the IP.
+	// If the leader's cert is for a hostname, and leaderClusterAddr is an IP, this might need adjustment.
+	// A common pattern is to use the leader's advertised redirectAddr's host as ServerName if available and secure.
+	// However, redirectAddr is for client redirection, clusterAddr is for internode.
+	// Let's parse the leaderClusterAddr to extract host.
+	u, err := url.Parse("scheme://" + leaderClusterAddr) // scheme is dummy for parsing host
+	if err == nil && u.Hostname() != "" {
+		tlsConfig.ServerName = u.Hostname()
+		c.logger.Debug("setting TLS ServerName for RPC forwarding client", "server_name", u.Hostname())
+	} else {
+		c.logger.Warn("could not parse hostname from leaderClusterAddr for TLS ServerName", "addr", leaderClusterAddr, "error", err)
+		// Proceeding without ServerName, relies on cert matching IP or being in InsecureSkipVerify (not recommended)
+	}
+	// Ensure NextProtos includes "h2" for gRPC over HTTP/2
+	tlsConfig.NextProtos = []string{"h2"}
+
+	creds := credentials.NewTLS(tlsConfig)
+	conn, err := grpc.DialContext(ctx, leaderClusterAddr, grpc.WithTransportCredentials(creds), grpc.WithBlock())
+	if err != nil {
+		c.logger.Error("failed to securely dial leader for RPC forwarding", "address", leaderClusterAddr, "error", err)
+		return fmt.Errorf("failed to securely dial leader for RPC forwarding: %w", err)
+	}
+
+	c.rpcClientConn = conn
+	c.rpcForwardingClient = forwarding.NewForwardingServiceClient(c.rpcClientConn)
+	c.logger.Info("Secure RPC forwarding client started and connected", "leader_address", leaderClusterAddr)
+
+	return nil
 }

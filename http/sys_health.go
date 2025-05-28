@@ -118,9 +118,14 @@ func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, erro
 
 	// Check system status
 	sealed := core.Sealed()
-	standby := core.StandbyStates()
+	standby, perfStandby := core.StandbyStates() // Consume two return values
 	var replicationState consts.ReplicationState
-	if standby {
+	// If it's a performance standby, it's not a typical "standby" in terms of replication state source for this check.
+	// Or if it's a regular standby.
+	if standby || perfStandby {
+		// TODO: Re-evaluate if ActiveNodeReplicationState is appropriate for perfStandby,
+		// or if it should have its own or use core.ReplicationState().
+		// For now, using ActiveNodeReplicationState if either kind of standby.
 		replicationState = core.ActiveNodeReplicationState()
 	} else {
 		replicationState = core.ReplicationState()
@@ -138,7 +143,8 @@ func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, erro
 		code = uninitCode
 	case sealed:
 		code = sealedCode
-	case standby:
+	// A performance standby node also respects standbyok and standbycode parameters
+	case standby || perfStandby:
 		if !standbyOK {
 			code = standbyCode
 		}
@@ -163,6 +169,7 @@ func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, erro
 		Initialized:                init,
 		Sealed:                     sealed,
 		Standby:                    standby,
+		PerformanceStandby:         perfStandby, // Use the actual perfStandby value
 		ReplicationPerformanceMode: replicationState.GetPerformanceString(),
 		ReplicationDRMode:          replicationState.GetDRString(),
 		ServerTimeUTC:              time.Now().UTC().Unix(),

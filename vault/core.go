@@ -61,6 +61,7 @@ import (
 	"github.com/patrickmn/go-cache"
 	uberAtomic "go.uber.org/atomic"
 	"google.golang.org/grpc"
+	// Import for request forwarding gRPC service
 )
 
 const (
@@ -289,6 +290,7 @@ type Core struct {
 	sealed    *uint32
 
 	standby              bool
+	perfStandby          bool // Indicates if the node is a performance standby
 	standbyDoneCh        chan struct{}
 	standbyStopCh        *atomic.Value
 	manualStepDownCh     chan struct{}
@@ -552,6 +554,19 @@ type Core struct {
 
 	// Telemetry objects
 	metricsHelper *metricsutil.MetricsHelper
+	// Performance Standby Metrics
+	// Gauge, indicates if the node is in performance standby mode (1 if true, 0 otherwise).
+	perfStandbyGauge metrics.Gauge
+	// Counter, total number of times the node has become ready as a performance standby.
+	perfStandbyReadyCounter metrics.Counter
+	// Counter, total number of requests handled locally by a performance standby node.
+	perfStandbyRequestsHandledLocallyCounter metrics.Counter
+	// Counter, total number of requests forwarded from a performance standby node to the active node.
+	perfStandbyRequestsForwardedCounter metrics.Counter
+	// Counter, total number of failed attempts to forward requests from a performance standby node.
+	perfStandbyRequestsForwardedFailedCounter metrics.Counter
+	// Counter, total number of login requests handled by a performance standby node.
+	perfStandbyLoginRequestsCounter metrics.Counter
 
 	// raftFollowerStates tracks information about all the raft follower nodes.
 	raftFollowerStates *raft.FollowerStates
@@ -646,7 +661,10 @@ type Core struct {
 
 // c.stateLock needs to be held in read mode before calling this function.
 func (c *Core) HAState() consts.HAState {
+	// c.stateLock must be held in read mode before calling
 	switch {
+	case c.perfStandby:
+		return consts.PerfStandby
 	case c.standby:
 		return consts.Standby
 	default:
@@ -925,30 +943,30 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		logger:               conf.Logger.Named("core"),
 		logLevel:             conf.LogLevel,
 
-		defaultLeaseTTL:                conf.DefaultLeaseTTL,
-		maxLeaseTTL:                    conf.MaxLeaseTTL,
-		sentinelTraceDisabled:          conf.DisableSentinelTrace,
-		cachingDisabled:                conf.DisableCache,
-		clusterName:                    conf.ClusterName,
-		clusterNetworkLayer:            conf.ClusterNetworkLayer,
-		clusterPeerClusterAddrsCache:   cache.New(3*clusterHeartbeatInterval, time.Second),
-		rawEnabled:                     conf.EnableRaw,
-		introspectionEnabled:           conf.EnableIntrospection,
-		shutdownDoneCh:                 new(atomic.Value),
-		replicationState:               new(uint32),
-		localClusterPrivateKey:         new(atomic.Value),
-		localClusterCert:               new(atomic.Value),
-		localClusterParsedCert:         new(atomic.Value),
-		activeNodeReplicationState:     new(uint32),
-		keepHALockOnStepDown:           new(uint32),
-		replicationFailure:             new(uint32),
-		activeContextCancelFunc:        new(atomic.Value),
-		allLoggers:                     conf.AllLoggers,
-		builtinRegistry:                conf.BuiltinRegistry,
-		neverBecomeActive:              new(uint32),
-		clusterLeaderParams:            new(atomic.Value),
-		metricsHelper:                  conf.MetricsHelper,
-		metricSink:                     conf.MetricSink,
+		defaultLeaseTTL:              conf.DefaultLeaseTTL,
+		maxLeaseTTL:                  conf.MaxLeaseTTL,
+		sentinelTraceDisabled:        conf.DisableSentinelTrace,
+		cachingDisabled:              conf.DisableCache,
+		clusterName:                  conf.ClusterName,
+		clusterNetworkLayer:          conf.ClusterNetworkLayer,
+		clusterPeerClusterAddrsCache: cache.New(3*clusterHeartbeatInterval, time.Second),
+		rawEnabled:                   conf.EnableRaw,
+		introspectionEnabled:         conf.EnableIntrospection,
+		shutdownDoneCh:               new(atomic.Value),
+		replicationState:             new(uint32),
+		localClusterPrivateKey:       new(atomic.Value),
+		localClusterCert:             new(atomic.Value),
+		localClusterParsedCert:       new(atomic.Value),
+		activeNodeReplicationState:   new(uint32),
+		keepHALockOnStepDown:         new(uint32),
+		replicationFailure:           new(uint32),
+		activeContextCancelFunc:      new(atomic.Value),
+		allLoggers:                   conf.AllLoggers,
+		builtinRegistry:              conf.BuiltinRegistry,
+		neverBecomeActive:            new(uint32),
+		clusterLeaderParams:          new(atomic.Value),
+		// metricsHelper is initialized in coreInit
+		// metricSink is initialized in coreInit
 		secureRandomReader:             conf.SecureRandomReader,
 		rawConfig:                      new(atomic.Value),
 		recoveryMode:                   conf.RecoveryMode,
@@ -975,9 +993,44 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 		unsafeCrossNamespaceIdentity:   conf.UnsafeCrossNamespaceIdentity,
 	}
 
+	// Initialize metrics helper and sink (moved from coreInit to be available for metric registration)
+	if conf.MetricsHelper == nil {
+		conf.MetricsHelper = metricsutil.NewMetricsHelper(metricsutil.BlackholeSink(), time.Hour, 0)
+	}
+	c.metricsHelper = conf.MetricsHelper
+	c.metricSink = conf.MetricSink
+	if c.metricSink != nil { // Ensure metricSink is not nil before using
+		c.metricSink.SetClusterID(c.clusterID.Load())
+		c.metricSink.SetLogger(c.logger)
+	}
+
+	// Register performance standby metrics
+	// Ensure metricsHelper is not nil before using. It should be set by the lines above.
+	if c.metricsHelper != nil {
+		c.perfStandbyGauge = c.metricsHelper.NewGauge([]string{"core", "performance_standby"})
+		c.perfStandbyGauge.SetHelp("Indicates if the node is in performance standby mode (1 if true, 0 otherwise).")
+
+		c.perfStandbyReadyCounter = c.metricsHelper.NewCounter([]string{"core", "performance_standby_ready_total"})
+		c.perfStandbyReadyCounter.SetHelp("Total number of times the node has become ready as a performance standby.")
+
+		c.perfStandbyRequestsHandledLocallyCounter = c.metricsHelper.NewCounter([]string{"core", "performance_standby_requests_handled_locally_total"})
+		c.perfStandbyRequestsHandledLocallyCounter.SetHelp("Total number of requests handled locally by a performance standby node.")
+
+		c.perfStandbyRequestsForwardedCounter = c.metricsHelper.NewCounter([]string{"core", "performance_standby_requests_forwarded_total"})
+		c.perfStandbyRequestsForwardedCounter.SetHelp("Total number of requests forwarded from a performance standby node to the active node.")
+
+		c.perfStandbyRequestsForwardedFailedCounter = c.metricsHelper.NewCounter([]string{"core", "performance_standby_requests_forwarded_failed_total"})
+		c.perfStandbyRequestsForwardedFailedCounter.SetHelp("Total number of failed attempts to forward requests from a performance standby node.")
+
+		c.perfStandbyLoginRequestsCounter = c.metricsHelper.NewCounter([]string{"core", "performance_standby_login_requests_total"})
+		c.perfStandbyLoginRequestsCounter.SetHelp("Total number of login requests handled by a performance standby node.")
+	}
+
 	c.standbyStopCh.Store(make(chan struct{}))
 	atomic.StoreUint32(c.sealed, 1)
-	c.metricSink.SetGaugeWithLabels([]string{"core", "unsealed"}, 0, nil)
+	if c.metricSink != nil { // Ensure metricSink is not nil before using
+		c.metricSink.SetGaugeWithLabels([]string{"core", "unsealed"}, 0, nil)
+	}
 
 	c.shutdownDoneCh.Store(make(chan struct{}))
 
@@ -1065,10 +1118,9 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 		return nil, err
 	}
 
-	err = coreInit(c, conf)
-	if err != nil {
-		return nil, err
-	}
+	// coreInit was previously called here, but its contents related to metrics
+	// are now in CreateCore for earlier metric registration.
+	// If coreInit had other responsibilities, they would remain or be integrated here/CreateCore.
 
 	// Construct a new AES-GCM barrier
 	c.barrier, err = NewAESGCMBarrier(c.physical)

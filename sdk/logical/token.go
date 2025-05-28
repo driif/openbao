@@ -312,3 +312,20 @@ func (te *TokenEntry) IsRoot() bool {
 
 	return len(te.Policies) == 1 && te.Policies[0] == "root"
 }
+
+func ParseTokenType(s string) (TokenType, error) {
+	switch s {
+	case "default", "":
+		return TokenTypeDefault, nil
+	case "service":
+		return TokenTypeService, nil
+	case "batch":
+		return TokenTypeBatch, nil
+	case "default-service":
+		return TokenTypeDefaultService, nil
+	case "default-batch":
+		return TokenTypeDefaultBatch, nil
+	default:
+		return 0, fmt.Errorf("unknown token type %q", s)
+	}
+}

@@ -295,29 +295,6 @@ func (c *Core) refreshRequestForwardingConnection(ctx context.Context, clusterAd
 	return nil
 }
 
-func (c *Core) clearForwardingClients() {
-	c.logger.Debug("clearing forwarding clients")
-	defer c.logger.Debug("done clearing forwarding clients")
-
-	if c.rpcClientConnCancelFunc != nil {
-		c.rpcClientConnCancelFunc()
-		c.rpcClientConnCancelFunc = nil
-	}
-	if c.rpcClientConn != nil {
-		c.rpcClientConn.Close()
-		c.rpcClientConn = nil
-	}
-
-	c.rpcClientConnContext = nil
-	c.rpcForwardingClient = nil
-
-	clusterListener := c.getClusterListener()
-	if clusterListener != nil {
-		clusterListener.RemoveClient(consts.RequestForwardingALPN)
-	}
-	c.clusterLeaderParams.Store((*ClusterLeaderParams)(nil))
-}
-
 // ForwardRequest forwards a given request to the active node and returns the
 // response.
 func (c *Core) ForwardRequest(req *http.Request) (int, http.Header, []byte, error) {

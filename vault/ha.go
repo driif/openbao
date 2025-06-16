@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -23,17 +22,13 @@ import (
 	"github.com/hashicorp/go-uuid"
 	"github.com/oklog/run"
 	"github.com/openbao/openbao/command/server"
-	"github.com/openbao/openbao/helper/forwarding"
 	"github.com/openbao/openbao/helper/namespace"
 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
-	"github.com/openbao/openbao/vault/cluster"
 	"github.com/openbao/openbao/vault/seal"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 	// "google.golang.org/grpc/credentials/insecure" // No longer needed
 )
 
@@ -477,20 +472,14 @@ func (c *Core) waitForPerfStandbyAvailability(ctx context.Context) error {
 		c.logger.Info("performance standby successfully became ready")
 		c.standby = false    // Not a regular standby
 		c.perfStandby = true // Is a performance standby
-		if c.perfStandbyReadyCounter != nil {
-			c.perfStandbyReadyCounter.Incr(1)
-		}
-		if c.perfStandbyGauge != nil {
-			c.perfStandbyGauge.Set(1)
-		}
+		metrics.IncrCounter([]string{"core", "performance_standby_ready_total"}, 1)
+		metrics.SetGauge([]string{"core", "performance_standby"}, 1)
 		return nil
 	case <-ctx.Done():
 		c.logger.Warn("context canceled while waiting for performance standby readiness")
 		c.perfStandby = false // Failed to become performance standby
 		c.standby = true      // Revert to regular standby
-		if c.perfStandbyGauge != nil {
-			c.perfStandbyGauge.Set(0)
-		}
+		metrics.SetGauge([]string{"core", "performance_standby"}, 0)
 		return ctx.Err()
 	}
 }
@@ -691,9 +680,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 			c.perfStandby = false // Becoming active means not a performance standby
 			c.leaderUUID = uuidValue
 			c.metricSink.SetGaugeWithLabels([]string{"core", "active"}, 1, nil)
-			if c.perfStandbyGauge != nil {
-				c.perfStandbyGauge.Set(0)
-			}
+			metrics.SetGauge([]string{"core", "performance_standby"}, 0)
 		}
 
 		c.stateLock.Unlock()
@@ -705,9 +692,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 				c.logger.Error("failed to unlock HA lock", "error", unlockErr)
 			}
 			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTimeValue)
-			if c.perfStandbyGauge != nil {
-				c.perfStandbyGauge.Set(0) // Failed to become active, ensure gauge is 0
-			}
+			metrics.SetGauge([]string{"core", "performance_standby"}, 0) // Failed to become active, ensure gauge is 0
 			continue
 		}
 
@@ -770,13 +755,11 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 				// Not attempting performance standby or conditions not met, ensure it's a regular standby
 				c.perfStandby = false
 				c.standby = true
-				if c.perfStandbyGauge != nil {
-					c.perfStandbyGauge.Set(0)
-				}
+				metrics.SetGauge([]string{"core", "performance_standby"}, 0)
 			}
 			// Ensure gauge reflects the final state
-			if !perfStandbyReady && c.perfStandbyGauge != nil {
-				c.perfStandbyGauge.Set(0)
+			if !perfStandbyReady {
+				metrics.SetGauge([]string{"core", "performance_standby"}, 0)
 			}
 
 			// Seal
@@ -1248,81 +1231,8 @@ func (c *Core) SetNeverBecomeActive(on bool) {
 // clearForwardingClients closes any existing forwarding clients.
 // c.requestForwardingConnectionLock must be held.
 func (c *Core) clearForwardingClients() {
-	if c.rpcClientConn != nil {
-		err := c.rpcClientConn.Close()
-		if err != nil {
-			c.logger.Error("failed to close RPC client connection", "error", err)
-		}
-		c.rpcClientConn = nil
-	}
-	c.rpcForwardingClient = nil
 	// This metric is related to client-side forwarding, not the performance standby state itself.
 	// Counters are not reset to 0 in this manner. If this was meant to be a gauge, it's being removed.
 	// The task is to remove `requests_forwarded` gauge reset.
 	// The new counter `core_performance_standby_requests_forwarded_total` will be incremented, not set.
-}
-
-// startForwardingClients starts the forwarding clients.
-// c.requestForwardingConnectionLock must be held.
-func (c *Core) startForwardingClients(ctx context.Context) error {
-	// Ensure previous connections are cleared
-	c.clearForwardingClients()
-
-	_, _, leaderClusterAddr, err := c.LeaderLocked()
-	if err != nil {
-		return fmt.Errorf("failed to get leader address for RPC forwarding: %w", err)
-	}
-	if leaderClusterAddr == "" {
-		return errors.New("leader cluster address is empty, cannot start RPC forwarding client")
-	}
-
-	clVal := c.clusterListener.Load()
-	if clVal == nil {
-		return errors.New("cluster listener is not initialized, cannot get TLS config for RPC forwarding")
-	}
-	cl, ok := clVal.(*cluster.Listener)
-	if !ok || cl == nil {
-		return errors.New("cluster listener is of unexpected type or nil, cannot get TLS config for RPC forwarding")
-	}
-
-	tlsConfig, err := cl.TLSConfig(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get TLS config for RPC forwarding: %w", err)
-	}
-	if tlsConfig == nil {
-		return errors.New("obtained nil TLS config for RPC forwarding")
-	}
-
-	// The leaderClusterAddr might be an IP address. For TLS verification,
-	// ServerName should match one of the names in the leader's certificate.
-	// We might need to parse leaderClusterAddr to extract the host if it includes a port,
-	// or use a pre-configured server name if available (e.g. from cluster config).
-	// For now, we'll assume the address is usable as ServerName or that the cert matches the IP.
-	// If the leader's cert is for a hostname, and leaderClusterAddr is an IP, this might need adjustment.
-	// A common pattern is to use the leader's advertised redirectAddr's host as ServerName if available and secure.
-	// However, redirectAddr is for client redirection, clusterAddr is for internode.
-	// Let's parse the leaderClusterAddr to extract host.
-	u, err := url.Parse("scheme://" + leaderClusterAddr) // scheme is dummy for parsing host
-	if err == nil && u.Hostname() != "" {
-		tlsConfig.ServerName = u.Hostname()
-		c.logger.Debug("setting TLS ServerName for RPC forwarding client", "server_name", u.Hostname())
-	} else {
-		c.logger.Warn("could not parse hostname from leaderClusterAddr for TLS ServerName", "addr", leaderClusterAddr, "error", err)
-		// Proceeding without ServerName, relies on cert matching IP or being in InsecureSkipVerify (not recommended)
-	}
-	// Ensure NextProtos includes "h2" for gRPC over HTTP/2
-	tlsConfig.NextProtos = []string{"h2"}
-
-	creds := credentials.NewTLS(tlsConfig)
-	conn, err := grpc.DialContext(ctx, leaderClusterAddr, grpc.WithTransportCredentials(creds), grpc.WithBlock())
-	if err != nil {
-		c.logger.Error("failed to securely dial leader for RPC forwarding", "address", leaderClusterAddr, "error", err)
-		return fmt.Errorf("failed to securely dial leader for RPC forwarding: %w", err)
-	}
-
-	c.rpcClientConn = conn
-	c.rpcForwardingClient = forwarding.NewForwardingServiceClient(c.rpcClientConn)
-	c.logger.Info("Secure RPC forwarding client started and connected", "leader_address", leaderClusterAddr)
-
-	return nil
 }

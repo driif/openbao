@@ -511,12 +511,12 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		firstIteration = false
 
 		// Create a lock
-		uuidValue, err := uuid.GenerateUUID()
+		uuid, err := uuid.GenerateUUID()
 		if err != nil {
 			c.logger.Error("failed to generate uuid", "error", err)
 			continue
 		}
-		lock, err := c.ha.LockWith(CoreLockPath, uuidValue)
+		lock, err := c.ha.LockWith(CoreLockPath, uuid)
 		if err != nil {
 			c.logger.Error("failed to create lock", "error", err)
 			continue
@@ -662,7 +662,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 
 		}
 		// Advertise as leader
-		if err := c.advertiseLeader(activeCtx, uuidValue, leaderLostCh); err != nil {
+		if err := c.advertiseLeader(activeCtx, uuid, leaderLostCh); err != nil {
 			c.heldHALock = nil
 			if unlockErr := lock.Unlock(); unlockErr != nil {
 				c.logger.Error("failed to unlock HA lock", "error", unlockErr)
@@ -678,7 +678,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 		if err == nil {
 			c.standby = false
 			c.perfStandby = false // Becoming active means not a performance standby
-			c.leaderUUID = uuidValue
+			c.leaderUUID = uuid
 			c.metricSink.SetGaugeWithLabels([]string{"core", "active"}, 1, nil)
 			metrics.SetGauge([]string{"core", "performance_standby"}, 0)
 		}
@@ -769,7 +769,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 
 			// If we are not meant to keep the HA lock, clear it
 			if atomic.LoadUint32(c.keepHALockOnStepDown) == 0 {
-				if err := c.clearLeader(uuidValue); err != nil {
+				if err := c.clearLeader(uuid); err != nil {
 					c.logger.Error("clearing leader advertisement failed", "error", err)
 				}
 
@@ -1138,9 +1138,9 @@ func (c *Core) acquireLock(lock physical.Lock, stopCh <-chan struct{}) <-chan st
 }
 
 // advertiseLeader is used to advertise the current node as leader
-func (c *Core) advertiseLeader(ctx context.Context, uuidValue string, leaderLostCh <-chan struct{}) error {
+func (c *Core) advertiseLeader(ctx context.Context, uuid string, leaderLostCh <-chan struct{}) error {
 	if leaderLostCh != nil {
-		go c.cleanLeaderPrefix(ctx, uuidValue, leaderLostCh)
+		go c.cleanLeaderPrefix(ctx, uuid, leaderLostCh)
 	}
 
 	var key *ecdsa.PrivateKey
@@ -1173,7 +1173,7 @@ func (c *Core) advertiseLeader(ctx context.Context, uuidValue string, leaderLost
 		return err
 	}
 	ent := &logical.StorageEntry{
-		Key:   coreLeaderPrefix + uuidValue,
+		Key:   coreLeaderPrefix + uuid,
 		Value: val,
 	}
 	err = c.barrier.Put(ctx, ent)
@@ -1191,7 +1191,7 @@ func (c *Core) advertiseLeader(ctx context.Context, uuidValue string, leaderLost
 	return nil
 }
 
-func (c *Core) cleanLeaderPrefix(ctx context.Context, uuidValue string, leaderLostCh <-chan struct{}) {
+func (c *Core) cleanLeaderPrefix(ctx context.Context, uuid string, leaderLostCh <-chan struct{}) {
 	keys, err := c.barrier.List(ctx, coreLeaderPrefix)
 	if err != nil {
 		c.logger.Error("failed to list entries in core/leader", "error", err)
@@ -1201,7 +1201,7 @@ func (c *Core) cleanLeaderPrefix(ctx context.Context, uuidValue string, leaderLo
 		timer := time.NewTimer(leaderPrefixCleanDelay)
 		select {
 		case <-timer.C:
-			if keys[0] != uuidValue {
+			if keys[0] != uuid {
 				if err := c.barrier.Delete(ctx, coreLeaderPrefix+keys[0]); err != nil {
 					c.logger.Error("failed to delete leader prefix entry", "key", keys[0], "error", err)
 				}
@@ -1215,8 +1215,8 @@ func (c *Core) cleanLeaderPrefix(ctx context.Context, uuidValue string, leaderLo
 }
 
 // clearLeader is used to clear our leadership entry
-func (c *Core) clearLeader(uuidValue string) error {
-	key := coreLeaderPrefix + uuidValue
+func (c *Core) clearLeader(uuid string) error {
+	key := coreLeaderPrefix + uuid
 	return c.barrier.Delete(context.Background(), key)
 }
 

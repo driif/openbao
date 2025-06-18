@@ -1072,9 +1072,10 @@ func NewCore(conf *CoreConfig) (*Core, error) {
 		return nil, err
 	}
 
-	// coreInit was previously called here, but its contents related to metrics
-	// are now in CreateCore for earlier metric registration.
-	// If coreInit had other responsibilities, they would remain or be integrated here/CreateCore.
+	err = coreInit(c, conf)
+	if err != nil {
+		return nil, err
+	}
 
 	// Construct a new AES-GCM barrier
 	c.barrier, err = NewAESGCMBarrier(c.physical)

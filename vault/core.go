@@ -290,7 +290,8 @@ type Core struct {
 	sealed    *uint32
 
 	standby              bool
-	perfStandby          bool // Indicates if the node is a performance standby
+	perfStandby          bool   // Indicates if the node is a performance standby
+	lastRemoteWALIndex   uint64 // Track last remote WAL for performance standby
 	standbyDoneCh        chan struct{}
 	standbyStopCh        *atomic.Value
 	manualStepDownCh     chan struct{}
@@ -3930,6 +3931,31 @@ func (c *Core) GetRaftAutopilotState(ctx context.Context) (*raft.AutopilotState,
 	}
 
 	return raftBackend.GetAutopilotServerState(ctx)
+}
+
+// getLastRemoteWAL returns the last WAL index received from the active node
+// This should be implemented to track replication state for performance standbys
+func (c *Core) getLastRemoteWAL() uint64 {
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+
+	if !c.perfStandby {
+		return 0
+	}
+
+	// Placeholder implementation
+	// In production, this should return the actual last remote WAL index
+	return c.lastRemoteWALIndex
+}
+
+// SetLastRemoteWAL sets the last remote WAL index for performance standbys
+func (c *Core) setLastRemoteWAL(index uint64) {
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+
+	if c.perfStandby {
+		c.lastRemoteWALIndex = index
+	}
 }
 
 func (c *Core) DetectStateLockDeadlocks() bool {

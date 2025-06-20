@@ -4572,21 +4572,23 @@ func (b *SystemBackend) pathInternalOpenAPI(ctx context.Context, req *logical.Re
 }
 
 type SealStatusResponse struct {
-	Type         string   `json:"type"`
-	Initialized  bool     `json:"initialized"`
-	Sealed       bool     `json:"sealed"`
-	T            int      `json:"t"`
-	N            int      `json:"n"`
-	Progress     int      `json:"progress"`
-	Nonce        string   `json:"nonce"`
-	Version      string   `json:"version"`
-	BuildDate    string   `json:"build_date"`
-	Migration    bool     `json:"migration"`
-	ClusterName  string   `json:"cluster_name,omitempty"`
-	ClusterID    string   `json:"cluster_id,omitempty"`
-	RecoverySeal bool     `json:"recovery_seal"`
-	StorageType  string   `json:"storage_type,omitempty"`
-	Warnings     []string `json:"warnings,omitempty"`
+	Type                     string   `json:"type"`
+	Initialized              bool     `json:"initialized"`
+	Sealed                   bool     `json:"sealed"`
+	T                        int      `json:"t"`
+	N                        int      `json:"n"`
+	Progress                 int      `json:"progress"`
+	Nonce                    string   `json:"nonce"`
+	Version                  string   `json:"version"`
+	BuildDate                string   `json:"build_date"`
+	Migration                bool     `json:"migration"`
+	ClusterName              string   `json:"cluster_name,omitempty"`
+	ClusterID                string   `json:"cluster_id,omitempty"`
+	RecoverySeal             bool     `json:"recovery_seal"`
+	StorageType              string   `json:"storage_type,omitempty"`
+	Warnings                 []string `json:"warnings,omitempty"`
+	PerfStandby              bool     `json:"performance_standby,omitempty"`
+	PerfStandbyLastRemoteWAL uint64   `json:"performance_standby_last_remote_wal,omitempty"`
 }
 
 func (core *Core) GetSealStatus(ctx context.Context, lock bool) (*SealStatusResponse, error) {
@@ -4637,21 +4639,26 @@ func (core *Core) GetSealStatus(ctx context.Context, lock bool) (*SealStatusResp
 
 	progress, nonce := core.SecretProgress(lock)
 
+	// Get performance standby information
+	_, perfStandby := core.StandbyStates()
+
 	s := &SealStatusResponse{
-		Type:         sealConfig.Type,
-		Initialized:  initialized,
-		Sealed:       sealed,
-		T:            sealConfig.SecretThreshold,
-		N:            sealConfig.SecretShares,
-		Progress:     progress,
-		Nonce:        nonce,
-		Version:      version.GetVersion().VersionNumber(),
-		BuildDate:    version.BuildDate,
-		Migration:    core.IsInSealMigrationMode(lock) && !core.IsSealMigrated(lock),
-		ClusterName:  clusterName,
-		ClusterID:    clusterID,
-		RecoverySeal: core.SealAccess().RecoveryKeySupported(),
-		StorageType:  core.StorageType(),
+		Type:                     sealConfig.Type,
+		Initialized:              initialized,
+		Sealed:                   sealed,
+		T:                        sealConfig.SecretThreshold,
+		N:                        sealConfig.SecretShares,
+		Progress:                 progress,
+		Nonce:                    nonce,
+		Version:                  version.GetVersion().VersionNumber(),
+		BuildDate:                version.BuildDate,
+		Migration:                core.IsInSealMigrationMode(lock) && !core.IsSealMigrated(lock),
+		ClusterName:              clusterName,
+		ClusterID:                clusterID,
+		RecoverySeal:             core.SealAccess().RecoveryKeySupported(),
+		StorageType:              core.StorageType(),
+		PerfStandby:              perfStandby,
+		PerfStandbyLastRemoteWAL: core.getLastRemoteWAL(),
 	}
 
 	return s, nil

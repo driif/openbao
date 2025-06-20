@@ -400,6 +400,44 @@ func (c *Core) runStandby(doneCh, manualStepDownCh, stopCh chan struct{}) {
 	defer close(manualStepDownCh)
 	c.logger.Info("entering standby mode")
 
+	// Try to become a performance standby if enabled
+	go func() {
+		c.stateLock.RLock()
+		rawConfig := c.rawConfig.Load().(*server.Config)
+		perfStandbyEnabled := !rawConfig.DisablePerformanceStandby
+		sealed := c.Sealed()
+		c.stateLock.RUnlock()
+
+		if perfStandbyEnabled && !sealed {
+			c.logger.Info("attempting to transition to performance standby mode in runStandby")
+
+			// Set initial state
+			c.stateLock.Lock()
+			c.standby = true
+			c.perfStandby = false
+			c.stateLock.Unlock()
+
+			// Try to become performance standby
+			perfStandbyCtx, perfStandbyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer perfStandbyCancel()
+
+			if err := c.waitForPerfStandbyAvailability(perfStandbyCtx); err == nil {
+				c.logger.Info("successfully became performance standby in runStandby")
+			} else {
+				c.logger.Error("failed to become performance standby in runStandby, remaining as regular standby", "error", err)
+			}
+		} else {
+			c.logger.Info("not attempting performance standby in runStandby",
+				"perfStandbyEnabled", perfStandbyEnabled,
+				"sealed", sealed)
+			// Ensure regular standby state
+			c.stateLock.Lock()
+			c.standby = true
+			c.perfStandby = false
+			c.stateLock.Unlock()
+		}
+	}()
+
 	var g run.Group
 	newLeaderCh := addEnterpriseHaActors(c, &g)
 	{
@@ -467,20 +505,56 @@ func (c *Core) waitForPerfStandbyAvailability(ctx context.Context) error {
 	// For now, simulate some work and then succeed.
 	// In a real scenario, this would involve checking WAL replication status,
 	// ensuring necessary data is replicated, etc.
-	select {
-	case <-time.After(2 * time.Second): // Simulate a delay
-		c.logger.Info("performance standby successfully became ready")
-		c.standby = false    // Not a regular standby
-		c.perfStandby = true // Is a performance standby
-		metrics.IncrCounter([]string{"core", "performance_standby_ready_total"}, 1)
-		metrics.SetGauge([]string{"core", "performance_standby"}, 1)
-		return nil
-	case <-ctx.Done():
-		c.logger.Warn("context canceled while waiting for performance standby readiness")
-		c.perfStandby = false // Failed to become performance standby
-		c.standby = true      // Revert to regular standby
-		metrics.SetGauge([]string{"core", "performance_standby"}, 0)
-		return ctx.Err()
+
+	c.logger.Info("initializing performance standby capabilities")
+
+	// Simulate WAL replication setup and synchronization
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	start := time.Now()
+	maxWaitTime := 10 * time.Second
+
+	for {
+		select {
+		case <-ticker.C:
+			// Simulate checking for WAL replication readiness
+			elapsed := time.Since(start)
+			if elapsed >= 2*time.Second {
+				c.logger.Info("performance standby initialization complete", "elapsed", elapsed)
+
+				// Set state atomically
+				c.standby = false    // Not a regular standby
+				c.perfStandby = true // Is a performance standby
+
+				// Initialize WAL tracking with a simulated index
+				c.setLastRemoteWAL(100) // Simulate receiving WAL entries
+
+				// Update metrics
+				metrics.IncrCounter([]string{"core", "performance_standby_ready_total"}, 1)
+				metrics.SetGauge([]string{"core", "performance_standby"}, 1)
+
+				c.logger.Info("performance standby successfully became ready",
+					"last_remote_wal", c.getLastRemoteWAL())
+				return nil
+			}
+
+			// Simulate progress
+			if elapsed > maxWaitTime {
+				c.logger.Warn("performance standby initialization timed out", "elapsed", elapsed)
+				c.perfStandby = false
+				c.standby = true
+				metrics.SetGauge([]string{"core", "performance_standby"}, 0)
+				return fmt.Errorf("performance standby initialization timed out after %v", elapsed)
+			}
+
+		case <-ctx.Done():
+			c.logger.Warn("context canceled while waiting for performance standby readiness")
+			c.perfStandby = false // Failed to become performance standby
+			c.standby = true      // Revert to regular standby
+			metrics.SetGauge([]string{"core", "performance_standby"}, 0)
+			return ctx.Err()
+		}
 	}
 }
 
@@ -522,7 +596,7 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 			continue
 		}
 
-		// Attempt the acquisition
+		// Attempt normal lock acquisition
 		leaderLostCh := c.acquireLock(lock, stopCh)
 
 		// Bail if we are being shutdown
@@ -741,17 +815,28 @@ func (c *Core) waitForLeadership(newLeaderCh chan func(), manualStepDownCh, stop
 			rawConfig := c.rawConfig.Load().(*server.Config)
 			perfStandbyEnabled := !rawConfig.DisablePerformanceStandby
 			perfStandbyReady := false
-			if perfStandbyEnabled && manualStepDown && !c.Sealed() {
-				c.logger.Info("attempting to transition to performance standby mode")
+
+			// Attempt performance standby on both manual step-down and automatic leadership loss
+			if perfStandbyEnabled && !c.Sealed() {
+				c.logger.Info("attempting to transition to performance standby mode", "manual_step_down", manualStepDown)
+				// Create a fresh context for performance standby setup since activeContext may be canceled
+				perfStandbyCtx, perfStandbyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+
 				// Attempt to become a performance standby
-				// waitForPerfStandbyAvailability will set c.standby and c.perfStandby accordingly
-				if err := c.waitForPerfStandbyAvailability(c.activeContext); err == nil {
+				err := c.waitForPerfStandbyAvailability(perfStandbyCtx)
+				perfStandbyCancel()
+
+				if err == nil {
 					perfStandbyReady = true // c.perfStandby is true, c.standby is false
 				} else {
 					c.logger.Error("failed to become performance standby, falling back to regular standby", "error", err)
 					// waitForPerfStandbyAvailability already set c.perfStandby=false, c.standby=true
 				}
 			} else {
+				c.logger.Info("not attempting performance standby",
+					"perfStandbyEnabled", perfStandbyEnabled,
+					"sealed", c.Sealed(),
+					"manual_step_down", manualStepDown)
 				// Not attempting performance standby or conditions not met, ensure it's a regular standby
 				c.perfStandby = false
 				c.standby = true

@@ -2065,3 +2065,14 @@ func boltOptions(path string) *bolt.Options {
 
 	return o
 }
+
+func (b *RaftBackend) IsCurrentlyLeader() bool {
+	b.l.RLock()
+	defer b.l.RUnlock()
+
+	if b.raft == nil {
+		return false
+	}
+
+	return b.raft.State() == raft.Leader
+}

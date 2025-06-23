@@ -1,8 +1,58 @@
 # RFC: Performance Standby Status Reporting - Implementation Analysis
 
-## Overview
+## Problem Statement
 
-This document analyzes the implementation of performance standby status reporting in OpenBao after extensive investigation and code changes. It documents what works, what doesn't work, and the root causes discovered.
+Currently, OpenBao's `bao status` command does not properly report performance standby information for standby nodes. When running a horizontally scaled cluster with performance standby nodes, operators cannot easily determine:
+
+1. Whether a node is operating as a performance standby
+2. The last remote WAL index processed by the performance standby
+3. The overall health and synchronization status of standby nodes
+
+### Current Status Output
+```
+Key                     Value
+---                     -----
+Seal Type               shamir
+Initialized             true
+Sealed                  false
+Total Shares            5
+Threshold               3
+Version                 2.0.0-HEAD
+Build Date              2025-06-16T14:22:35Z
+Storage Type            raft
+Cluster Name            vault-cluster-76582241
+Cluster ID              48bc5d2e-1330-a868-6d73-05dff0b6b74e
+HA Enabled              true
+HA Cluster              https://127.0.0.1:8201
+HA Mode                 active
+Active Since            2025-06-19T08:52:02.271484Z
+Raft Committed Index    30
+Raft Applied Index      30
+```
+
+### Desired Status Output (for Performance Standby)
+```
+Key                                    Value
+---                                    -----
+Seal Type                              shamir
+Initialized                            true
+Sealed                                 false
+Total Shares                           5
+Threshold                              3
+Version                                2.3.0
+Build Date                             2025-06-19T14:22:35Z
+Storage Type                           raft
+Cluster Name                           vault-cluster-26345dd9
+Cluster ID                             91d0351b-2ca4-c61b-c701-eb1c7da743ea
+HA Enabled                             true
+HA Cluster                             https://127.0.0.1:8201
+HA Mode                                standby
+Active Node Address                    http://127.0.0.1:8200
+Performance Standby Node               true
+Performance Standby Last Remote WAL    104
+Raft Committed Index                   269
+Raft Applied Index                     269
+```
 
 ## Problem Statement - CORRECTED
 

@@ -36,12 +36,13 @@ func (c *Sys) HealthWithContext(ctx context.Context) (*HealthResponse, error) {
 }
 
 type HealthResponse struct {
-	Initialized   bool   `json:"initialized"`
-	Sealed        bool   `json:"sealed"`
-	Standby       bool   `json:"standby"`
-	ServerTimeUTC int64  `json:"server_time_utc"`
-	Version       string `json:"version"`
-	ClusterName   string `json:"cluster_name,omitempty"`
-	ClusterID     string `json:"cluster_id,omitempty"`
-	LastWAL       uint64 `json:"last_wal,omitempty"`
+	Initialized        bool   `json:"initialized"`
+	Sealed             bool   `json:"sealed"`
+	Standby            bool   `json:"standby"`
+	PerformanceStandby bool   `json:"performance_standby"`
+	ServerTimeUTC      int64  `json:"server_time_utc"`
+	Version            string `json:"version"`
+	ClusterName        string `json:"cluster_name,omitempty"`
+	ClusterID          string `json:"cluster_id,omitempty"`
+	LastWAL            uint64 `json:"last_wal,omitempty"`
 }

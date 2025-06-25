@@ -169,7 +169,7 @@ func getSysHealth(core *vault.Core, r *http.Request) (int, *HealthResponse, erro
 		Initialized:                init,
 		Sealed:                     sealed,
 		Standby:                    standby,
-		PerformanceStandby:         perfStandby, // Use the actual perfStandby value
+		PerformanceStandby:         perfStandby,
 		ReplicationPerformanceMode: replicationState.GetPerformanceString(),
 		ReplicationDRMode:          replicationState.GetDRString(),
 		ServerTimeUTC:              time.Now().UTC().Unix(),

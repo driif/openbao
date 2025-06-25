@@ -53,14 +53,23 @@ var addEnterpriseHaActors func(*Core, *run.Group) chan func() = addEnterpriseHaA
 
 func addEnterpriseHaActorsNoop(*Core, *run.Group) chan func() { return nil }
 
-// Standby checks if the Vault is in standby mode
+// Standby checks if the node is in standby mode
 func (c *Core) Standby() (bool, error) {
 	c.stateLock.RLock()
 	standby := c.standby
-	perfStandby := c.perfStandby
 	c.stateLock.RUnlock()
 	// A node is considered "standby" if it's either a regular standby or a performance standby.
-	return standby || perfStandby, nil
+	return standby, nil
+}
+
+// PerfStandby checks if the node is a performance standby
+// This function cannot be used during request handling
+// because this causes a deadlock with the statelock.
+func (c *Core) PerfStandby() bool {
+	c.stateLock.RLock()
+	perfStandby := c.perfStandby
+	c.stateLock.RUnlock()
+	return perfStandby
 }
 
 func (c *Core) ActiveTime() time.Time {
@@ -154,8 +163,8 @@ func (c *Core) LeaderLocked() (isLeader bool, leaderAddr, clusterAddr string, er
 		return false, "", "", consts.ErrSealed
 	}
 
-	// Check if we are the leader (not standby and not performance standby)
-	if !c.standby && !c.perfStandby {
+	// Check if we are the leader
+	if !c.standby {
 		return true, c.redirectAddr, c.ClusterAddr(), nil
 	}
 

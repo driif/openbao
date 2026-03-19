@@ -77,6 +77,8 @@ func Backend(ctx context.Context, conf *logical.BackendConfig) (*backend, error)
 			b.pathCacheConfig(),
 			b.pathConfigKeys(),
 			b.pathKmipConfig(),
+			b.pathKmipRoleList(),
+			b.pathKmipRole(),
 			b.pathCreateCSR(),
 			b.pathImportCertChain(),
 		},

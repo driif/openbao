@@ -54,13 +54,13 @@ The `ovh/kmip-go` library (already an indirect dependency via go-kms-wrapping) p
 - Create: `builtin/logical/transit/path_kmip_role_test.go`
 - Modify: `builtin/logical/transit/backend.go` (register path)
 
-- [ ] Define `kmipRole` struct: `CertSubjectDN string`, `AllowedOperations []string`, `AllowedKeyNames []string`
-- [ ] Implement `pathKmipRole()` at pattern `kmip/roles/{name}` supporting create/read/list/delete
-- [ ] Implement `pathKmipRoleList()` at `kmip/roles/` with list operation
-- [ ] Store roles at storage path `kmip/roles/<name>`
-- [ ] Register paths in `Backend()`
-- [ ] Write tests for role CRUD and listing
-- [ ] Run tests - must pass
+- [x] Define `kmipRole` struct: `CertSubjectDN string`, `AllowedOperations []string`, `AllowedKeyNames []string`
+- [x] Implement `pathKmipRole()` at pattern `kmip/roles/{name}` supporting create/read/list/delete
+- [x] Implement `pathKmipRoleList()` at `kmip/roles/` with list operation
+- [x] Store roles at storage path `kmip/roles/<name>`
+- [x] Register paths in `Backend()`
+- [x] Write tests for role CRUD and listing
+- [x] Run tests - must pass
 
 ### Task 3: KMIP Server Lifecycle
 

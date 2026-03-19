@@ -163,14 +163,14 @@ The `ovh/kmip-go` library (already an indirect dependency via go-kms-wrapping) p
 **Files:**
 - Create: `builtin/logical/transit/kmip_integration_test.go`
 
-- [ ] Write an end-to-end test that:
+- [x] Write an end-to-end test that:
   - starts a transit backend with KMIP enabled on a random port
   - connects using `ovh/kmip-go`'s `kmipclient` package
   - exercises Create, GetAttributes, Locate, Encrypt, Decrypt, Destroy operations
   - verifies auth middleware rejects unauthenticated connections
-- [ ] Run full integration test: `go test -run TestKmip ./builtin/logical/transit/...`
-- [ ] Run full test suite: `go test ./builtin/logical/transit/...`
-- [ ] Run linter: `make lint` or `golangci-lint run ./builtin/logical/transit/...`
+- [x] Run full integration test: `go test -run TestKmip ./builtin/logical/transit/...`
+- [x] Run full test suite: `go test ./builtin/logical/transit/...`
+- [x] Run linter: `make lint` or `golangci-lint run ./builtin/logical/transit/...`
 
 ### Task 8: Verify acceptance criteria
 

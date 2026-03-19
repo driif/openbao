@@ -79,7 +79,7 @@ func TestKmipIntegration_EndToEnd(t *testing.T) {
 	}
 	srv, err := newTransitKmipServer(cfg, b)
 	require.NoError(t, err)
-	require.NoError(t, srv.Start())
+	srv.Start()
 	t.Cleanup(func() { _ = srv.Stop() })
 
 	// Connect the authorised client.
@@ -156,7 +156,7 @@ func TestKmipIntegration_UnknownClientRejected(t *testing.T) {
 	}
 	srv, err := newTransitKmipServer(cfg, b)
 	require.NoError(t, err)
-	require.NoError(t, srv.Start())
+	srv.Start()
 	t.Cleanup(func() { _ = srv.Stop() })
 
 	// The known client should succeed.

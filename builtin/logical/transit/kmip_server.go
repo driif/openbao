@@ -82,13 +82,12 @@ func newTransitKmipServer(cfg *kmipConfig, b *backend) (*transitKmipServer, erro
 }
 
 // Start begins serving KMIP connections in a background goroutine.
-func (s *transitKmipServer) Start() error {
+func (s *transitKmipServer) Start() {
 	go func() {
 		if err := s.srv.Serve(); err != nil && err != kmipserver.ErrShutdown {
 			s.b.Logger().Error("KMIP server stopped with error", "error", err)
 		}
 	}()
-	return nil
 }
 
 // Stop gracefully shuts down the KMIP server.
@@ -124,9 +123,7 @@ func (b *backend) restartKmipServer(cfg *kmipConfig) error {
 		return fmt.Errorf("failed to create KMIP server: %w", err)
 	}
 
-	if err := srv.Start(); err != nil {
-		return fmt.Errorf("failed to start KMIP server: %w", err)
-	}
+	srv.Start()
 
 	b.kmipServer = srv
 	b.Logger().Info("KMIP server started", "listen_addr", cfg.ListenAddr)

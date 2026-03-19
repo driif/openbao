@@ -195,7 +195,7 @@ func TestAuthMiddleware_Integration(t *testing.T) {
 	}
 	srv, err := newTransitKmipServer(cfg, b)
 	require.NoError(t, err)
-	require.NoError(t, srv.Start())
+	srv.Start()
 	t.Cleanup(func() { _ = srv.Stop() })
 
 	caCertPool := x509.NewCertPool()

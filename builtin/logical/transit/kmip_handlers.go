@@ -82,6 +82,17 @@ func kmipAlgorithmToTransitType(alg kmip.CryptographicAlgorithm, bitLen int32) (
 	}
 }
 
+// kmipObjectTypeForKeyType returns the KMIP ObjectType for a given transit KeyType.
+func kmipObjectTypeForKeyType(t keysutil.KeyType) kmip.ObjectType {
+	switch t {
+	case keysutil.KeyType_RSA2048, keysutil.KeyType_RSA3072, keysutil.KeyType_RSA4096,
+		keysutil.KeyType_ECDSA_P256, keysutil.KeyType_ECDSA_P384, keysutil.KeyType_ECDSA_P521:
+		return kmip.ObjectTypePrivateKey
+	default:
+		return kmip.ObjectTypeSymmetricKey
+	}
+}
+
 // transitTypeToKmipAlgorithm maps a transit KeyType to a KMIP CryptographicAlgorithm and bit length.
 func transitTypeToKmipAlgorithm(t keysutil.KeyType) (kmip.CryptographicAlgorithm, int32) {
 	switch t {
@@ -423,7 +434,7 @@ func handleGetAttributes(ctx context.Context, b *backend, req *payloads.GetAttri
 
 	attrs := []kmip.Attribute{
 		{AttributeName: kmip.AttributeNameUniqueIdentifier, AttributeValue: name},
-		{AttributeName: kmip.AttributeNameObjectType, AttributeValue: kmip.ObjectTypeSymmetricKey},
+		{AttributeName: kmip.AttributeNameObjectType, AttributeValue: kmipObjectTypeForKeyType(p.Type)},
 		{AttributeName: kmip.AttributeNameCryptographicAlgorithm, AttributeValue: alg},
 		{AttributeName: kmip.AttributeNameCryptographicLength, AttributeValue: bitLen},
 		{AttributeName: kmip.AttributeNameState, AttributeValue: state},
@@ -475,6 +486,22 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 	keys, err := storage.List(ctx, "policy/")
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to list keys: %s", err)
+	}
+
+	// Filter by AllowedKeyNames if the role restricts key access.
+	role := kmipRoleFromContext(ctx)
+	if role != nil && len(role.AllowedKeyNames) > 0 {
+		allowed := make(map[string]bool, len(role.AllowedKeyNames))
+		for _, n := range role.AllowedKeyNames {
+			allowed[n] = true
+		}
+		filtered := keys[:0]
+		for _, k := range keys {
+			if allowed[k] {
+				filtered = append(filtered, k)
+			}
+		}
+		keys = filtered
 	}
 
 	// Apply offset if specified
@@ -535,6 +562,11 @@ func handleDestroy(ctx context.Context, b *backend, req *payloads.DestroyRequest
 // handleActivate implements the KMIP Activate operation.
 // Transit keys are always in the Active state, so this is a no-op that returns success.
 func handleActivate(ctx context.Context, b *backend, req *payloads.ActivateRequestPayload) (*payloads.ActivateResponsePayload, error) {
+	storage := b.storage
+	if storage == nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "storage not available")
+	}
+
 	name := req.UniqueIdentifier
 	if name == "" {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
@@ -543,6 +575,21 @@ func handleActivate(ctx context.Context, b *backend, req *payloads.ActivateReque
 	if err := authorizeOperation(ctx, kmip.OperationActivate, name); err != nil {
 		return nil, err
 	}
+
+	p, _, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
+		Storage: storage,
+		Name:    name,
+	}, b.GetRandomReader())
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to read key: %s", err)
+	}
+	if p == nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q not found", name)
+	}
+	if !b.System().CachingDisabled() {
+		p.Lock(false)
+	}
+	p.Unlock()
 
 	return &payloads.ActivateResponsePayload{
 		UniqueIdentifier: name,

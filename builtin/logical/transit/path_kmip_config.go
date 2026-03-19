@@ -198,7 +198,6 @@ func (b *backend) getKmipConfig(ctx context.Context, s logical.Storage) (*kmipCo
 
 // validateCACertPEM checks that the PEM string contains at least one valid X.509 certificate.
 func validateCACertPEM(pemStr string) error {
-	pool := x509.NewCertPool()
 	rest := []byte(pemStr)
 	found := false
 	for {
@@ -213,7 +212,6 @@ func validateCACertPEM(pemStr string) error {
 		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
 			return fmt.Errorf("invalid certificate block: %w", err)
 		}
-		pool.AppendCertsFromPEM([]byte(pemStr))
 		found = true
 	}
 	if !found {

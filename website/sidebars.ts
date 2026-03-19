@@ -376,6 +376,7 @@ const sidebars: SidebarsConfig = {
                     Transit: [
                         "secrets/transit/index",
                         "secrets/transit/key-wrapping-guide",
+                        "secrets/transit/kmip-server",
                     ],
                 },
             ],

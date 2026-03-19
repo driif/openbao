@@ -85,8 +85,7 @@ func TestKmipServer_StartStop(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 
-	err = srv.Start()
-	require.NoError(t, err)
+	srv.Start()
 
 	// Verify listening address
 	require.NotNil(t, srv.Addr())
@@ -112,7 +111,7 @@ func TestKmipServer_TLSConnection(t *testing.T) {
 
 	srv, err := newTransitKmipServer(cfg, b)
 	require.NoError(t, err)
-	require.NoError(t, srv.Start())
+	srv.Start()
 	t.Cleanup(func() { _ = srv.Stop() })
 
 	// Build a TLS client that trusts our self-signed server cert
@@ -146,7 +145,7 @@ func TestKmipServer_RejectsInvalidClientCert(t *testing.T) {
 
 	srv, err := newTransitKmipServer(cfg, b)
 	require.NoError(t, err)
-	require.NoError(t, srv.Start())
+	srv.Start()
 	t.Cleanup(func() { _ = srv.Stop() })
 
 	// Connect without a client cert - should fail TLS handshake.

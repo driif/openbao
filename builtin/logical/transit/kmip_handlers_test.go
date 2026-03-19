@@ -690,20 +690,21 @@ func TestHandleVerify_InvalidSignature(t *testing.T) {
 	signResp, err := handleSign(ctx, b, signReq)
 	require.NoError(t, err)
 
-	// Tamper with the signature
-	tampered := append([]byte(nil), signResp.SignatureData...)
-	tampered[len(tampered)-1] ^= 0xFF
+	// Tamper with the data (not the signature bytes), so the vault:v1: signature
+	// format remains valid but the cryptographic check fails. Transit returns
+	// valid=false in this case, not an error.
+	tamperedData := append([]byte(nil), data...)
+	tamperedData[len(tamperedData)-1] ^= 0xFF
 
 	verifyReq := &payloads.SignatureVerifyRequestPayload{
 		UniqueIdentifier: "sign-key2",
-		Data:             data,
-		SignatureData:    tampered,
+		Data:             tamperedData,
+		SignatureData:    signResp.SignatureData,
 	}
-	// transit verify with invalid sig returns error or invalid indicator
 	verifyResp, err := handleVerify(ctx, b, verifyReq)
-	if err == nil {
-		require.Equal(t, kmip.ValidityIndicatorInvalid, verifyResp.ValidityIndicator)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, verifyResp)
+	require.Equal(t, kmip.ValidityIndicatorInvalid, verifyResp.ValidityIndicator)
 }
 
 func TestHandleSign_MissingUID(t *testing.T) {

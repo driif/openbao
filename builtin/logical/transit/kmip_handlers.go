@@ -9,6 +9,7 @@ import (
 	"crypto/elliptic"
 	cryptoRand "crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"strconv"
@@ -147,7 +148,7 @@ func getKmipAttributeAlgorithmAndLength(ta kmip.TemplateAttribute) (kmip.Cryptog
 	return alg, length
 }
 
-// registerKmipHandlers registers all KMIP key management operation handlers with the executor.
+// registerKmipHandlers registers all KMIP key management and cryptographic operation handlers with the executor.
 // It is called from newTransitKmipServer after the auth middleware is registered.
 func registerKmipHandlers(executor *kmipserver.BatchExecutor, b *backend) {
 	executor.Route(kmip.OperationCreate, kmipserver.HandleFunc(func(ctx context.Context, req *payloads.CreateRequestPayload) (*payloads.CreateResponsePayload, error) {
@@ -173,6 +174,21 @@ func registerKmipHandlers(executor *kmipserver.BatchExecutor, b *backend) {
 	}))
 	executor.Route(kmip.OperationRegister, kmipserver.HandleFunc(func(ctx context.Context, req *payloads.RegisterRequestPayload) (*payloads.RegisterResponsePayload, error) {
 		return handleRegister(ctx, b, req)
+	}))
+	executor.Route(kmip.OperationEncrypt, kmipserver.HandleFunc(func(ctx context.Context, req *payloads.EncryptRequestPayload) (*payloads.EncryptResponsePayload, error) {
+		return handleEncrypt(ctx, b, req)
+	}))
+	executor.Route(kmip.OperationDecrypt, kmipserver.HandleFunc(func(ctx context.Context, req *payloads.DecryptRequestPayload) (*payloads.DecryptResponsePayload, error) {
+		return handleDecrypt(ctx, b, req)
+	}))
+	executor.Route(kmip.OperationSign, kmipserver.HandleFunc(func(ctx context.Context, req *payloads.SignRequestPayload) (*payloads.SignResponsePayload, error) {
+		return handleSign(ctx, b, req)
+	}))
+	executor.Route(kmip.OperationSignatureVerify, kmipserver.HandleFunc(func(ctx context.Context, req *payloads.SignatureVerifyRequestPayload) (*payloads.SignatureVerifyResponsePayload, error) {
+		return handleVerify(ctx, b, req)
+	}))
+	executor.Route(kmip.OperationQuery, kmipserver.HandleFunc(func(ctx context.Context, req *payloads.QueryRequestPayload) (*payloads.QueryResponsePayload, error) {
+		return handleQuery(ctx, b, req)
 	}))
 }
 
@@ -558,6 +574,233 @@ func handleRevoke(ctx context.Context, b *backend, req *payloads.RevokeRequestPa
 	return &payloads.RevokeResponsePayload{
 		UniqueIdentifier: name,
 	}, nil
+}
+
+// handleEncrypt implements the KMIP Encrypt operation by calling transit encrypt.
+// The KMIP Data field (plaintext bytes) is base64-encoded and passed to transit.
+// The transit ciphertext string is returned as the KMIP Data field.
+func handleEncrypt(ctx context.Context, b *backend, req *payloads.EncryptRequestPayload) (*payloads.EncryptResponsePayload, error) {
+	storage := b.storage
+	if storage == nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "storage not available")
+	}
+
+	name := req.UniqueIdentifier
+	if name == "" {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	}
+	if len(req.Data) == 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (plaintext) is required")
+	}
+
+	if err := authorizeOperation(ctx, kmip.OperationEncrypt, name); err != nil {
+		return nil, err
+	}
+
+	plaintext := base64.StdEncoding.EncodeToString(req.Data)
+	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "encrypt/"+name, map[string]interface{}{
+		"plaintext": plaintext,
+	})
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to encrypt: %s", err)
+	}
+
+	ciphertext, ok := resp.Data["ciphertext"].(string)
+	if !ok || ciphertext == "" {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "transit encrypt returned no ciphertext")
+	}
+
+	return &payloads.EncryptResponsePayload{
+		UniqueIdentifier: name,
+		Data:             []byte(ciphertext),
+	}, nil
+}
+
+// handleDecrypt implements the KMIP Decrypt operation by calling transit decrypt.
+// The KMIP Data field contains the transit ciphertext string (as bytes).
+// The decrypted plaintext bytes are returned as the KMIP Data field.
+func handleDecrypt(ctx context.Context, b *backend, req *payloads.DecryptRequestPayload) (*payloads.DecryptResponsePayload, error) {
+	storage := b.storage
+	if storage == nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "storage not available")
+	}
+
+	name := req.UniqueIdentifier
+	if name == "" {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	}
+	if len(req.Data) == 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (ciphertext) is required")
+	}
+
+	if err := authorizeOperation(ctx, kmip.OperationDecrypt, name); err != nil {
+		return nil, err
+	}
+
+	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "decrypt/"+name, map[string]interface{}{
+		"ciphertext": string(req.Data),
+	})
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to decrypt: %s", err)
+	}
+
+	plaintextB64, ok := resp.Data["plaintext"].(string)
+	if !ok {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "transit decrypt returned no plaintext")
+	}
+
+	plaintext, err := base64.StdEncoding.DecodeString(plaintextB64)
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to decode plaintext: %s", err)
+	}
+
+	return &payloads.DecryptResponsePayload{
+		UniqueIdentifier: name,
+		Data:             plaintext,
+	}, nil
+}
+
+// handleSign implements the KMIP Sign operation by calling transit sign.
+// The KMIP Data field (bytes to sign) is base64-encoded and passed as the transit 'input'.
+// The transit signature string is returned as the KMIP SignatureData field.
+func handleSign(ctx context.Context, b *backend, req *payloads.SignRequestPayload) (*payloads.SignResponsePayload, error) {
+	storage := b.storage
+	if storage == nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "storage not available")
+	}
+
+	name := req.UniqueIdentifier
+	if name == "" {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	}
+	if len(req.Data) == 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (input to sign) is required")
+	}
+
+	if err := authorizeOperation(ctx, kmip.OperationSign, name); err != nil {
+		return nil, err
+	}
+
+	input := base64.StdEncoding.EncodeToString(req.Data)
+	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "sign/"+name, map[string]interface{}{
+		"input": input,
+	})
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to sign: %s", err)
+	}
+
+	signature, ok := resp.Data["signature"].(string)
+	if !ok || signature == "" {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "transit sign returned no signature")
+	}
+
+	return &payloads.SignResponsePayload{
+		UniqueIdentifier: name,
+		SignatureData:    []byte(signature),
+	}, nil
+}
+
+// handleVerify implements the KMIP SignatureVerify operation by calling transit verify.
+// The KMIP Data field and SignatureData are passed to transit verify.
+// Returns ValidityIndicatorValid or ValidityIndicatorInvalid.
+func handleVerify(ctx context.Context, b *backend, req *payloads.SignatureVerifyRequestPayload) (*payloads.SignatureVerifyResponsePayload, error) {
+	storage := b.storage
+	if storage == nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "storage not available")
+	}
+
+	name := req.UniqueIdentifier
+	if name == "" {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	}
+	if len(req.Data) == 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (original input) is required")
+	}
+	if len(req.SignatureData) == 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "SignatureData is required")
+	}
+
+	if err := authorizeOperation(ctx, kmip.OperationSignatureVerify, name); err != nil {
+		return nil, err
+	}
+
+	input := base64.StdEncoding.EncodeToString(req.Data)
+	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "verify/"+name, map[string]interface{}{
+		"input":     input,
+		"signature": string(req.SignatureData),
+	})
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to verify: %s", err)
+	}
+
+	valid, _ := resp.Data["valid"].(bool)
+	indicator := kmip.ValidityIndicatorInvalid
+	if valid {
+		indicator = kmip.ValidityIndicatorValid
+	}
+
+	return &payloads.SignatureVerifyResponsePayload{
+		UniqueIdentifier:  name,
+		ValidityIndicator: indicator,
+	}, nil
+}
+
+// handleQuery implements the KMIP Query operation by returning server capabilities.
+// It reports the supported operations and object types for this transit KMIP server.
+func handleQuery(_ context.Context, _ *backend, req *payloads.QueryRequestPayload) (*payloads.QueryResponsePayload, error) {
+	resp := &payloads.QueryResponsePayload{}
+
+	wantOperations := false
+	wantObjects := false
+	wantServerInfo := false
+	for _, fn := range req.QueryFunction {
+		switch fn {
+		case kmip.QueryFunctionOperations:
+			wantOperations = true
+		case kmip.QueryFunctionObjects:
+			wantObjects = true
+		case kmip.QueryFunctionServerInformation:
+			wantServerInfo = true
+		}
+	}
+	// If no specific functions requested, return all info
+	if len(req.QueryFunction) == 0 {
+		wantOperations = true
+		wantObjects = true
+		wantServerInfo = true
+	}
+
+	if wantOperations {
+		resp.Operations = []kmip.Operation{
+			kmip.OperationCreate,
+			kmip.OperationRegister,
+			kmip.OperationGet,
+			kmip.OperationGetAttributes,
+			kmip.OperationLocate,
+			kmip.OperationActivate,
+			kmip.OperationRevoke,
+			kmip.OperationDestroy,
+			kmip.OperationEncrypt,
+			kmip.OperationDecrypt,
+			kmip.OperationSign,
+			kmip.OperationSignatureVerify,
+			kmip.OperationQuery,
+		}
+	}
+
+	if wantObjects {
+		resp.ObjectType = []kmip.ObjectType{
+			kmip.ObjectTypeSymmetricKey,
+			kmip.ObjectTypePrivateKey,
+			kmip.ObjectTypePublicKey,
+		}
+	}
+
+	if wantServerInfo {
+		resp.VendorIdentification = "OpenBao Transit KMIP Server"
+	}
+
+	return resp, nil
 }
 
 // handleRegister implements the KMIP Register operation by importing a pre-existing key into transit.

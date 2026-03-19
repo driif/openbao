@@ -569,3 +569,231 @@ func TestTransitTypeToKmipAlgorithm(t *testing.T) {
 		require.Equal(t, tc.expBits, bits)
 	}
 }
+
+// --- handleEncrypt / handleDecrypt round-trip tests ---
+
+func TestHandleEncryptDecrypt_AES256(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	createKeyViaTransit(t, b, b.storage, "enc-dec-key", "aes256-gcm96")
+
+	plaintext := []byte("hello kmip world")
+
+	encReq := &payloads.EncryptRequestPayload{
+		UniqueIdentifier: "enc-dec-key",
+		Data:             plaintext,
+	}
+	encResp, err := handleEncrypt(ctx, b, encReq)
+	require.NoError(t, err)
+	require.NotNil(t, encResp)
+	require.Equal(t, "enc-dec-key", encResp.UniqueIdentifier)
+	require.NotEmpty(t, encResp.Data)
+	// Ciphertext should be a transit-format string, not the plaintext
+	require.NotEqual(t, plaintext, encResp.Data)
+
+	decReq := &payloads.DecryptRequestPayload{
+		UniqueIdentifier: "enc-dec-key",
+		Data:             encResp.Data,
+	}
+	decResp, err := handleDecrypt(ctx, b, decReq)
+	require.NoError(t, err)
+	require.NotNil(t, decResp)
+	require.Equal(t, plaintext, decResp.Data)
+}
+
+func TestHandleEncrypt_MissingUID(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	_, err := handleEncrypt(ctx, b, &payloads.EncryptRequestPayload{Data: []byte("data")})
+	require.Error(t, err)
+}
+
+func TestHandleEncrypt_MissingData(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	_, err := handleEncrypt(ctx, b, &payloads.EncryptRequestPayload{UniqueIdentifier: "some-key"})
+	require.Error(t, err)
+}
+
+func TestHandleDecrypt_MissingUID(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	_, err := handleDecrypt(ctx, b, &payloads.DecryptRequestPayload{Data: []byte("vault:v1:data")})
+	require.Error(t, err)
+}
+
+func TestHandleDecrypt_MissingData(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	_, err := handleDecrypt(ctx, b, &payloads.DecryptRequestPayload{UniqueIdentifier: "some-key"})
+	require.Error(t, err)
+}
+
+func TestHandleEncrypt_Unauthorized(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+
+	createKeyViaTransit(t, b, b.storage, "enc-key", "aes256-gcm96")
+	_, err := handleEncrypt(context.Background(), b, &payloads.EncryptRequestPayload{
+		UniqueIdentifier: "enc-key",
+		Data:             []byte("data"),
+	})
+	require.Error(t, err)
+}
+
+// --- handleSign / handleVerify round-trip tests ---
+
+func TestHandleSignVerify_ECDSA_P256(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	createKeyViaTransit(t, b, b.storage, "sign-key", "ecdsa-p256")
+
+	data := []byte("data to sign")
+
+	signReq := &payloads.SignRequestPayload{
+		UniqueIdentifier: "sign-key",
+		Data:             data,
+	}
+	signResp, err := handleSign(ctx, b, signReq)
+	require.NoError(t, err)
+	require.NotNil(t, signResp)
+	require.Equal(t, "sign-key", signResp.UniqueIdentifier)
+	require.NotEmpty(t, signResp.SignatureData)
+
+	verifyReq := &payloads.SignatureVerifyRequestPayload{
+		UniqueIdentifier: "sign-key",
+		Data:             data,
+		SignatureData:    signResp.SignatureData,
+	}
+	verifyResp, err := handleVerify(ctx, b, verifyReq)
+	require.NoError(t, err)
+	require.NotNil(t, verifyResp)
+	require.Equal(t, kmip.ValidityIndicatorValid, verifyResp.ValidityIndicator)
+}
+
+func TestHandleVerify_InvalidSignature(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	createKeyViaTransit(t, b, b.storage, "sign-key2", "ecdsa-p256")
+
+	data := []byte("data to sign")
+	signReq := &payloads.SignRequestPayload{
+		UniqueIdentifier: "sign-key2",
+		Data:             data,
+	}
+	signResp, err := handleSign(ctx, b, signReq)
+	require.NoError(t, err)
+
+	// Tamper with the signature
+	tampered := append([]byte(nil), signResp.SignatureData...)
+	tampered[len(tampered)-1] ^= 0xFF
+
+	verifyReq := &payloads.SignatureVerifyRequestPayload{
+		UniqueIdentifier: "sign-key2",
+		Data:             data,
+		SignatureData:    tampered,
+	}
+	// transit verify with invalid sig returns error or invalid indicator
+	verifyResp, err := handleVerify(ctx, b, verifyReq)
+	if err == nil {
+		require.Equal(t, kmip.ValidityIndicatorInvalid, verifyResp.ValidityIndicator)
+	}
+}
+
+func TestHandleSign_MissingUID(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	_, err := handleSign(ctx, b, &payloads.SignRequestPayload{Data: []byte("data")})
+	require.Error(t, err)
+}
+
+func TestHandleSign_MissingData(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	_, err := handleSign(ctx, b, &payloads.SignRequestPayload{UniqueIdentifier: "some-key"})
+	require.Error(t, err)
+}
+
+func TestHandleVerify_MissingUID(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	_, err := handleVerify(ctx, b, &payloads.SignatureVerifyRequestPayload{
+		Data:          []byte("data"),
+		SignatureData: []byte("vault:v1:sig"),
+	})
+	require.Error(t, err)
+}
+
+func TestHandleVerify_MissingSignature(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	_, err := handleVerify(ctx, b, &payloads.SignatureVerifyRequestPayload{
+		UniqueIdentifier: "some-key",
+		Data:             []byte("data"),
+	})
+	require.Error(t, err)
+}
+
+// --- handleQuery tests ---
+
+func TestHandleQuery_AllFunctions(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	req := &payloads.QueryRequestPayload{}
+	resp, err := handleQuery(ctx, b, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotEmpty(t, resp.Operations)
+	require.NotEmpty(t, resp.ObjectType)
+	require.NotEmpty(t, resp.VendorIdentification)
+
+	// Check that key operations are listed
+	opSet := make(map[kmip.Operation]bool)
+	for _, op := range resp.Operations {
+		opSet[op] = true
+	}
+	require.True(t, opSet[kmip.OperationCreate])
+	require.True(t, opSet[kmip.OperationEncrypt])
+	require.True(t, opSet[kmip.OperationDecrypt])
+	require.True(t, opSet[kmip.OperationSign])
+	require.True(t, opSet[kmip.OperationSignatureVerify])
+	require.True(t, opSet[kmip.OperationQuery])
+}
+
+func TestHandleQuery_OnlyOperations(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	req := &payloads.QueryRequestPayload{
+		QueryFunction: []kmip.QueryFunction{kmip.QueryFunctionOperations},
+	}
+	resp, err := handleQuery(ctx, b, req)
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.Operations)
+	require.Empty(t, resp.ObjectType)
+	require.Empty(t, resp.VendorIdentification)
+}
+
+func TestHandleQuery_ServerInfo(t *testing.T) {
+	b, _ := setupHandlerBackend(t)
+	ctx := authCtx()
+
+	req := &payloads.QueryRequestPayload{
+		QueryFunction: []kmip.QueryFunction{kmip.QueryFunctionServerInformation},
+	}
+	resp, err := handleQuery(ctx, b, req)
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.VendorIdentification)
+	require.Empty(t, resp.Operations)
+}

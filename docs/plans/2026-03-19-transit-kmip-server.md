@@ -142,21 +142,21 @@ The `ovh/kmip-go` library (already an indirect dependency via go-kms-wrapping) p
 - Modify: `builtin/logical/transit/kmip_handlers.go`
 - Modify: `builtin/logical/transit/kmip_handlers_test.go`
 
-- [ ] Implement `handleEncrypt(ctx, req *payloads.EncryptRequestPayload) (*payloads.EncryptResponsePayload, error)`:
+- [x] Implement `handleEncrypt(ctx, req *payloads.EncryptRequestPayload) (*payloads.EncryptResponsePayload, error)`:
   - call transit `Encrypt` with plaintext from `Data`
   - return ciphertext as `Data`
-- [ ] Implement `handleDecrypt(ctx, req *payloads.DecryptRequestPayload) (*payloads.DecryptResponsePayload, error)`:
+- [x] Implement `handleDecrypt(ctx, req *payloads.DecryptRequestPayload) (*payloads.DecryptResponsePayload, error)`:
   - call transit `Decrypt` with ciphertext from `Data`
   - return plaintext as `Data`
-- [ ] Implement `handleSign(ctx, req *payloads.SignRequestPayload) (*payloads.SignResponsePayload, error)`:
+- [x] Implement `handleSign(ctx, req *payloads.SignRequestPayload) (*payloads.SignResponsePayload, error)`:
   - call transit `Sign`
-- [ ] Implement `handleVerify(ctx, req *payloads.VerifyRequestPayload) (*payloads.VerifyResponsePayload, error)`:
+- [x] Implement `handleVerify(ctx, req *payloads.VerifyRequestPayload) (*payloads.VerifyResponsePayload, error)`:
   - call transit `Verify`
-- [ ] Implement `handleQuery(ctx, req) (resp, error)`:
+- [x] Implement `handleQuery(ctx, req) (resp, error)`:
   - return supported operations list, server info
-- [ ] Register crypto handlers in `BatchExecutor`
-- [ ] Write tests for encrypt/decrypt/sign/verify round-trips
-- [ ] Run tests - must pass
+- [x] Register crypto handlers in `BatchExecutor`
+- [x] Write tests for encrypt/decrypt/sign/verify round-trips
+- [x] Run tests - must pass
 
 ### Task 7: Integration Tests
 

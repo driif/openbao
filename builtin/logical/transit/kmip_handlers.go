@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 
 	"github.com/openbao/openbao/sdk/v2/helper/keysutil"
@@ -21,6 +22,22 @@ import (
 	"github.com/ovh/kmip-go/payloads"
 	"github.com/ovh/kmip-go/ttlv"
 )
+
+// validKmipName matches transit key names: letters, digits, hyphens, underscores.
+// Slashes and dots are disallowed to prevent path traversal via UniqueIdentifier.
+var validKmipName = regexp.MustCompile(`^[a-zA-Z0-9_\-]+$`)
+
+// validateKmipName returns an error if name is empty or contains characters that
+// could be used to traverse paths (e.g. "/" or "..").
+func validateKmipName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if !validKmipName.MatchString(name) {
+		return fmt.Errorf("name %q contains invalid characters: only letters, digits, hyphens, and underscores are allowed", name)
+	}
+	return nil
+}
 
 // callTransit constructs an internal logical.Request and routes it through the transit backend.
 // It returns the response or an error. If the response contains an error, the error is returned.
@@ -254,8 +271,8 @@ func handleGet(ctx context.Context, b *backend, req *payloads.GetRequestPayload)
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 
 	if err := authorizeOperation(ctx, kmip.OperationGet, name); err != nil {
@@ -402,8 +419,8 @@ func handleGetAttributes(ctx context.Context, b *backend, req *payloads.GetAttri
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 
 	if err := authorizeOperation(ctx, kmip.OperationGetAttributes, name); err != nil {
@@ -483,9 +500,26 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 		return nil, err
 	}
 
-	keys, err := storage.List(ctx, "policy/")
+	allKeys, err := storage.List(ctx, "policy/")
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to list keys: %s", err)
+	}
+
+	// Filter out soft-deleted keys — they are not usable for any KMIP operation.
+	keys := allKeys[:0]
+	for _, k := range allKeys {
+		p, _, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
+			Storage: storage,
+			Name:    k,
+		}, b.GetRandomReader())
+		if err != nil || p == nil || p.SoftDeleted {
+			continue
+		}
+		if !b.System().CachingDisabled() {
+			p.Lock(false)
+			p.Unlock()
+		}
+		keys = append(keys, k)
 	}
 
 	// Filter by AllowedKeyNames if the role restricts key access.
@@ -532,8 +566,8 @@ func handleDestroy(ctx context.Context, b *backend, req *payloads.DestroyRequest
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 
 	if err := authorizeOperation(ctx, kmip.OperationDestroy, name); err != nil {
@@ -568,8 +602,8 @@ func handleActivate(ctx context.Context, b *backend, req *payloads.ActivateReque
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 
 	if err := authorizeOperation(ctx, kmip.OperationActivate, name); err != nil {
@@ -588,8 +622,8 @@ func handleActivate(ctx context.Context, b *backend, req *payloads.ActivateReque
 	}
 	if !b.System().CachingDisabled() {
 		p.Lock(false)
+		defer p.Unlock()
 	}
-	p.Unlock()
 
 	return &payloads.ActivateResponsePayload{
 		UniqueIdentifier: name,
@@ -605,8 +639,8 @@ func handleRevoke(ctx context.Context, b *backend, req *payloads.RevokeRequestPa
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 
 	if err := authorizeOperation(ctx, kmip.OperationRevoke, name); err != nil {
@@ -633,8 +667,8 @@ func handleEncrypt(ctx context.Context, b *backend, req *payloads.EncryptRequest
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 	if len(req.Data) == 0 {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (plaintext) is required")
@@ -673,8 +707,8 @@ func handleDecrypt(ctx context.Context, b *backend, req *payloads.DecryptRequest
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 	if len(req.Data) == 0 {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (ciphertext) is required")
@@ -717,8 +751,8 @@ func handleSign(ctx context.Context, b *backend, req *payloads.SignRequestPayloa
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 	if len(req.Data) == 0 {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (input to sign) is required")
@@ -757,8 +791,8 @@ func handleVerify(ctx context.Context, b *backend, req *payloads.SignatureVerify
 	}
 
 	name := req.UniqueIdentifier
-	if name == "" {
-		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "UniqueIdentifier is required")
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid UniqueIdentifier: %s", err)
 	}
 	if len(req.Data) == 0 {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (original input) is required")
@@ -794,7 +828,11 @@ func handleVerify(ctx context.Context, b *backend, req *payloads.SignatureVerify
 
 // handleQuery implements the KMIP Query operation by returning server capabilities.
 // It reports the supported operations and object types for this transit KMIP server.
-func handleQuery(_ context.Context, _ *backend, req *payloads.QueryRequestPayload) (*payloads.QueryResponsePayload, error) {
+func handleQuery(ctx context.Context, _ *backend, req *payloads.QueryRequestPayload) (*payloads.QueryResponsePayload, error) {
+	if err := authorizeOperation(ctx, kmip.OperationQuery, ""); err != nil {
+		return nil, err
+	}
+
 	resp := &payloads.QueryResponsePayload{}
 
 	wantOperations := false

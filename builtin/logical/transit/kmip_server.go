@@ -69,8 +69,8 @@ func newTransitKmipServer(cfg *kmipConfig, b *backend) (*transitKmipServer, erro
 	executor := kmipserver.NewBatchExecutor()
 	// Register auth middleware so every request is authenticated.
 	executor.Use(authMiddleware(b))
-	// Operation handlers will be registered in later tasks (Task 5 & 6).
-	// For now the executor returns OperationNotSupported for unregistered ops.
+	// Register key management operation handlers.
+	registerKmipHandlers(executor, b)
 
 	srv := kmipserver.NewServer(listener, executor)
 

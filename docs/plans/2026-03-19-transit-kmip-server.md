@@ -113,28 +113,28 @@ The `ovh/kmip-go` library (already an indirect dependency via go-kms-wrapping) p
 - Create: `builtin/logical/transit/kmip_handlers.go`
 - Create: `builtin/logical/transit/kmip_handlers_test.go`
 
-- [ ] Implement helper `callTransit(ctx context.Context, b *backend, storage logical.Storage, op logical.Operation, path string, data map[string]interface{}) (*logical.Response, error)` to invoke transit paths internally
-- [ ] Implement `handleCreate(ctx, req *payloads.CreateRequestPayload) (*payloads.CreateResponsePayload, error)`:
+- [x] Implement helper `callTransit(ctx context.Context, b *backend, storage logical.Storage, op logical.Operation, path string, data map[string]interface{}) (*logical.Response, error)` to invoke transit paths internally
+- [x] Implement `handleCreate(ctx, req *payloads.CreateRequestPayload) (*payloads.CreateResponsePayload, error)`:
   - map `CryptographicAlgorithm` to transit key type (aes128-gcm96, aes256-gcm96, rsa-2048, etc.)
   - call transit `CreateKey` via internal request
   - return `UniqueIdentifier` = key name
-- [ ] Implement `handleGet(ctx, req *payloads.GetRequestPayload) (*payloads.GetResponsePayload, error)`:
+- [x] Implement `handleGet(ctx, req *payloads.GetRequestPayload) (*payloads.GetResponsePayload, error)`:
   - call transit `ExportKey` to retrieve raw key material
   - return as KMIP `SymmetricKey` or `PrivateKey` object
-- [ ] Implement `handleGetAttributes(ctx, req) (resp, error)`:
+- [x] Implement `handleGetAttributes(ctx, req) (resp, error)`:
   - call transit `ReadKey`, map policy fields to KMIP attributes (CryptographicLength, Algorithm, State, dates)
-- [ ] Implement `handleLocate(ctx, req) (resp, error)`:
+- [x] Implement `handleLocate(ctx, req) (resp, error)`:
   - call transit `ListKeys`, filter by attributes if specified in request
-- [ ] Implement `handleDestroy(ctx, req) (resp, error)`:
+- [x] Implement `handleDestroy(ctx, req) (resp, error)`:
   - call transit soft-delete or `DeleteKey`
-- [ ] Implement `handleActivate(ctx, req) (resp, error)` - no-op for transit (keys auto-activate), return success
-- [ ] Implement `handleRevoke(ctx, req) (resp, error)` - call transit soft-delete
-- [ ] Implement `handleRegister(ctx, req) (resp, error)`:
+- [x] Implement `handleActivate(ctx, req) (resp, error)` - no-op for transit (keys auto-activate), return success
+- [x] Implement `handleRevoke(ctx, req) (resp, error)` - call transit soft-delete
+- [x] Implement `handleRegister(ctx, req) (resp, error)`:
   - extract key material from KMIP object
   - call transit `ImportKey`
-- [ ] Register all handlers in `BatchExecutor` in `newTransitKmipServer`
-- [ ] Write tests for each handler (mock the transit backend calls)
-- [ ] Run tests - must pass
+- [x] Register all handlers in `BatchExecutor` in `newTransitKmipServer`
+- [x] Write tests for each handler (mock the transit backend calls)
+- [x] Run tests - must pass
 
 ### Task 6: KMIP Cryptographic Operation Handlers
 

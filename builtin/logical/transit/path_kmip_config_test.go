@@ -33,6 +33,7 @@ func generateTestCert(t *testing.T) (certPEM, keyPEM string) {
 			CommonName:   "test-kmip",
 			Organization: []string{"Test"},
 		},
+		DNSNames:              []string{"test-kmip"},
 		NotBefore:             time.Now().Add(-time.Minute),
 		NotAfter:              time.Now().Add(time.Hour),
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,

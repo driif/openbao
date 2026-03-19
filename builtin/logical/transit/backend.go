@@ -34,7 +34,23 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 	if err := b.Setup(ctx, conf); err != nil {
 		return nil, err
 	}
+
+	// Start KMIP server if configured and enabled.
+	cfg, err := b.getKmipConfig(ctx, conf.StorageView)
+	if err != nil {
+		b.Logger().Warn("Failed to load KMIP config on startup", "error", err)
+	} else if cfg != nil && cfg.Enabled {
+		if err := b.restartKmipServer(cfg); err != nil {
+			b.Logger().Error("Failed to start KMIP server on startup", "error", err)
+		}
+	}
+
 	return b, nil
+}
+
+// cleanupKmip is called by the framework on backend unload/cleanup.
+func (b *backend) cleanupKmip(_ context.Context) {
+	b.stopKmipServer()
 }
 
 func Backend(ctx context.Context, conf *logical.BackendConfig) (*backend, error) {
@@ -87,6 +103,7 @@ func Backend(ctx context.Context, conf *logical.BackendConfig) (*backend, error)
 		Invalidate:   b.invalidate,
 		BackendType:  logical.TypeLogical,
 		PeriodicFunc: b.periodicFunc,
+		Clean:        b.cleanupKmip,
 	}
 
 	b.backendUUID = conf.BackendUUID
@@ -125,6 +142,10 @@ type backend struct {
 	checkAutoRotateAfter time.Time
 	autoRotateOnce       sync.Once
 	backendUUID          string
+
+	// KMIP server fields
+	kmipServer *transitKmipServer
+	kmipMu     sync.Mutex
 }
 
 func GetCacheSizeFromStorage(ctx context.Context, s logical.Storage) (int, error) {

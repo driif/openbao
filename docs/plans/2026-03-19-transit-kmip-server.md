@@ -69,23 +69,23 @@ The `ovh/kmip-go` library (already an indirect dependency via go-kms-wrapping) p
 - Create: `builtin/logical/transit/kmip_server_test.go`
 - Modify: `builtin/logical/transit/backend.go` (add `kmipServer` field, call start/stop)
 
-- [ ] Define `transitKmipServer` struct holding `*kmipserver.Server`, `net.Listener`, cancel func, and reference to `*backend`
-- [ ] Implement `newTransitKmipServer(cfg *kmipConfig, b *backend) (*transitKmipServer, error)`:
+- [x] Define `transitKmipServer` struct holding `*kmipserver.Server`, `net.Listener`, cancel func, and reference to `*backend`
+- [x] Implement `newTransitKmipServer(cfg *kmipConfig, b *backend) (*transitKmipServer, error)`:
   - parse server cert/key PEM via `tls.X509KeyPair`
   - parse CA cert for client auth if `RequireClientCert` is set
   - build `tls.Config` with `ClientAuth: tls.RequireAndVerifyClientCert`
   - call `tls.Listen("tcp", cfg.ListenAddr, tlsCfg)` to create listener
   - create `kmipserver.BatchExecutor`, register operation handlers (stub initially)
   - return `kmipserver.NewServer(listener, executor)`
-- [ ] Implement `Start() error` - runs `srv.Serve()` in a goroutine
-- [ ] Implement `Stop() error` - calls `srv.Shutdown()`
-- [ ] Add `kmipServer *transitKmipServer` and `kmipMu sync.Mutex` fields to `backend` struct
-- [ ] In `backend.go` after `Setup()`, load KMIP config and start server if `Enabled`
-- [ ] In `backend.Cleanup()`, stop KMIP server if running
-- [ ] Handle config updates from write handler (stop old, start new)
-- [ ] Promote `github.com/ovh/kmip-go` to direct dependency in `go.mod`
-- [ ] Write tests: server starts/stops, handles TLS connections, rejects invalid certs
-- [ ] Run tests - must pass
+- [x] Implement `Start() error` - runs `srv.Serve()` in a goroutine
+- [x] Implement `Stop() error` - calls `srv.Shutdown()`
+- [x] Add `kmipServer *transitKmipServer` and `kmipMu sync.Mutex` fields to `backend` struct
+- [x] In `backend.go` after `Setup()`, load KMIP config and start server if `Enabled`
+- [x] In `backend.Cleanup()`, stop KMIP server if running
+- [x] Handle config updates from write handler (stop old, start new)
+- [x] Promote `github.com/ovh/kmip-go` to direct dependency in `go.mod`
+- [x] Write tests: server starts/stops, handles TLS connections, rejects invalid certs
+- [x] Run tests - must pass
 
 ### Task 4: KMIP Authentication Middleware
 

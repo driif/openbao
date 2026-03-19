@@ -172,6 +172,11 @@ func (b *backend) pathKmipConfigWrite(ctx context.Context, req *logical.Request,
 		return nil, err
 	}
 
+	// Restart KMIP server to pick up the new configuration.
+	if err := b.restartKmipServer(cfg); err != nil {
+		return logical.ErrorResponse("configuration saved, but failed to restart KMIP server: %s", err), nil
+	}
+
 	return nil, nil
 }
 

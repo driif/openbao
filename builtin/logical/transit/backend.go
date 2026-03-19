@@ -220,6 +220,22 @@ func (b *backend) invalidate(ctx context.Context, key string) {
 		b.configMutex.Lock()
 		defer b.configMutex.Unlock()
 		b.cacheSizeChanged = true
+	case key == kmipConfigStoragePath:
+		// In HA deployments, when another node writes a new KMIP config this
+		// node receives an invalidation event. Reload and restart the KMIP
+		// server so the updated config (certs, listen address, enabled state)
+		// takes effect on this node as well.
+		if b.storage == nil {
+			return
+		}
+		cfg, err := b.getKmipConfig(ctx, b.storage)
+		if err != nil {
+			b.Logger().Error("Failed to reload KMIP config on invalidation", "error", err)
+			return
+		}
+		if err := b.restartKmipServer(cfg); err != nil {
+			b.Logger().Error("Failed to restart KMIP server after config invalidation", "error", err)
+		}
 	}
 }
 

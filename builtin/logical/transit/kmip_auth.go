@@ -39,10 +39,14 @@ func authMiddleware(b *backend) kmipserver.Middleware {
 		certs := kmipserver.PeerCertificates(ctx)
 
 		if len(certs) == 0 {
-			// No client cert present. If the listener requires client certs the
-			// TLS layer will have already rejected the connection; here we just
-			// allow the request through with a nil role so that individual
-			// operation handlers can decide what to do.
+			// No client cert present. When RequireClientCert is false the TLS
+			// layer uses tls.NoClientCert, so unauthenticated connections reach
+			// here. Inject a permissive wildcard role (empty AllowedOperations
+			// and empty AllowedKeyNames = all operations on all keys allowed)
+			// so that authorizeOperation checks pass for these connections.
+			// When RequireClientCert is true the TLS handshake would have
+			// rejected the connection before we get here.
+			ctx = context.WithValue(ctx, ctxKmipRole{}, &kmipRole{})
 			return next(ctx, msg)
 		}
 

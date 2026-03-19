@@ -243,6 +243,9 @@ func handleCreate(ctx context.Context, b *backend, req *payloads.CreateRequestPa
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to determine key name: %s", err)
 	}
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid key name: %s", err)
+	}
 
 	if err := authorizeOperation(ctx, kmip.OperationCreate, name); err != nil {
 		return nil, err
@@ -291,8 +294,8 @@ func handleGet(ctx context.Context, b *backend, req *payloads.GetRequestPayload)
 	}
 	if !b.System().CachingDisabled() {
 		p.Lock(false)
+		defer p.Unlock()
 	}
-	defer p.Unlock()
 
 	if !p.Exportable {
 		return nil, kmipserver.Errorf(kmip.ResultReasonPermissionDenied, "key %q is not exportable", name)
@@ -439,8 +442,8 @@ func handleGetAttributes(ctx context.Context, b *backend, req *payloads.GetAttri
 	}
 	if !b.System().CachingDisabled() {
 		p.Lock(false)
+		defer p.Unlock()
 	}
-	defer p.Unlock()
 
 	if p.SoftDeleted {
 		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q is soft deleted", name)
@@ -582,9 +585,15 @@ func handleDestroy(ctx context.Context, b *backend, req *payloads.DestroyRequest
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to enable deletion for key %q: %s", name, err)
 	}
 
-	// Now permanently delete the key
+	// Now permanently delete the key. If deletion fails, restore deletion_allowed=false
+	// to avoid leaving the key permanently unprotected.
 	_, err = callTransit(ctx, b, storage, logical.DeleteOperation, "keys/"+name, nil)
 	if err != nil {
+		if _, restoreErr := callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name+"/config", map[string]interface{}{
+			"deletion_allowed": false,
+		}); restoreErr != nil {
+			b.Logger().Error("Failed to restore deletion_allowed=false after failed destroy", "key", name, "error", restoreErr)
+		}
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to destroy key %q: %s", name, err)
 	}
 
@@ -899,6 +908,9 @@ func handleRegister(ctx context.Context, b *backend, req *payloads.RegisterReque
 	name, err := getKmipNameFromTemplateAttribute(req.TemplateAttribute)
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to determine key name: %s", err)
+	}
+	if err := validateKmipName(name); err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "invalid key name: %s", err)
 	}
 
 	if err := authorizeOperation(ctx, kmip.OperationRegister, name); err != nil {

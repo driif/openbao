@@ -101,7 +101,7 @@ func (b *backend) pathKmipConfigRead(ctx context.Context, req *logical.Request, 
 		return nil, err
 	}
 	if cfg == nil {
-		return nil, nil
+		return nil, nil //nolint:nilnil
 	}
 
 	return &logical.Response{
@@ -177,7 +177,7 @@ func (b *backend) pathKmipConfigWrite(ctx context.Context, req *logical.Request,
 		return logical.ErrorResponse("configuration saved, but failed to restart KMIP server: %s", err), nil
 	}
 
-	return nil, nil
+	return nil, nil //nolint:nilnil
 }
 
 func (b *backend) getKmipConfig(ctx context.Context, s logical.Storage) (*kmipConfig, error) {
@@ -186,7 +186,7 @@ func (b *backend) getKmipConfig(ctx context.Context, s logical.Storage) (*kmipCo
 		return nil, fmt.Errorf("error reading KMIP config: %w", err)
 	}
 	if entry == nil {
-		return nil, nil
+		return nil, nil //nolint:nilnil
 	}
 
 	var cfg kmipConfig

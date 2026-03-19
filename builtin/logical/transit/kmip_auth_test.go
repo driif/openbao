@@ -196,7 +196,7 @@ func TestAuthMiddleware_Integration(t *testing.T) {
 	srv, err := newTransitKmipServer(cfg, b)
 	require.NoError(t, err)
 	require.NoError(t, srv.Start())
-	t.Cleanup(func() { srv.Stop() })
+	t.Cleanup(func() { _ = srv.Stop() })
 
 	caCertPool := x509.NewCertPool()
 	caCertPool.AppendCertsFromPEM([]byte(caCertPEM))
@@ -211,7 +211,7 @@ func TestAuthMiddleware_Integration(t *testing.T) {
 		ServerName:   "test-kmip-ca",
 	})
 	require.NoError(t, err, "known client should connect")
-	knownConn.Close()
+	require.NoError(t, knownConn.Close())
 
 	// Unknown client: signed by same CA but no matching role.
 	unknownDN := pkix.Name{CommonName: "unknown-client", Organization: []string{"TestOrg"}}
@@ -228,7 +228,7 @@ func TestAuthMiddleware_Integration(t *testing.T) {
 	// auth middleware will reject the first request with PermissionDenied.
 	// We just verify we can connect at TLS level.
 	if err == nil {
-		unknownConn.Close()
+		_ = unknownConn.Close()
 	}
 	// (The rejection happens at the KMIP protocol level, not TLS level.)
 }

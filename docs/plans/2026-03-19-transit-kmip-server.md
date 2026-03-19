@@ -174,10 +174,10 @@ The `ovh/kmip-go` library (already an indirect dependency via go-kms-wrapping) p
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] Run full transit test suite: `go test ./builtin/logical/transit/...`
-- [ ] Run broader test suite: `go test ./...`
-- [ ] Run linter: check for any new lint errors in changed files
-- [ ] Verify KMIP server starts/stops cleanly with transit mount mount/unmount
+- [x] Run full transit test suite: `go test ./builtin/logical/transit/...`
+- [x] Run broader test suite: `go test ./...`
+- [x] Run linter: check for any new lint errors in changed files
+- [x] Verify KMIP server starts/stops cleanly with transit mount mount/unmount
 
 ### Task 9: Update documentation
 

@@ -63,9 +63,9 @@ func authMiddleware(b *backend) kmipserver.Middleware {
 
 // findKmipRoleByDN iterates all stored kmipRoles and returns the first whose
 // CertSubjectDN matches dn. Returns (nil, nil) when no match is found.
-func (b *backend) findKmipRoleByDN(ctx context.Context, dn string) (*kmipRole, error) {
+func (b *backend) findKmipRoleByDN(ctx context.Context, dn string) (*kmipRole, error) { //nolint:nilnil
 	if b.storage == nil {
-		return nil, nil
+		return nil, nil //nolint:nilnil
 	}
 
 	names, err := b.storage.List(ctx, kmipRoleStoragePrefix)
@@ -82,7 +82,7 @@ func (b *backend) findKmipRoleByDN(ctx context.Context, dn string) (*kmipRole, e
 			return role, nil
 		}
 	}
-	return nil, nil
+	return nil, nil //nolint:nilnil
 }
 
 // authorizeOperation checks whether the role stored in ctx allows the given

@@ -63,7 +63,7 @@ func freePort(t *testing.T) string {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := ln.Addr().String()
-	ln.Close()
+	require.NoError(t, ln.Close())
 	return addr
 }
 
@@ -113,7 +113,7 @@ func TestKmipServer_TLSConnection(t *testing.T) {
 	srv, err := newTransitKmipServer(cfg, b)
 	require.NoError(t, err)
 	require.NoError(t, srv.Start())
-	t.Cleanup(func() { srv.Stop() })
+	t.Cleanup(func() { _ = srv.Stop() })
 
 	// Build a TLS client that trusts our self-signed server cert
 	certPool := x509.NewCertPool()
@@ -126,7 +126,7 @@ func TestKmipServer_TLSConnection(t *testing.T) {
 
 	conn, err := tls.Dial("tcp", addr, tlsCfg)
 	require.NoError(t, err)
-	conn.Close()
+	require.NoError(t, conn.Close())
 }
 
 func TestKmipServer_RejectsInvalidClientCert(t *testing.T) {
@@ -147,7 +147,7 @@ func TestKmipServer_RejectsInvalidClientCert(t *testing.T) {
 	srv, err := newTransitKmipServer(cfg, b)
 	require.NoError(t, err)
 	require.NoError(t, srv.Start())
-	t.Cleanup(func() { srv.Stop() })
+	t.Cleanup(func() { _ = srv.Stop() })
 
 	// Connect without a client cert - should fail TLS handshake.
 	// Force TLS 1.2 so that client cert verification is synchronous.
@@ -165,7 +165,7 @@ func TestKmipServer_RejectsInvalidClientCert(t *testing.T) {
 		// Try to read to force server to process the (empty) client cert
 		buf := make([]byte, 1)
 		_, err = conn.Read(buf)
-		conn.Close()
+		_ = conn.Close()
 	}
 	require.Error(t, err, "connection without client cert should fail")
 }
@@ -243,7 +243,7 @@ func TestKmipServer_Cleanup(t *testing.T) {
 	b.kmipMu.Unlock()
 
 	// Trigger cleanup (simulates vault unloading the backend)
-	b.Backend.Cleanup(context.Background())
+	b.Cleanup(context.Background())
 
 	b.kmipMu.Lock()
 	require.Nil(t, b.kmipServer, "KMIP server should be nil after cleanup")

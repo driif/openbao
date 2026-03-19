@@ -122,7 +122,7 @@ func (b *backend) pathKmipRoleRead(ctx context.Context, req *logical.Request, d 
 		return nil, err
 	}
 	if role == nil {
-		return nil, nil
+		return nil, nil //nolint:nilnil
 	}
 
 	return &logical.Response{
@@ -160,7 +160,7 @@ func (b *backend) pathKmipRoleWrite(ctx context.Context, req *logical.Request, d
 		return nil, err
 	}
 
-	return nil, nil
+	return nil, nil //nolint:nilnil
 }
 
 func (b *backend) pathKmipRoleDelete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
@@ -170,7 +170,7 @@ func (b *backend) pathKmipRoleDelete(ctx context.Context, req *logical.Request, 
 		return nil, fmt.Errorf("error deleting KMIP role %q: %w", name, err)
 	}
 
-	return nil, nil
+	return nil, nil //nolint:nilnil
 }
 
 func (b *backend) pathKmipRoleListAll(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
@@ -188,7 +188,7 @@ func (b *backend) getKmipRole(ctx context.Context, s logical.Storage, name strin
 		return nil, fmt.Errorf("error reading KMIP role %q: %w", name, err)
 	}
 	if entry == nil {
-		return nil, nil
+		return nil, nil //nolint:nilnil
 	}
 
 	var role kmipRole

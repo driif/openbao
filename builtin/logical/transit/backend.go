@@ -35,6 +35,10 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 		return nil, err
 	}
 
+	// Store the storage view so that non-request-context code (e.g. KMIP
+	// auth middleware) can access persistent storage.
+	b.storage = conf.StorageView
+
 	// Start KMIP server if configured and enabled.
 	cfg, err := b.getKmipConfig(ctx, conf.StorageView)
 	if err != nil {
@@ -146,6 +150,10 @@ type backend struct {
 	// KMIP server fields
 	kmipServer *transitKmipServer
 	kmipMu     sync.Mutex
+	// storage is the backend's persistent storage view, set during Factory
+	// and used by components (e.g. KMIP auth middleware) that operate outside
+	// the normal request handler lifecycle.
+	storage logical.Storage
 }
 
 func GetCacheSizeFromStorage(ctx context.Context, s logical.Storage) (int, error) {

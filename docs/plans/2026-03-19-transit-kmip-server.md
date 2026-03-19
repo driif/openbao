@@ -93,19 +93,19 @@ The `ovh/kmip-go` library (already an indirect dependency via go-kms-wrapping) p
 - Create: `builtin/logical/transit/kmip_auth.go`
 - Create: `builtin/logical/transit/kmip_auth_test.go`
 
-- [ ] Implement `authMiddleware(b *backend) kmipserver.Middleware`:
+- [x] Implement `authMiddleware(b *backend) kmipserver.Middleware`:
   - extract `*tls.ConnectionState` from `kmipserver` connection context
   - extract peer certificate subject DN from `ConnectionState.PeerCertificates[0]`
   - load matching `kmipRole` from storage by subject DN
   - store role in context for downstream handlers
   - return `OperationNotAllowed` if no matching role found
-- [ ] Implement `authorizeOperation(ctx context.Context, op kmip.Operation, keyName string) error`:
+- [x] Implement `authorizeOperation(ctx context.Context, op kmip.Operation, keyName string) error`:
   - read role from context
   - check op string against `AllowedOperations`
   - check key name against `AllowedKeyNames` (empty = all allowed)
-- [ ] Register middleware via `executor.Use(authMiddleware(b))` in `newTransitKmipServer`
-- [ ] Write tests for auth middleware (valid cert, unknown cert, restricted ops)
-- [ ] Run tests - must pass
+- [x] Register middleware via `executor.Use(authMiddleware(b))` in `newTransitKmipServer`
+- [x] Write tests for auth middleware (valid cert, unknown cert, restricted ops)
+- [x] Run tests - must pass
 
 ### Task 5: KMIP Key Management Operation Handlers
 

@@ -222,10 +222,15 @@ func (b *backend) invalidate(ctx context.Context, key string) {
 		b.cacheSizeChanged = true
 	case key == kmipConfigStoragePath:
 		// In HA deployments, when another node writes a new KMIP config this
-		// node receives an invalidation event. Reload and restart the KMIP
-		// server so the updated config (certs, listen address, enabled state)
-		// takes effect on this node as well.
+		// node receives an invalidation event. Only the active primary (or a
+		// performance secondary with a local mount) should bind the KMIP port;
+		// standby and DR secondary nodes must not attempt to bind the same
+		// address.
 		if b.storage == nil {
+			return
+		}
+		if b.System().ReplicationState().HasState(consts.ReplicationDRSecondary|consts.ReplicationPerformanceStandby) ||
+			(!b.System().LocalMount() && b.System().ReplicationState().HasState(consts.ReplicationPerformanceSecondary)) {
 			return
 		}
 		cfg, err := b.getKmipConfig(ctx, b.storage)

@@ -92,8 +92,6 @@ func kmipAlgorithmToTransitType(alg kmip.CryptographicAlgorithm, bitLen int32) (
 		default:
 			return "", fmt.Errorf("unsupported EC key size %d bits", bitLen)
 		}
-	case kmip.CryptographicAlgorithmChaCha20Poly1305:
-		return "chacha20-poly1305", nil
 	default:
 		return "", fmt.Errorf("unsupported KMIP algorithm: %s", ttlv.EnumStr(alg))
 	}
@@ -708,8 +706,13 @@ func handleActivate(ctx context.Context, b *backend, req *payloads.ActivateReque
 	if p == nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q not found", name)
 	}
-	// Transit keys are always Active; no state change needed. Release the
-	// policy lock immediately — we read nothing from p under the lock.
+	// Transit keys are always Active; no state change needed. Acquire and
+	// immediately release the lock to match the pattern used by every other
+	// handler: when caching is enabled GetPolicy returns with no lock held,
+	// so we must take one before calling Unlock.
+	if !b.System().CachingDisabled() {
+		p.Lock(false)
+	}
 	p.Unlock()
 
 	return &payloads.ActivateResponsePayload{

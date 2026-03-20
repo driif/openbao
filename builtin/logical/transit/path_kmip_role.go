@@ -6,10 +6,39 @@ package transit
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/openbao/openbao/sdk/v2/framework"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/ovh/kmip-go"
+	"github.com/ovh/kmip-go/ttlv"
 )
+
+// kmipValidOperations is the set of KMIP operation name strings that this
+// server supports. These are the canonical strings produced by ttlv.EnumStr
+// for each registered operation and used by authorizeOperation for comparison.
+var kmipValidOperations = func() []string {
+	ops := []kmip.Operation{
+		kmip.OperationCreate,
+		kmip.OperationGet,
+		kmip.OperationGetAttributes,
+		kmip.OperationLocate,
+		kmip.OperationDestroy,
+		kmip.OperationActivate,
+		kmip.OperationRevoke,
+		kmip.OperationRegister,
+		kmip.OperationEncrypt,
+		kmip.OperationDecrypt,
+		kmip.OperationSign,
+		kmip.OperationSignatureVerify,
+		kmip.OperationQuery,
+	}
+	strs := make([]string, len(ops))
+	for i, op := range ops {
+		strs[i] = ttlv.EnumStr(op)
+	}
+	return strs
+}()
 
 const kmipRoleStoragePrefix = "kmip/roles/"
 
@@ -147,10 +176,25 @@ func (b *backend) pathKmipRoleWrite(ctx context.Context, req *logical.Request, d
 	}
 
 	if v, ok := d.GetOk("cert_subject_dn"); ok {
-		role.CertSubjectDN = v.(string)
+		newDN := v.(string)
+		// Reject if another role already claims this Subject DN.
+		existing, err := b.findKmipRoleByDN(ctx, newDN)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil && existing.CertSubjectDN == newDN && role.CertSubjectDN != newDN {
+			return logical.ErrorResponse("cert_subject_dn %q is already claimed by another role", newDN), nil
+		}
+		role.CertSubjectDN = newDN
 	}
 	if v, ok := d.GetOk("allowed_operations"); ok {
-		role.AllowedOperations = v.([]string)
+		ops := v.([]string)
+		for _, op := range ops {
+			if !slices.Contains(kmipValidOperations, op) {
+				return logical.ErrorResponse("unknown operation %q; valid operations: %v", op, kmipValidOperations), nil
+			}
+		}
+		role.AllowedOperations = ops
 	}
 	if v, ok := d.GetOk("allowed_key_names"); ok {
 		role.AllowedKeyNames = v.([]string)

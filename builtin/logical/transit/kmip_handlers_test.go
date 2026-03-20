@@ -95,7 +95,7 @@ func TestKmipAlgorithmToTransitType(t *testing.T) {
 		{kmip.CryptographicAlgorithmECDSA, 384, "ecdsa-p384", false},
 		{kmip.CryptographicAlgorithmECDSA, 521, "ecdsa-p521", false},
 		{kmip.CryptographicAlgorithmEC, 0, "ecdsa-p256", false},
-		{kmip.CryptographicAlgorithmChaCha20Poly1305, 0, "chacha20-poly1305", false},
+		{kmip.CryptographicAlgorithmChaCha20Poly1305, 0, "", true}, // not supported: no KMIP Get equivalent
 	}
 
 	for _, tc := range tests {

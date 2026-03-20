@@ -15,9 +15,10 @@ import (
 
 // transitKmipServer wraps the ovh/kmip-go server with lifecycle management.
 type transitKmipServer struct {
-	srv      *kmipserver.Server
-	listener net.Listener
-	b        *backend
+	srv        *kmipserver.Server
+	listener   net.Listener
+	b          *backend
+	listenAddr string // configured listen address used to detect same-address restarts
 }
 
 // newTransitKmipServer creates a new KMIP server from the given config.
@@ -75,9 +76,10 @@ func newTransitKmipServer(cfg *kmipConfig, b *backend) (*transitKmipServer, erro
 	srv := kmipserver.NewServer(listener, executor)
 
 	return &transitKmipServer{
-		srv:      srv,
-		listener: listener,
-		b:        b,
+		srv:        srv,
+		listener:   listener,
+		b:          b,
+		listenAddr: cfg.ListenAddr,
 	}, nil
 }
 
@@ -119,16 +121,30 @@ func (b *backend) restartKmipServer(cfg *kmipConfig) error {
 		return nil
 	}
 
-	// Create and bind the new server BEFORE tearing down the old one so that a
-	// startup failure (bad cert, port already in use, etc.) leaves the current
-	// listener running and does not persist the broken config.
+	// When the listen address changes, bind the new server first so that a
+	// startup failure (bad cert, port not available, etc.) leaves the current
+	// server running rather than causing an outage.
+	//
+	// When the listen address stays the same (e.g. rotating the TLS certificate
+	// while keeping the same port), the old server must be stopped first because
+	// the OS will not allow two listeners on the same address simultaneously.
+	// This introduces a brief window without a listener, but it is unavoidable.
+	sameAddr := b.kmipServer != nil && b.kmipServer.listenAddr == cfg.ListenAddr
+
+	if sameAddr {
+		if err := b.kmipServer.Stop(); err != nil {
+			b.Logger().Warn("Error stopping existing KMIP server", "error", err)
+		}
+		b.kmipServer = nil
+	}
+
 	srv, err := newTransitKmipServer(cfg, b)
 	if err != nil {
 		return fmt.Errorf("failed to create KMIP server: %w", err)
 	}
 
-	// New server is ready; now stop the old one.
-	if b.kmipServer != nil {
+	// For address-change restarts, stop the old server now that the new one is bound.
+	if !sameAddr && b.kmipServer != nil {
 		if err := b.kmipServer.Stop(); err != nil {
 			b.Logger().Warn("Error stopping existing KMIP server", "error", err)
 		}

@@ -39,12 +39,18 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 	// auth middleware) can access persistent storage.
 	b.storage = conf.StorageView
 
-	// Start KMIP server if configured and enabled.
+	// Start KMIP server if configured, enabled, and this node should serve
+	// KMIP connections. DR secondaries and performance standbys are read-only
+	// and must not bind the KMIP port; the invalidate handler enforces the same
+	// check when a config change is replicated from the active node.
 	cfg, err := b.getKmipConfig(ctx, conf.StorageView)
 	if err != nil {
 		b.Logger().Warn("Failed to load KMIP config on startup", "error", err)
 	} else if cfg != nil && cfg.Enabled {
-		if err := b.restartKmipServer(cfg); err != nil {
+		if b.System().ReplicationState().HasState(consts.ReplicationDRSecondary|consts.ReplicationPerformanceStandby) ||
+			(!b.System().LocalMount() && b.System().ReplicationState().HasState(consts.ReplicationPerformanceSecondary)) {
+			b.Logger().Debug("Skipping KMIP server start on non-primary node")
+		} else if err := b.restartKmipServer(cfg); err != nil {
 			b.Logger().Error("Failed to start KMIP server on startup", "error", err)
 		}
 	}

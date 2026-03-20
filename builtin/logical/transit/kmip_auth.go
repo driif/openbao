@@ -28,9 +28,12 @@ func kmipRoleFromContext(ctx context.Context) *kmipRole {
 // configured kmipRoles. The matched role is stored in the request context
 // for downstream authorizeOperation checks.
 //
-// If RequireClientCert is false on the KMIP config, the server may not supply
-// peer certificates; in that case the middleware stores a nil role and allows
-// the request to proceed (authorization is still enforced per-operation).
+// If RequireClientCert is false on the KMIP config, the TLS layer accepts
+// connections without client certificates. Such unauthenticated connections
+// are injected with a wildcard role (empty AllowedOperations and empty
+// AllowedKeyNames), which grants access to all operations on all keys.
+// Only enable RequireClientCert=false in environments where network-level
+// controls already restrict who can reach the KMIP port.
 //
 // If RequireClientCert is true (the default) and no matching role is found,
 // the middleware returns PermissionDenied.
@@ -41,11 +44,9 @@ func authMiddleware(b *backend) kmipserver.Middleware {
 		if len(certs) == 0 {
 			// No client cert present. When RequireClientCert is false the TLS
 			// layer uses tls.NoClientCert, so unauthenticated connections reach
-			// here. Inject a permissive wildcard role (empty AllowedOperations
-			// and empty AllowedKeyNames = all operations on all keys allowed)
-			// so that authorizeOperation checks pass for these connections.
-			// When RequireClientCert is true the TLS handshake would have
-			// rejected the connection before we get here.
+			// here. A zero-value role grants all operations on all keys.
+			// When RequireClientCert is true the TLS handshake rejects the
+			// connection before we reach this point.
 			ctx = context.WithValue(ctx, ctxKmipRole{}, &kmipRole{})
 			return next(ctx, msg)
 		}

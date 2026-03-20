@@ -294,8 +294,8 @@ func handleGet(ctx context.Context, b *backend, req *payloads.GetRequestPayload)
 	}
 	if !b.System().CachingDisabled() {
 		p.Lock(false)
-		defer p.Unlock()
 	}
+	defer p.Unlock()
 
 	if !p.Exportable {
 		return nil, kmipserver.Errorf(kmip.ResultReasonPermissionDenied, "key %q is not exportable", name)
@@ -442,8 +442,8 @@ func handleGetAttributes(ctx context.Context, b *backend, req *payloads.GetAttri
 	}
 	if !b.System().CachingDisabled() {
 		p.Lock(false)
-		defer p.Unlock()
 	}
+	defer p.Unlock()
 
 	if p.SoftDeleted {
 		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q is soft deleted", name)
@@ -492,6 +492,59 @@ func handleGetAttributes(ctx context.Context, b *backend, req *payloads.GetAttri
 	}, nil
 }
 
+// locateMatchesAttributes returns true if the policy matches all KMIP Attribute
+// filters from a Locate request. An empty filter list matches everything.
+// Supported attributes: UniqueIdentifier, CryptographicAlgorithm,
+// CryptographicLength, ObjectType, State.
+func locateMatchesAttributes(p *keysutil.Policy, attrs []kmip.Attribute) bool {
+	for _, attr := range attrs {
+		switch attr.AttributeName {
+		case kmip.AttributeNameUniqueIdentifier:
+			v, ok := attr.AttributeValue.(string)
+			if !ok || v != p.Name {
+				return false
+			}
+		case kmip.AttributeNameCryptographicAlgorithm:
+			v, ok := attr.AttributeValue.(kmip.CryptographicAlgorithm)
+			if !ok {
+				return false
+			}
+			alg, _ := transitTypeToKmipAlgorithm(p.Type)
+			if v != alg {
+				return false
+			}
+		case kmip.AttributeNameCryptographicLength:
+			v, ok := attr.AttributeValue.(int32)
+			if !ok {
+				return false
+			}
+			_, bitLen := transitTypeToKmipAlgorithm(p.Type)
+			if v != bitLen {
+				return false
+			}
+		case kmip.AttributeNameObjectType:
+			v, ok := attr.AttributeValue.(kmip.ObjectType)
+			if !ok {
+				return false
+			}
+			if v != kmipObjectTypeForKeyType(p.Type) {
+				return false
+			}
+		case kmip.AttributeNameState:
+			v, ok := attr.AttributeValue.(kmip.State)
+			if !ok {
+				return false
+			}
+			// Transit keys are always Active unless soft-deleted (filtered earlier).
+			if v != kmip.StateActive {
+				return false
+			}
+		}
+		// Unknown attributes are ignored — we can only match attributes we expose.
+	}
+	return true
+}
+
 // handleLocate implements the KMIP Locate operation by listing all transit keys.
 func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPayload) (*payloads.LocateResponsePayload, error) {
 	storage := b.storage
@@ -503,24 +556,47 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 		return nil, err
 	}
 
+	// Transit only stores online objects. If the request explicitly asks for
+	// archived-only objects (StorageStatusMask set but StorageStatusOnlineStorage
+	// bit NOT set), return an empty result rather than silently ignoring the mask.
+	if req.StorageStatusMask != 0 && req.StorageStatusMask&kmip.StorageStatusOnlineStorage == 0 {
+		total := int32(0)
+		return &payloads.LocateResponsePayload{
+			UniqueIdentifier: nil,
+			LocatedItems:     &total,
+		}, nil
+	}
+
 	allKeys, err := storage.List(ctx, "policy/")
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to list keys: %s", err)
 	}
 
 	// Filter out soft-deleted keys — they are not usable for any KMIP operation.
-	keys := allKeys[:0]
+	// Also apply any KMIP attribute filters from the request.
+	keys := make([]string, 0, len(allKeys))
 	for _, k := range allKeys {
 		p, _, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
 			Storage: storage,
 			Name:    k,
 		}, b.GetRandomReader())
-		if err != nil || p == nil || p.SoftDeleted {
+		if err != nil {
+			b.Logger().Warn("kmip: locate skipping key due to read error", "key", k, "error", err)
 			continue
 		}
+		if p == nil {
+			continue
+		}
+		// When caching is disabled GetPolicy returns with the write lock held;
+		// when caching is enabled we must acquire a read lock ourselves.
 		if !b.System().CachingDisabled() {
 			p.Lock(false)
-			p.Unlock()
+		}
+		softDeleted := p.SoftDeleted
+		matchesAttrs := locateMatchesAttributes(p, req.Attribute)
+		p.Unlock()
+		if softDeleted || !matchesAttrs {
+			continue
 		}
 		keys = append(keys, k)
 	}
@@ -532,7 +608,7 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 		for _, n := range role.AllowedKeyNames {
 			allowed[n] = true
 		}
-		filtered := keys[:0]
+		filtered := make([]string, 0, len(keys))
 		for _, k := range keys {
 			if allowed[k] {
 				filtered = append(filtered, k)
@@ -543,6 +619,9 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 
 	// Apply offset if specified
 	offset := int(req.OffsetItems)
+	if offset < 0 {
+		offset = 0
+	}
 	if offset > len(keys) {
 		offset = len(keys)
 	}
@@ -629,10 +708,9 @@ func handleActivate(ctx context.Context, b *backend, req *payloads.ActivateReque
 	if p == nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q not found", name)
 	}
-	if !b.System().CachingDisabled() {
-		p.Lock(false)
-		defer p.Unlock()
-	}
+	// Transit keys are always Active; no state change needed. Release the
+	// policy lock immediately — we read nothing from p under the lock.
+	p.Unlock()
 
 	return &payloads.ActivateResponsePayload{
 		UniqueIdentifier: name,
@@ -886,7 +964,6 @@ func handleQuery(ctx context.Context, _ *backend, req *payloads.QueryRequestPayl
 		resp.ObjectType = []kmip.ObjectType{
 			kmip.ObjectTypeSymmetricKey,
 			kmip.ObjectTypePrivateKey,
-			kmip.ObjectTypePublicKey,
 		}
 	}
 

@@ -117,13 +117,19 @@ func (b *backend) pathKmipConfigRead(ctx context.Context, req *logical.Request, 
 }
 
 func (b *backend) pathKmipConfigWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	// Load existing config to allow partial updates
-	cfg, err := b.getKmipConfig(ctx, req.Storage)
+	// Load existing config to allow partial updates. Keep a reference to the
+	// old config so we can roll back the in-memory server if Storage.Put fails.
+	oldCfg, err := b.getKmipConfig(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
-	if cfg == nil {
-		cfg = &kmipConfig{
+
+	// Build the new config as a separate struct so oldCfg is unmodified.
+	var cfg kmipConfig
+	if oldCfg != nil {
+		cfg = *oldCfg
+	} else {
+		cfg = kmipConfig{
 			ListenAddr:        "0.0.0.0:5696",
 			RequireClientCert: true,
 		}
@@ -164,17 +170,32 @@ func (b *backend) pathKmipConfigWrite(ctx context.Context, req *logical.Request,
 		}
 	}
 
-	entry, err := logical.StorageEntryJSON(kmipConfigStoragePath, cfg)
+	// When the server is enabled, require_client_cert=true without a CA cert would
+	// fall back to the host trust store instead of a mount-local CA, silently
+	// broadening which client certificates can pass the TLS handshake.
+	if cfg.Enabled && cfg.RequireClientCert && cfg.TLSCACertPEM == "" {
+		return logical.ErrorResponse("tls_ca_cert_pem is required when require_client_cert is true and the server is enabled"), logical.ErrInvalidRequest
+	}
+
+	// Try to start the server with the new config before persisting it, so that
+	// a bad listen_addr or occupied port does not cause an outage. The old server
+	// keeps running if the new config fails to bind.
+	if err := b.restartKmipServer(&cfg); err != nil {
+		return logical.ErrorResponse("failed to start KMIP server with new configuration: %s", err), nil
+	}
+
+	entry, err := logical.StorageEntryJSON(kmipConfigStoragePath, &cfg)
 	if err != nil {
 		return nil, err
 	}
 	if err := req.Storage.Put(ctx, entry); err != nil {
+		// The in-memory server was already switched to the new config.
+		// Attempt to roll back to the previous config so state is consistent.
+		if rollbackErr := b.restartKmipServer(oldCfg); rollbackErr != nil {
+			b.Logger().Error("KMIP server rollback failed after storage write error; in-memory and stored configs may diverge",
+				"storage_error", err, "rollback_error", rollbackErr)
+		}
 		return nil, err
-	}
-
-	// Restart KMIP server to pick up the new configuration.
-	if err := b.restartKmipServer(cfg); err != nil {
-		return logical.ErrorResponse("configuration saved, but failed to restart KMIP server: %s", err), nil
 	}
 
 	return nil, nil //nolint:nilnil

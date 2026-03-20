@@ -100,13 +100,34 @@ func (s *transitKmipServer) Addr() net.Addr {
 	return s.listener.Addr()
 }
 
-// restartKmipServer stops any running KMIP server and starts a new one based on cfg.
-// The caller must NOT hold b.kmipMu.
+// restartKmipServer starts a new KMIP server based on cfg, then stops the
+// previously running server. Creating the new server first means that a bad
+// listen_addr or occupied port leaves the old server intact rather than
+// causing an outage. The caller must NOT hold b.kmipMu.
 func (b *backend) restartKmipServer(cfg *kmipConfig) error {
 	b.kmipMu.Lock()
 	defer b.kmipMu.Unlock()
 
-	// Stop existing server if running
+	if cfg == nil || !cfg.Enabled {
+		// Just stop any running server; nothing new to start.
+		if b.kmipServer != nil {
+			if err := b.kmipServer.Stop(); err != nil {
+				b.Logger().Warn("Error stopping existing KMIP server", "error", err)
+			}
+			b.kmipServer = nil
+		}
+		return nil
+	}
+
+	// Create and bind the new server BEFORE tearing down the old one so that a
+	// startup failure (bad cert, port already in use, etc.) leaves the current
+	// listener running and does not persist the broken config.
+	srv, err := newTransitKmipServer(cfg, b)
+	if err != nil {
+		return fmt.Errorf("failed to create KMIP server: %w", err)
+	}
+
+	// New server is ready; now stop the old one.
 	if b.kmipServer != nil {
 		if err := b.kmipServer.Stop(); err != nil {
 			b.Logger().Warn("Error stopping existing KMIP server", "error", err)
@@ -114,17 +135,7 @@ func (b *backend) restartKmipServer(cfg *kmipConfig) error {
 		b.kmipServer = nil
 	}
 
-	if cfg == nil || !cfg.Enabled {
-		return nil
-	}
-
-	srv, err := newTransitKmipServer(cfg, b)
-	if err != nil {
-		return fmt.Errorf("failed to create KMIP server: %w", err)
-	}
-
 	srv.Start()
-
 	b.kmipServer = srv
 	b.Logger().Info("KMIP server started", "listen_addr", cfg.ListenAddr)
 	return nil

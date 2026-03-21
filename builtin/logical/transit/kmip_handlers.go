@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -193,6 +194,9 @@ func getKmipNameFromTemplateAttribute(ta kmip.TemplateAttribute) (string, error)
 	if _, err := io.ReadFull(cryptoRand.Reader, b); err != nil {
 		return "", fmt.Errorf("failed to generate key name: %w", err)
 	}
+	// Set UUID v4 version and RFC 4122 variant bits.
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
 }
 
@@ -703,7 +707,7 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 		ids = ids[:req.MaximumItems]
 	}
 
-	total := int32(len(keys))
+	total := int32(min(len(keys), math.MaxInt32))
 	return &payloads.LocateResponsePayload{
 		UniqueIdentifier: ids,
 		LocatedItems:     &total,
@@ -753,6 +757,9 @@ func handleDestroy(ctx context.Context, b *backend, req *payloads.DestroyRequest
 			"deletion_allowed": originalDeletionAllowed,
 		}); restoreErr != nil {
 			b.Logger().Error("Failed to restore deletion_allowed after failed destroy", "key", name, "original", originalDeletionAllowed, "error", restoreErr)
+			// Surface the uncertain state: deletion_allowed is now true and could not be reverted.
+			return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure,
+				"failed to destroy key %q and could not restore deletion_allowed; key state is uncertain: %s", name, err)
 		}
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to destroy key %q: %s", name, err)
 	}

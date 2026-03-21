@@ -140,6 +140,12 @@ func (b *backend) restartKmipServer(cfg *kmipConfig) error {
 
 	srv, err := newTransitKmipServer(cfg, b)
 	if err != nil {
+		if sameAddr {
+			// The old server was already stopped and cannot be restored because the OS
+			// will not allow two listeners on the same address. The KMIP server is now
+			// offline. The operator must write a valid configuration to re-enable it.
+			b.Logger().Error("KMIP server offline after failed same-address restart; update config/kmip to re-enable", "error", err)
+		}
 		return fmt.Errorf("failed to create KMIP server: %w", err)
 	}
 

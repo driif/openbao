@@ -369,7 +369,7 @@ func handleGet(ctx context.Context, b *backend, req *payloads.GetRequestPayload)
 		}, nil
 
 	case keysutil.KeyType_ECDSA_P256, keysutil.KeyType_ECDSA_P384, keysutil.KeyType_ECDSA_P521:
-		if keyEntry.EC_D == nil {
+		if keyEntry.EC_D == nil || keyEntry.EC_X == nil || keyEntry.EC_Y == nil {
 			return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "EC key material not available")
 		}
 		var curve elliptic.Curve
@@ -459,9 +459,13 @@ func handleGetAttributes(ctx context.Context, b *backend, req *payloads.GetAttri
 	attrs := []kmip.Attribute{
 		{AttributeName: kmip.AttributeNameUniqueIdentifier, AttributeValue: name},
 		{AttributeName: kmip.AttributeNameObjectType, AttributeValue: kmipObjectTypeForKeyType(p.Type)},
-		{AttributeName: kmip.AttributeNameCryptographicAlgorithm, AttributeValue: alg},
-		{AttributeName: kmip.AttributeNameCryptographicLength, AttributeValue: bitLen},
 		{AttributeName: kmip.AttributeNameState, AttributeValue: state},
+	}
+	if alg != 0 {
+		attrs = append(attrs, kmip.Attribute{AttributeName: kmip.AttributeNameCryptographicAlgorithm, AttributeValue: alg})
+	}
+	if bitLen != 0 {
+		attrs = append(attrs, kmip.Attribute{AttributeName: kmip.AttributeNameCryptographicLength, AttributeValue: bitLen})
 	}
 
 	versionStr := strconv.Itoa(p.LatestVersion)
@@ -726,14 +730,11 @@ func handleActivate(ctx context.Context, b *backend, req *payloads.ActivateReque
 	if p == nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q not found", name)
 	}
-	// Transit keys are always Active; no state change needed. Acquire and
-	// immediately release the lock to match the pattern used by every other
-	// handler: when caching is enabled GetPolicy returns with no lock held,
-	// so we must take one before calling Unlock.
-	if !b.System().CachingDisabled() {
-		p.Lock(false)
+	// Transit keys are always Active; no state change needed. When caching is
+	// disabled, GetPolicy returns with the write lock held and must be released.
+	if b.System().CachingDisabled() {
+		p.Unlock()
 	}
-	p.Unlock()
 
 	return &payloads.ActivateResponsePayload{
 		UniqueIdentifier: name,

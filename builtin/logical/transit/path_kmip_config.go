@@ -50,8 +50,9 @@ func (b *backend) pathKmipConfig() *framework.Path {
 				Description: "PEM-encoded TLS certificate for the KMIP server.",
 			},
 			"server_key_pem": {
-				Type:        framework.TypeString,
-				Description: "PEM-encoded private key for the KMIP server certificate.",
+				Type:         framework.TypeString,
+				Description:  "PEM-encoded private key for the KMIP server certificate.",
+				DisplayAttrs: &framework.DisplayAttributes{Sensitive: true},
 			},
 			"tls_ca_cert_pem": {
 				Type:        framework.TypeString,

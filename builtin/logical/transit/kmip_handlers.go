@@ -521,8 +521,14 @@ func handleGetAttributes(ctx context.Context, b *backend, req *payloads.GetAttri
 		attrs = append(attrs, kmip.Attribute{AttributeName: kmip.AttributeNameCryptographicLength, AttributeValue: bitLen})
 	}
 
-	versionStr := strconv.Itoa(p.LatestVersion)
-	if keyEntry, ok := p.Keys[versionStr]; ok {
+	// InitialDate must reflect when the key object was first created (version 1),
+	// not the most recent rotation. Fall back to the minimum available version if
+	// version 1 has been archived and its entry removed.
+	initialVersionStr := "1"
+	if _, ok := p.Keys[initialVersionStr]; !ok {
+		initialVersionStr = strconv.Itoa(p.MinDecryptionVersion)
+	}
+	if keyEntry, ok := p.Keys[initialVersionStr]; ok {
 		attrs = append(attrs, kmip.Attribute{
 			AttributeName:  kmip.AttributeNameInitialDate,
 			AttributeValue: keyEntry.CreationTime,

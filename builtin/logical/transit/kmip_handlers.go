@@ -758,7 +758,18 @@ func handleRevoke(ctx context.Context, b *backend, req *payloads.RevokeRequestPa
 		return nil, err
 	}
 
-	_, err := callTransit(ctx, b, storage, logical.DeleteOperation, "keys/"+name+"/soft-delete", nil)
+	// Verify the key exists before attempting soft-delete. The transit
+	// soft-delete handler returns (nil, nil) for non-existent keys, which
+	// would cause a false success response violating KMIP semantics.
+	keyResp, err := callTransit(ctx, b, storage, logical.ReadOperation, "keys/"+name, nil)
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to read key %q: %s", name, err)
+	}
+	if keyResp == nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q not found", name)
+	}
+
+	_, err = callTransit(ctx, b, storage, logical.DeleteOperation, "keys/"+name+"/soft-delete", nil)
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to revoke key %q: %s", name, err)
 	}

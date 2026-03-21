@@ -19,7 +19,7 @@ import (
 
 // TestBackend_basic_docker is an example test using the Docker Environment
 func TestAccBackend_basic_docker(t *testing.T) {
-	decryptData := make(map[string]interface{})
+	decryptData := make(map[string]any)
 	envOptions := stepwise.MountOptions{
 		RegistryName:    "updatedtransit",
 		PluginType:      api.PluginTypeSecrets,
@@ -42,11 +42,11 @@ func TestAccBackend_basic_docker(t *testing.T) {
 	})
 }
 
-func testAccStepwiseWritePolicy(t *testing.T, name string, derived bool) stepwise.Step {
+func testAccStepwiseWritePolicy(_ *testing.T, name string, derived bool) stepwise.Step {
 	ts := stepwise.Step{
 		Operation: stepwise.WriteOperation,
 		Path:      "keys/" + name,
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"derived": derived,
 		},
 	}
@@ -56,7 +56,7 @@ func testAccStepwiseWritePolicy(t *testing.T, name string, derived bool) stepwis
 	return ts
 }
 
-func testAccStepwiseListPolicy(t *testing.T, name string, expectNone bool) stepwise.Step {
+func testAccStepwiseListPolicy(_ *testing.T, name string, expectNone bool) stepwise.Step {
 	return stepwise.Step{
 		Operation: stepwise.ListOperation,
 		Path:      "keys",
@@ -166,12 +166,12 @@ func testAccStepwiseReadPolicyWithVersions(t *testing.T, name string, expectNone
 }
 
 func testAccStepwiseEncryptContext(
-	t *testing.T, name, plaintext, context string, decryptData map[string]interface{},
+	_ *testing.T, name, plaintext, context string, decryptData map[string]any,
 ) stepwise.Step {
 	return stepwise.Step{
 		Operation: stepwise.UpdateOperation,
 		Path:      "encrypt/" + name,
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"plaintext": base64.StdEncoding.EncodeToString([]byte(plaintext)),
 			"context":   base64.StdEncoding.EncodeToString([]byte(context)),
 		},
@@ -193,7 +193,7 @@ func testAccStepwiseEncryptContext(
 }
 
 func testAccStepwiseDecrypt(
-	t *testing.T, name, plaintext string, decryptData map[string]interface{},
+	_ *testing.T, name, plaintext string, decryptData map[string]any,
 ) stepwise.Step {
 	return stepwise.Step{
 		Operation: stepwise.UpdateOperation,
@@ -221,17 +221,17 @@ func testAccStepwiseDecrypt(
 	}
 }
 
-func testAccStepwiseEnableDeletion(t *testing.T, name string) stepwise.Step {
+func testAccStepwiseEnableDeletion(_ *testing.T, name string) stepwise.Step {
 	return stepwise.Step{
 		Operation: stepwise.UpdateOperation,
 		Path:      "keys/" + name + "/config",
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"deletion_allowed": true,
 		},
 	}
 }
 
-func testAccStepwiseDeletePolicy(t *testing.T, name string) stepwise.Step {
+func testAccStepwiseDeletePolicy(_ *testing.T, name string) stepwise.Step {
 	return stepwise.Step{
 		Operation: stepwise.DeleteOperation,
 		Path:      "keys/" + name,

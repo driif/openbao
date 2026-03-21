@@ -106,7 +106,7 @@ func (b *backend) pathKmipConfigRead(ctx context.Context, req *logical.Request, 
 	}
 
 	return &logical.Response{
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"enabled":             cfg.Enabled,
 			"listen_addr":         cfg.ListenAddr,
 			"server_cert_pem":     cfg.ServerCertPEM,
@@ -171,11 +171,12 @@ func (b *backend) pathKmipConfigWrite(ctx context.Context, req *logical.Request,
 		}
 	}
 
-	// When the server is enabled, require_client_cert=true without a CA cert would
-	// fall back to the host trust store instead of a mount-local CA, silently
-	// broadening which client certificates can pass the TLS handshake.
-	if cfg.Enabled && cfg.RequireClientCert && cfg.TLSCACertPEM == "" {
-		return logical.ErrorResponse("tls_ca_cert_pem is required when require_client_cert is true and the server is enabled"), logical.ErrInvalidRequest
+	// A CA cert is always required when the server is enabled. Without it the
+	// TLS layer cannot verify client certificate identity, so any client could
+	// mint a self-signed certificate matching any configured role DN and bypass
+	// auth entirely.
+	if cfg.Enabled && cfg.TLSCACertPEM == "" {
+		return logical.ErrorResponse("tls_ca_cert_pem is required when the KMIP server is enabled"), logical.ErrInvalidRequest
 	}
 
 	// Try to start the server with the new config before persisting it, so that

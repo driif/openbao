@@ -35,31 +35,41 @@ func newTransitKmipServer(cfg *kmipConfig, b *backend) (*transitKmipServer, erro
 		MinVersion:   tls.VersionTLS12,
 	}
 
-	// Set up client certificate verification if required
-	if cfg.RequireClientCert {
-		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
-		if cfg.TLSCACertPEM != "" {
-			pool := x509.NewCertPool()
-			rest := []byte(cfg.TLSCACertPEM)
-			for {
-				var block *pem.Block
-				block, rest = pem.Decode(rest)
-				if block == nil {
-					break
-				}
-				if block.Type != "CERTIFICATE" {
-					continue
-				}
-				cert, err := x509.ParseCertificate(block.Bytes)
-				if err != nil {
-					return nil, fmt.Errorf("failed to parse CA certificate: %w", err)
-				}
-				pool.AddCert(cert)
+	// Set up CA cert pool if provided; used whether or not client certs are required.
+	if cfg.TLSCACertPEM != "" {
+		pool := x509.NewCertPool()
+		rest := []byte(cfg.TLSCACertPEM)
+		for {
+			var block *pem.Block
+			block, rest = pem.Decode(rest)
+			if block == nil {
+				break
 			}
-			tlsCfg.ClientCAs = pool
+			if block.Type != "CERTIFICATE" {
+				continue
+			}
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse CA certificate: %w", err)
+			}
+			pool.AddCert(cert)
 		}
+		tlsCfg.ClientCAs = pool
+	}
+
+	if cfg.RequireClientCert {
+		// Reject connections that do not present a valid client certificate.
+		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+	} else if cfg.TLSCACertPEM != "" {
+		// Request a client cert and verify it against the CA if presented, but
+		// do not reject connections that omit one. Application-level auth
+		// (authMiddleware) still requires a cert and will return PermissionDenied
+		// when none is provided.
+		tlsCfg.ClientAuth = tls.VerifyClientCertIfGiven
 	} else {
-		tlsCfg.ClientAuth = tls.NoClientCert
+		// Request a client cert but do not verify or require it at the TLS layer.
+		// Application-level auth still requires one.
+		tlsCfg.ClientAuth = tls.RequestClientCert
 	}
 
 	listener, err := tls.Listen("tcp", cfg.ListenAddr, tlsCfg)

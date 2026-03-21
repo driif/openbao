@@ -155,7 +155,7 @@ func (b *backend) pathKmipRoleRead(ctx context.Context, req *logical.Request, d 
 	}
 
 	return &logical.Response{
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"cert_subject_dn":    role.CertSubjectDN,
 			"allowed_operations": role.AllowedOperations,
 			"allowed_key_names":  role.AllowedKeyNames,
@@ -164,6 +164,11 @@ func (b *backend) pathKmipRoleRead(ctx context.Context, req *logical.Request, d 
 }
 
 func (b *backend) pathKmipRoleWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	// Serialise role writes so the DN-uniqueness check and the storage write
+	// are atomic with respect to concurrent requests.
+	b.kmipRoleMu.Lock()
+	defer b.kmipRoleMu.Unlock()
+
 	name := d.Get("name").(string)
 
 	// Load existing role to allow partial updates

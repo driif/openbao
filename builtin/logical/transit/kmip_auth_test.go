@@ -135,8 +135,10 @@ func TestFindKmipRoleByDN(t *testing.T) {
 	require.Nil(t, notFound)
 }
 
-// TestAuthMiddleware_NoClientCert checks that when no peer certificate is
-// present the middleware passes the request along (TLS layer handles enforcement).
+// TestAuthMiddleware_NoClientCert checks that the middleware returns
+// PermissionDenied when no peer certificate is present, regardless of the
+// TLS-layer RequireClientCert setting. Application-level auth always requires
+// a certificate to identify the caller.
 func TestAuthMiddleware_NoClientCert(t *testing.T) {
 	b, storage := createBackendWithSysView(t)
 	b.storage = storage
@@ -150,8 +152,9 @@ func TestAuthMiddleware_NoClientCert(t *testing.T) {
 	}
 
 	_, err := middleware(next, context.Background(), &kmip.RequestMessage{})
-	require.NoError(t, err)
-	require.True(t, called, "next should have been called when no cert is present")
+	require.Error(t, err, "middleware must reject requests with no client certificate")
+	require.Contains(t, err.Error(), "client certificate required")
+	require.False(t, called, "next must not be called when no cert is present")
 }
 
 // TestAuthMiddleware_Integration exercises the middleware in a real KMIP
@@ -248,11 +251,9 @@ func TestAuthMiddleware_StorageNil(t *testing.T) {
 
 	middleware := authMiddleware(b)
 
-	// Build a fake context with a peer certificate using a real TLS handshake
-	// is complex; instead we invoke the middleware directly via the exported
-	// kmipserver.PeerCertificates path. Since we can't inject a peer cert
-	// without a real TLS connection (ctxConn is unexported), we only test the
-	// no-cert path here - which should pass through to next.
+	// Without a real TLS connection we cannot inject a peer certificate, so
+	// this test exercises the no-cert code path: the middleware must return
+	// PermissionDenied before even trying to consult storage.
 	called := false
 	next := func(ctx context.Context, msg *kmip.RequestMessage) (*kmip.ResponseMessage, error) {
 		called = true
@@ -260,8 +261,9 @@ func TestAuthMiddleware_StorageNil(t *testing.T) {
 	}
 
 	_, err := middleware(next, context.Background(), &kmip.RequestMessage{})
-	require.NoError(t, err)
-	require.True(t, called)
+	require.Error(t, err, "middleware must reject requests with no client certificate")
+	require.Contains(t, err.Error(), "client certificate required")
+	require.False(t, called)
 }
 
 // TestKmipRoleFromContext verifies the context getter.

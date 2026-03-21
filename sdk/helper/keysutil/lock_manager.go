@@ -21,6 +21,10 @@ const (
 	currentConvergentVersion = 3
 )
 
+// ErrKeyAlreadyExists is returned by ImportPolicy when MustNotExist is set
+// and the key already exists in storage.
+var ErrKeyAlreadyExists = errors.New("key already exists")
+
 // PolicyRequest holds values used when requesting a policy. Most values are
 // only used during an upsert.
 type PolicyRequest struct {
@@ -47,6 +51,11 @@ type PolicyRequest struct {
 
 	// Whether to upsert
 	Upsert bool
+
+	// MustNotExist causes ImportPolicy to return ErrKeyAlreadyExists if the
+	// named key already exists in storage. This allows callers to perform an
+	// atomic check-and-create without a separate existence check.
+	MustNotExist bool
 
 	// Whether to allow plaintext backup
 	AllowPlaintextBackup bool
@@ -158,7 +167,7 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 	defer lock.Unlock()
 
 	var ok bool
-	var pRaw interface{}
+	var pRaw any
 
 	// If the policy is in cache and 'force' is not specified, error out. Anywhere
 	// that would put it in the cache will also be protected by the mutex above,
@@ -244,7 +253,7 @@ func (lm *LockManager) BackupPolicy(ctx context.Context, storage logical.Storage
 	defer lock.Unlock()
 
 	var ok bool
-	var pRaw interface{}
+	var pRaw any
 
 	if lm.useCache {
 		pRaw, ok = lm.cache.Load(name)
@@ -282,7 +291,7 @@ func (lm *LockManager) GetPolicy(ctx context.Context, req PolicyRequest, rand io
 	var p *Policy
 	var err error
 	var ok bool
-	var pRaw interface{}
+	var pRaw any
 
 	// Check if it's in our cache. If so, return right away.
 	if lm.useCache {
@@ -446,7 +455,7 @@ func (lm *LockManager) ImportPolicy(ctx context.Context, req PolicyRequest, key 
 	var p *Policy
 	var err error
 	var ok bool
-	var pRaw interface{}
+	var pRaw any
 
 	// Check if it's in our cache
 	if lm.useCache {
@@ -470,6 +479,10 @@ func (lm *LockManager) ImportPolicy(ctx context.Context, req PolicyRequest, key 
 	p, err = lm.getPolicyFromStorage(ctx, req.Storage, req.Name)
 	if err != nil {
 		return err
+	}
+
+	if p != nil && req.MustNotExist {
+		return ErrKeyAlreadyExists
 	}
 
 	if p == nil {
@@ -502,7 +515,7 @@ func (lm *LockManager) DeletePolicy(ctx context.Context, storage logical.Storage
 	var p *Policy
 	var err error
 	var ok bool
-	var pRaw interface{}
+	var pRaw any
 
 	// We may be writing to disk, so grab an exclusive lock. This prevents bad
 	// behavior when the cache is turned off. We also lock the shared policy

@@ -30,12 +30,10 @@ func kmipRoleFromContext(ctx context.Context) *kmipRole {
 // configured kmipRoles. The matched role is stored in the request context
 // for downstream authorizeOperation checks.
 //
-// If RequireClientCert is false on the KMIP config, the TLS layer accepts
-// connections without client certificates. Such unauthenticated connections
-// are injected with a wildcard role (empty AllowedOperations and empty
-// AllowedKeyNames), which grants access to all operations on all keys.
-// Only enable RequireClientCert=false in environments where network-level
-// controls already restrict who can reach the KMIP port.
+// A client certificate is always required at the application level. If no
+// certificate is presented the middleware returns PermissionDenied regardless
+// of the RequireClientCert TLS setting (that setting only controls whether the
+// TLS handshake itself rejects uncertified connections).
 //
 // If RequireClientCert is true (the default) and no matching role is found,
 // the middleware returns PermissionDenied.
@@ -44,13 +42,11 @@ func authMiddleware(b *backend) kmipserver.Middleware {
 		certs := kmipserver.PeerCertificates(ctx)
 
 		if len(certs) == 0 {
-			// No client cert present. When RequireClientCert is false the TLS
-			// layer uses tls.NoClientCert, so unauthenticated connections reach
-			// here. A zero-value role grants all operations on all keys.
-			// When RequireClientCert is true the TLS handshake rejects the
-			// connection before we reach this point.
-			ctx = context.WithValue(ctx, ctxKmipRole{}, &kmipRole{})
-			return next(ctx, msg)
+			// No client cert present. Deny the request regardless of
+			// RequireClientCert setting — the TLS-layer option only controls
+			// whether the handshake is rejected; application-level auth still
+			// requires a client certificate to identify the caller.
+			return nil, kmipserver.Errorf(kmip.ResultReasonPermissionDenied, "auth: client certificate required")
 		}
 
 		subjectDN := certs[0].Subject.String()

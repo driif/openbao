@@ -559,12 +559,12 @@ func Test_Import(t *testing.T) {
 	}
 
 	tests := map[string]struct {
-		policy      Policy
+		policy      *Policy
 		key         []byte
 		shouldError bool
 	}{
 		"import AES key": {
-			policy: Policy{
+			policy: &Policy{
 				Name: "test-aes-key",
 				Type: KeyType_AES256_GCM96,
 			},
@@ -572,7 +572,7 @@ func Test_Import(t *testing.T) {
 			shouldError: false,
 		},
 		"import RSA key": {
-			policy: Policy{
+			policy: &Policy{
 				Name: "test-rsa-key",
 				Type: KeyType_RSA2048,
 			},
@@ -580,7 +580,7 @@ func Test_Import(t *testing.T) {
 			shouldError: false,
 		},
 		"import ECDSA key": {
-			policy: Policy{
+			policy: &Policy{
 				Name: "test-ecdsa-key",
 				Type: KeyType_ECDSA_P256,
 			},
@@ -588,7 +588,7 @@ func Test_Import(t *testing.T) {
 			shouldError: false,
 		},
 		"import ED25519 key": {
-			policy: Policy{
+			policy: &Policy{
 				Name: "test-ed25519-key",
 				Type: KeyType_ED25519,
 			},
@@ -596,7 +596,7 @@ func Test_Import(t *testing.T) {
 			shouldError: false,
 		},
 		"import incorrect key type": {
-			policy: Policy{
+			policy: &Policy{
 				Name: "test-ed25519-key",
 				Type: KeyType_ED25519,
 			},
@@ -690,7 +690,7 @@ func BenchmarkSymmetric(b *testing.B) {
 	key, _ := p.GetKey(nil, 1, 32)
 	pt := make([]byte, 10)
 	ad := make([]byte, 10)
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		ct, _ := p.SymmetricEncryptRaw(1, key, pt,
 			SymmetricOpts{
 				AdditionalData: ad,
@@ -904,7 +904,7 @@ func Test_RSA_PKCS1(t *testing.T) {
 		tabs[i] = strings.Repeat("\t", i)
 	}
 
-	test_RSA_PKCS1 := func(t *testing.T, p *Policy, rsaKey *rsa.PrivateKey, hashType HashType,
+	test_RSA_PKCS1 := func(t *testing.T, p *Policy, _ *rsa.PrivateKey, hashType HashType,
 		marshalingType MarshalingType,
 	) {
 		unsaltedOptions := SigningOptions{

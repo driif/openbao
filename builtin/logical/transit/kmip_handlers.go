@@ -10,6 +10,7 @@ import (
 	cryptoRand "crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -42,7 +43,7 @@ func validateKmipName(name string) error {
 
 // callTransit constructs an internal logical.Request and routes it through the transit backend.
 // It returns the response or an error. If the response contains an error, the error is returned.
-func callTransit(ctx context.Context, b *backend, storage logical.Storage, op logical.Operation, path string, data map[string]interface{}) (*logical.Response, error) {
+func callTransit(ctx context.Context, b *backend, storage logical.Storage, op logical.Operation, path string, data map[string]any) (*logical.Response, error) {
 	req := &logical.Request{
 		Operation: op,
 		Path:      path,
@@ -95,6 +96,46 @@ func kmipAlgorithmToTransitType(alg kmip.CryptographicAlgorithm, bitLen int32) (
 		}
 	default:
 		return "", fmt.Errorf("unsupported KMIP algorithm: %s", ttlv.EnumStr(alg))
+	}
+}
+
+// kmipAlgorithmToKeysutilType maps a KMIP CryptographicAlgorithm and bit length to a keysutil.KeyType.
+// This is used for atomic key creation via GetPolicy to avoid a read-before-write race.
+func kmipAlgorithmToKeysutilType(alg kmip.CryptographicAlgorithm, bitLen int32) (keysutil.KeyType, error) {
+	switch alg {
+	case kmip.CryptographicAlgorithmAES:
+		switch bitLen {
+		case 128:
+			return keysutil.KeyType_AES128_GCM96, nil
+		case 256, 0:
+			return keysutil.KeyType_AES256_GCM96, nil
+		default:
+			return 0, fmt.Errorf("unsupported AES key size %d bits", bitLen)
+		}
+	case kmip.CryptographicAlgorithmRSA:
+		switch bitLen {
+		case 2048:
+			return keysutil.KeyType_RSA2048, nil
+		case 3072:
+			return keysutil.KeyType_RSA3072, nil
+		case 4096, 0:
+			return keysutil.KeyType_RSA4096, nil
+		default:
+			return 0, fmt.Errorf("unsupported RSA key size %d bits", bitLen)
+		}
+	case kmip.CryptographicAlgorithmECDSA, kmip.CryptographicAlgorithmEC:
+		switch bitLen {
+		case 256, 0:
+			return keysutil.KeyType_ECDSA_P256, nil
+		case 384:
+			return keysutil.KeyType_ECDSA_P384, nil
+		case 521:
+			return keysutil.KeyType_ECDSA_P521, nil
+		default:
+			return 0, fmt.Errorf("unsupported EC key size %d bits", bitLen)
+		}
+	default:
+		return 0, fmt.Errorf("unsupported KMIP algorithm: %s", ttlv.EnumStr(alg))
 	}
 }
 
@@ -222,6 +263,11 @@ func registerKmipHandlers(executor *kmipserver.BatchExecutor, b *backend) {
 // handleCreate implements the KMIP Create operation by creating a new transit key.
 // The key name is taken from the Name attribute in TemplateAttribute, or a UUID is generated.
 // The key type is derived from CryptographicAlgorithm + CryptographicLength attributes.
+//
+// Key uniqueness is enforced atomically: GetPolicy with Upsert=true holds the
+// per-key lock for the entire check-and-generate sequence, so two concurrent
+// KMIP Creates (or a concurrent transit-side create) for the same name cannot
+// both succeed.
 func handleCreate(ctx context.Context, b *backend, req *payloads.CreateRequestPayload) (*payloads.CreateResponsePayload, error) {
 	storage := b.storage
 	if storage == nil {
@@ -233,7 +279,7 @@ func handleCreate(ctx context.Context, b *backend, req *payloads.CreateRequestPa
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "CryptographicAlgorithm is required")
 	}
 
-	keyType, err := kmipAlgorithmToTransitType(alg, bitLen)
+	keyType, err := kmipAlgorithmToKeysutilType(alg, bitLen)
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "%s", err.Error())
 	}
@@ -250,38 +296,28 @@ func handleCreate(ctx context.Context, b *backend, req *payloads.CreateRequestPa
 		return nil, err
 	}
 
-	// Reject if a key with this name already exists — KMIP Create must return
-	// ObjectAlreadyExists rather than silently succeeding (transit key creation
-	// is idempotent and would return success without this check).
-	existing, _, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
-		Storage: storage,
-		Name:    name,
+	// Atomically create the key. GetPolicy with Upsert=true holds the per-key
+	// lock for the entire check-and-generate sequence. If the key already
+	// existed (upserted == false), return ObjectAlreadyExists per KMIP spec.
+	p, upserted, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
+		Upsert:     true,
+		Storage:    storage,
+		Name:       name,
+		KeyType:    keyType,
+		Exportable: true,
 	}, b.GetRandomReader())
-	if err != nil {
-		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to check for existing key: %s", err)
-	}
-	if existing != nil {
-		if b.System().CachingDisabled() {
-			existing.Unlock()
-		}
-		return nil, kmipserver.Errorf(kmip.ResultReasonObjectAlreadyExists, "key %q already exists", name)
-	}
-
-	_, err = callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name, map[string]interface{}{
-		"type":       keyType,
-		"exportable": true,
-	})
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to create key: %s", err)
 	}
-
-	objectType := kmip.ObjectTypeSymmetricKey
-	if alg == kmip.CryptographicAlgorithmRSA || alg == kmip.CryptographicAlgorithmECDSA || alg == kmip.CryptographicAlgorithmEC {
-		objectType = kmip.ObjectTypePrivateKey
+	if p != nil && b.System().CachingDisabled() {
+		p.Unlock()
+	}
+	if !upserted {
+		return nil, kmipserver.Errorf(kmip.ResultReasonObjectAlreadyExists, "key %q already exists", name)
 	}
 
 	return &payloads.CreateResponsePayload{
-		ObjectType:       objectType,
+		ObjectType:       kmipObjectTypeForKeyType(keyType),
 		UniqueIdentifier: name,
 	}, nil
 }
@@ -653,13 +689,7 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 	}
 
 	// Apply offset if specified
-	offset := int(req.OffsetItems)
-	if offset < 0 {
-		offset = 0
-	}
-	if offset > len(keys) {
-		offset = len(keys)
-	}
+	offset := min(max(int(req.OffsetItems), 0), len(keys))
 	ids := keys[offset:]
 
 	// Apply MaximumItems limit if specified
@@ -702,7 +732,7 @@ func handleDestroy(ctx context.Context, b *backend, req *payloads.DestroyRequest
 	originalDeletionAllowed, _ := keyResp.Data["deletion_allowed"].(bool)
 
 	// Enable deletion on the key first.
-	_, err = callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name+"/config", map[string]interface{}{
+	_, err = callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name+"/config", map[string]any{
 		"deletion_allowed": true,
 	})
 	if err != nil {
@@ -713,7 +743,7 @@ func handleDestroy(ctx context.Context, b *backend, req *payloads.DestroyRequest
 	// original value to avoid permanently changing the key's deletion policy.
 	_, err = callTransit(ctx, b, storage, logical.DeleteOperation, "keys/"+name, nil)
 	if err != nil {
-		if _, restoreErr := callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name+"/config", map[string]interface{}{
+		if _, restoreErr := callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name+"/config", map[string]any{
 			"deletion_allowed": originalDeletionAllowed,
 		}); restoreErr != nil {
 			b.Logger().Error("Failed to restore deletion_allowed after failed destroy", "key", name, "original", originalDeletionAllowed, "error", restoreErr)
@@ -831,7 +861,7 @@ func handleEncrypt(ctx context.Context, b *backend, req *payloads.EncryptRequest
 	}
 
 	plaintext := base64.StdEncoding.EncodeToString(req.Data)
-	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "encrypt/"+name, map[string]interface{}{
+	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "encrypt/"+name, map[string]any{
 		"plaintext": plaintext,
 	})
 	if err != nil {
@@ -870,7 +900,7 @@ func handleDecrypt(ctx context.Context, b *backend, req *payloads.DecryptRequest
 		return nil, err
 	}
 
-	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "decrypt/"+name, map[string]interface{}{
+	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "decrypt/"+name, map[string]any{
 		"ciphertext": string(req.Data),
 	})
 	if err != nil {
@@ -915,7 +945,7 @@ func handleSign(ctx context.Context, b *backend, req *payloads.SignRequestPayloa
 	}
 
 	input := base64.StdEncoding.EncodeToString(req.Data)
-	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "sign/"+name, map[string]interface{}{
+	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "sign/"+name, map[string]any{
 		"input": input,
 	})
 	if err != nil {
@@ -958,7 +988,7 @@ func handleVerify(ctx context.Context, b *backend, req *payloads.SignatureVerify
 	}
 
 	input := base64.StdEncoding.EncodeToString(req.Data)
-	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "verify/"+name, map[string]interface{}{
+	resp, err := callTransit(ctx, b, storage, logical.UpdateOperation, "verify/"+name, map[string]any{
 		"input":     input,
 		"signature": string(req.SignatureData),
 	})
@@ -1145,9 +1175,13 @@ func handleRegister(ctx context.Context, b *backend, req *payloads.RegisterReque
 		KeyType:      ktype,
 		Exportable:   true,
 		IsPrivateKey: isPrivateKey,
+		MustNotExist: true,
 	}
 
 	if err := b.lm.ImportPolicy(ctx, polReq, keyBytes, b.GetRandomReader()); err != nil {
+		if errors.Is(err, keysutil.ErrKeyAlreadyExists) {
+			return nil, kmipserver.Errorf(kmip.ResultReasonObjectAlreadyExists, "key %q already exists", name)
+		}
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to import key: %s", err)
 	}
 

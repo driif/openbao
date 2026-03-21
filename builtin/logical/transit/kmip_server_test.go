@@ -175,16 +175,18 @@ func TestKmipServer_LifecycleViaBackend(t *testing.T) {
 	certPEM, keyPEM := generateTestCert(t)
 	addr := freePort(t)
 
-	// Enable KMIP server via config write
+	// Enable KMIP server via config write. A CA cert is required by the API
+	// even with require_client_cert=false so that client identity can be verified.
 	writeReq := &logical.Request{
 		Storage:   storage,
 		Operation: logical.UpdateOperation,
 		Path:      "config/kmip",
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"enabled":             true,
 			"listen_addr":         addr,
 			"server_cert_pem":     certPEM,
 			"server_key_pem":      keyPEM,
+			"tls_ca_cert_pem":     certPEM,
 			"require_client_cert": false,
 		},
 	}
@@ -202,7 +204,7 @@ func TestKmipServer_LifecycleViaBackend(t *testing.T) {
 		Storage:   storage,
 		Operation: logical.UpdateOperation,
 		Path:      "config/kmip",
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"enabled": false,
 		},
 	}
@@ -226,11 +228,12 @@ func TestKmipServer_Cleanup(t *testing.T) {
 		Storage:   storage,
 		Operation: logical.UpdateOperation,
 		Path:      "config/kmip",
-		Data: map[string]interface{}{
+		Data: map[string]any{
 			"enabled":             true,
 			"listen_addr":         addr,
 			"server_cert_pem":     certPEM,
 			"server_key_pem":      keyPEM,
+			"tls_ca_cert_pem":     certPEM,
 			"require_client_cert": false,
 		},
 	}

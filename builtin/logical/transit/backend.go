@@ -47,7 +47,11 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 	if err != nil {
 		b.Logger().Warn("Failed to load KMIP config on startup", "error", err)
 	} else if cfg != nil && cfg.Enabled {
-		if b.System().ReplicationState().HasState(consts.ReplicationDRSecondary|consts.ReplicationPerformanceStandby) ||
+		if cfg.TLSCACertPEM == "" {
+			// A CA cert is required for the server to verify client identity.
+			// Refuse to start rather than bind a listener with no trust anchor.
+			b.Logger().Error("Refusing to start KMIP server on startup: tls_ca_cert_pem is required when enabled; update config/kmip to add a CA certificate")
+		} else if b.System().ReplicationState().HasState(consts.ReplicationDRSecondary|consts.ReplicationPerformanceStandby) ||
 			(!b.System().LocalMount() && b.System().ReplicationState().HasState(consts.ReplicationPerformanceSecondary)) {
 			b.Logger().Debug("Skipping KMIP server start on non-primary node")
 		} else if err := b.restartKmipServer(cfg); err != nil {
@@ -158,6 +162,9 @@ type backend struct {
 	// KMIP server fields
 	kmipServer *transitKmipServer
 	kmipMu     sync.Mutex
+	// kmipRoleMu serialises role writes to make the DN-uniqueness check and
+	// the subsequent storage write atomic with respect to concurrent requests.
+	kmipRoleMu sync.Mutex
 	// storage is the backend's persistent storage view, set during Factory
 	// and used by components (e.g. KMIP auth middleware) that operate outside
 	// the normal request handler lifecycle.
@@ -207,11 +214,11 @@ func (b *backend) GetPolicy(ctx context.Context, polReq keysutil.PolicyRequest, 
 	} else {
 		b.configMutex.RUnlock()
 	}
-	p, _, err := b.lm.GetPolicy(ctx, polReq, rand)
+	p, upserted, err := b.lm.GetPolicy(ctx, polReq, rand)
 	if err != nil {
 		return p, false, err
 	}
-	return p, true, nil
+	return p, upserted, nil
 }
 
 func (b *backend) invalidate(ctx context.Context, key string) {
@@ -243,6 +250,13 @@ func (b *backend) invalidate(ctx context.Context, key string) {
 		cfg, err := b.getKmipConfig(ctx, b.storage)
 		if err != nil {
 			b.Logger().Error("Failed to reload KMIP config on invalidation", "error", err)
+			return
+		}
+		if cfg != nil && cfg.Enabled && cfg.TLSCACertPEM == "" {
+			// A CA cert is required for the server to verify client identity.
+			// Refuse to start rather than bind a listener with no trust anchor.
+			b.Logger().Error("Refusing to start KMIP server after config invalidation: tls_ca_cert_pem is required when enabled; update config/kmip to add a CA certificate")
+			b.stopKmipServer()
 			return
 		}
 		if err := b.restartKmipServer(cfg); err != nil {

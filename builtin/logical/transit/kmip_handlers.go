@@ -868,6 +868,17 @@ func handleEncrypt(ctx context.Context, b *backend, req *payloads.EncryptRequest
 	if len(req.Data) == 0 {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (plaintext) is required")
 	}
+	// Reject fields that transit does not support; silently ignoring them would
+	// create a false assurance (e.g. a client-supplied IV or AAD not being used).
+	if req.CryptographicParameters != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for Encrypt")
+	}
+	if len(req.IVCounterNonce) > 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "IVCounterNonce is not supported; transit manages the IV internally")
+	}
+	if len(req.AuthenticatedEncryptionAdditionalData) > 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "AuthenticatedEncryptionAdditionalData is not supported for Encrypt")
+	}
 
 	if err := authorizeOperation(ctx, kmip.OperationEncrypt, name); err != nil {
 		return nil, err
@@ -907,6 +918,20 @@ func handleDecrypt(ctx context.Context, b *backend, req *payloads.DecryptRequest
 	}
 	if len(req.Data) == 0 {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (ciphertext) is required")
+	}
+	// Reject fields that transit does not support; silently ignoring them would
+	// create a false assurance (e.g. a client-supplied IV or AAD not being used).
+	if req.CryptographicParameters != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for Decrypt")
+	}
+	if len(req.IVCounterNonce) > 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "IVCounterNonce is not supported; transit manages the IV internally")
+	}
+	if len(req.AuthenticatedEncryptionAdditionalData) > 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "AuthenticatedEncryptionAdditionalData is not supported for Decrypt")
+	}
+	if len(req.AuthenticatedEncryptionTag) > 0 {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "AuthenticatedEncryptionTag is not supported for Decrypt")
 	}
 
 	if err := authorizeOperation(ctx, kmip.OperationDecrypt, name); err != nil {
@@ -952,6 +977,11 @@ func handleSign(ctx context.Context, b *backend, req *payloads.SignRequestPayloa
 	if len(req.Data) == 0 {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "Data (input to sign) is required")
 	}
+	// Reject CryptographicParameters to avoid silent algorithm/padding mismatches;
+	// transit uses the key's configured algorithm and cannot be overridden per-request.
+	if req.CryptographicParameters != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for Sign")
+	}
 
 	if err := authorizeOperation(ctx, kmip.OperationSign, name); err != nil {
 		return nil, err
@@ -994,6 +1024,11 @@ func handleVerify(ctx context.Context, b *backend, req *payloads.SignatureVerify
 	}
 	if len(req.SignatureData) == 0 {
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "SignatureData is required")
+	}
+	// Reject CryptographicParameters to avoid silent algorithm/padding mismatches;
+	// transit uses the key's configured algorithm and cannot be overridden per-request.
+	if req.CryptographicParameters != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for SignatureVerify")
 	}
 
 	if err := authorizeOperation(ctx, kmip.OperationSignatureVerify, name); err != nil {

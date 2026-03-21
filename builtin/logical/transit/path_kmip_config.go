@@ -188,6 +188,12 @@ func (b *backend) pathKmipConfigWrite(ctx context.Context, req *logical.Request,
 
 	entry, err := logical.StorageEntryJSON(kmipConfigStoragePath, &cfg)
 	if err != nil {
+		// The in-memory server was already switched to the new config.
+		// Roll back to the previous config so state remains consistent.
+		if rollbackErr := b.restartKmipServer(oldCfg); rollbackErr != nil {
+			b.Logger().Error("KMIP server rollback failed after config marshal error; in-memory and stored configs may diverge",
+				"marshal_error", err, "rollback_error", rollbackErr)
+		}
 		return nil, err
 	}
 	if err := req.Storage.Put(ctx, entry); err != nil {

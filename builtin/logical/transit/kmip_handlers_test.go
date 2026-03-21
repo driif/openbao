@@ -447,10 +447,17 @@ func TestHandleRevoke(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "revoke-key", resp.UniqueIdentifier)
 
-	// After soft-delete, GetAttributes should fail (soft-deleted key)
+	// After soft-delete (revoke), GetAttributes must succeed per KMIP spec and return StateDeactivated.
 	attrReq := &payloads.GetAttributesRequestPayload{UniqueIdentifier: "revoke-key"}
-	_, err = handleGetAttributes(ctx, b, attrReq)
-	require.Error(t, err)
+	attrResp, err := handleGetAttributes(ctx, b, attrReq)
+	require.NoError(t, err)
+	var gotState kmip.State
+	for _, a := range attrResp.Attribute {
+		if a.AttributeName == kmip.AttributeNameState {
+			gotState, _ = a.AttributeValue.(kmip.State)
+		}
+	}
+	require.Equal(t, kmip.StateDeactivated, gotState, "revoked key should have StateDeactivated")
 }
 
 func TestHandleRevoke_MissingUID(t *testing.T) {

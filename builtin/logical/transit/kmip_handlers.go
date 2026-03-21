@@ -506,12 +506,11 @@ func handleGetAttributes(ctx context.Context, b *backend, req *payloads.GetAttri
 	}
 	defer p.Unlock()
 
-	if p.SoftDeleted {
-		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q is soft deleted", name)
-	}
-
 	alg, bitLen := transitTypeToKmipAlgorithm(p.Type)
 	state := kmip.StateActive
+	if p.SoftDeleted {
+		state = kmip.StateDeactivated
+	}
 
 	attrs := []kmip.Attribute{
 		{AttributeName: kmip.AttributeNameUniqueIdentifier, AttributeValue: name},

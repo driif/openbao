@@ -258,8 +258,13 @@ func handleCreate(ctx context.Context, b *backend, req *payloads.CreateRequestPa
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to create key: %s", err)
 	}
 
+	objectType := kmip.ObjectTypeSymmetricKey
+	if alg == kmip.CryptographicAlgorithmRSA || alg == kmip.CryptographicAlgorithmECDSA || alg == kmip.CryptographicAlgorithmEC {
+		objectType = kmip.ObjectTypePrivateKey
+	}
+
 	return &payloads.CreateResponsePayload{
-		ObjectType:       req.ObjectType,
+		ObjectType:       objectType,
 		UniqueIdentifier: name,
 	}, nil
 }

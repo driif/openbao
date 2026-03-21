@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/ovh/kmip-go"
@@ -82,6 +83,9 @@ func (b *backend) findKmipRoleByDN(ctx context.Context, storage logical.Storage,
 	}
 
 	for _, name := range names {
+		if strings.HasSuffix(name, "/") {
+			continue
+		}
 		role, err := b.getKmipRole(ctx, storage, name)
 		if err != nil {
 			return nil, err

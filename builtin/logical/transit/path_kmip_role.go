@@ -200,6 +200,10 @@ func (b *backend) pathKmipRoleWrite(ctx context.Context, req *logical.Request, d
 		role.AllowedKeyNames = v.([]string)
 	}
 
+	if role.CertSubjectDN == "" {
+		return logical.ErrorResponse("cert_subject_dn is required"), nil
+	}
+
 	if err := b.putKmipRole(ctx, req.Storage, name, role); err != nil {
 		return nil, err
 	}

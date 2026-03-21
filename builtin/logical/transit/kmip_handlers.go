@@ -250,6 +250,23 @@ func handleCreate(ctx context.Context, b *backend, req *payloads.CreateRequestPa
 		return nil, err
 	}
 
+	// Reject if a key with this name already exists — KMIP Create must return
+	// ObjectAlreadyExists rather than silently succeeding (transit key creation
+	// is idempotent and would return success without this check).
+	existing, _, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
+		Storage: storage,
+		Name:    name,
+	}, b.GetRandomReader())
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to check for existing key: %s", err)
+	}
+	if existing != nil {
+		if b.System().CachingDisabled() {
+			existing.Unlock()
+		}
+		return nil, kmipserver.Errorf(kmip.ResultReasonObjectAlreadyExists, "key %q already exists", name)
+	}
+
 	_, err = callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name, map[string]interface{}{
 		"type":       keyType,
 		"exportable": true,
@@ -588,6 +605,12 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 		if strings.HasSuffix(k, "/") {
 			continue
 		}
+		// Skip keys whose names are not valid KMIP UniqueIdentifiers; such keys
+		// exist in transit (e.g. names with dots) but cannot be operated on via
+		// KMIP, so surfacing them in Locate would return unusable identifiers.
+		if err := validateKmipName(k); err != nil {
+			continue
+		}
 		p, _, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
 			Storage: storage,
 			Name:    k,
@@ -730,12 +753,19 @@ func handleActivate(ctx context.Context, b *backend, req *payloads.ActivateReque
 	if p == nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q not found", name)
 	}
-	// Transit keys are always Active; no state change needed. When caching is
-	// disabled, GetPolicy returns with the write lock held and must be released.
-	if b.System().CachingDisabled() {
-		p.Unlock()
+	// When caching is enabled GetPolicy returns without a lock; acquire a read
+	// lock to safely inspect the key. When caching is disabled GetPolicy returns
+	// with the write lock held; skip the extra Lock call and let Unlock release it.
+	if !b.System().CachingDisabled() {
+		p.Lock(false)
+	}
+	defer p.Unlock()
+
+	if p.SoftDeleted {
+		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q is soft deleted", name)
 	}
 
+	// Transit keys are always Active once created; no state change needed.
 	return &payloads.ActivateResponsePayload{
 		UniqueIdentifier: name,
 	}, nil
@@ -1101,10 +1131,11 @@ func handleRegister(ctx context.Context, b *backend, req *payloads.RegisterReque
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to check for existing key: %s", err)
 	}
 	if existing != nil {
-		if !b.System().CachingDisabled() {
-			existing.Lock(false)
+		// When caching is disabled GetPolicy returns with the write lock held;
+		// release it before returning. When caching is enabled no lock is held.
+		if b.System().CachingDisabled() {
+			existing.Unlock()
 		}
-		existing.Unlock()
 		return nil, kmipserver.Errorf(kmip.ResultReasonObjectAlreadyExists, "key %q already exists", name)
 	}
 

@@ -1080,6 +1080,22 @@ func handleRegister(ctx context.Context, b *backend, req *payloads.RegisterReque
 		return nil, kmipserver.Errorf(kmip.ResultReasonInvalidField, "unsupported key type for import: %s", keyType)
 	}
 
+	// Check that a key with this name does not already exist to prevent silent overwrites.
+	existing, _, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
+		Storage: storage,
+		Name:    name,
+	}, b.GetRandomReader())
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to check for existing key: %s", err)
+	}
+	if existing != nil {
+		if !b.System().CachingDisabled() {
+			existing.Lock(false)
+		}
+		existing.Unlock()
+		return nil, kmipserver.Errorf(kmip.ResultReasonObjectAlreadyExists, "key %q already exists", name)
+	}
+
 	polReq := keysutil.PolicyRequest{
 		Storage:      storage,
 		Name:         name,

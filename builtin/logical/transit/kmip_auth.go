@@ -56,7 +56,8 @@ func authMiddleware(b *backend) kmipserver.Middleware {
 			return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "auth: failed to look up role: %s", err)
 		}
 		if role == nil {
-			return nil, kmipserver.Errorf(kmip.ResultReasonPermissionDenied, "auth: no role found for subject DN %q", subjectDN)
+			b.Logger().Debug("kmip auth: no role found for client certificate", "subject_dn", subjectDN)
+			return nil, kmipserver.Errorf(kmip.ResultReasonPermissionDenied, "auth: authentication failed")
 		}
 
 		ctx = context.WithValue(ctx, ctxKmipRole{}, role)

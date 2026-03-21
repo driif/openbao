@@ -840,6 +840,9 @@ func handleRevoke(ctx context.Context, b *backend, req *payloads.RevokeRequestPa
 	if keyResp == nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q not found", name)
 	}
+	if softDeleted, _ := keyResp.Data["soft_deleted"].(bool); softDeleted {
+		return nil, kmipserver.Errorf(kmip.ResultReasonPermissionDenied, "key %q is already revoked", name)
+	}
 
 	_, err = callTransit(ctx, b, storage, logical.DeleteOperation, "keys/"+name+"/soft-delete", nil)
 	if err != nil {

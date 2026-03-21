@@ -798,3 +798,32 @@ func TestHandleQuery_ServerInfo(t *testing.T) {
 	require.NotEmpty(t, resp.VendorIdentification)
 	require.Empty(t, resp.Operations)
 }
+
+// --- validateKmipName tests ---
+
+func TestValidateKmipName(t *testing.T) {
+	tests := []struct {
+		name    string
+		wantErr bool
+	}{
+		{"valid-key", false},
+		{"valid_key_123", false},
+		{"AES256", false},
+		{"", true},
+		{"has/slash", true},
+		{"has.dot", true},
+		{"../traversal", true},
+		{"space name", true},
+		{"tab\tname", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateKmipName(tc.name)
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

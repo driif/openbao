@@ -14,6 +14,7 @@ import (
 	"io"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/openbao/openbao/sdk/v2/helper/keysutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
@@ -574,6 +575,10 @@ func handleLocate(ctx context.Context, b *backend, req *payloads.LocateRequestPa
 	// Also apply any KMIP attribute filters from the request.
 	keys := make([]string, 0, len(allKeys))
 	for _, k := range allKeys {
+		// Skip subdirectory entries (e.g. "archive/") returned by some storage backends.
+		if strings.HasSuffix(k, "/") {
+			continue
+		}
 		p, _, err := b.GetPolicy(ctx, keysutil.PolicyRequest{
 			Storage: storage,
 			Name:    k,
@@ -654,22 +659,32 @@ func handleDestroy(ctx context.Context, b *backend, req *payloads.DestroyRequest
 		return nil, err
 	}
 
-	// Enable deletion on the key first
-	_, err := callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name+"/config", map[string]interface{}{
+	// Read the key's current deletion_allowed value so we can restore it if deletion fails.
+	keyResp, err := callTransit(ctx, b, storage, logical.ReadOperation, "keys/"+name, nil)
+	if err != nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to read key %q: %s", name, err)
+	}
+	if keyResp == nil {
+		return nil, kmipserver.Errorf(kmip.ResultReasonItemNotFound, "key %q not found", name)
+	}
+	originalDeletionAllowed, _ := keyResp.Data["deletion_allowed"].(bool)
+
+	// Enable deletion on the key first.
+	_, err = callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name+"/config", map[string]interface{}{
 		"deletion_allowed": true,
 	})
 	if err != nil {
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to enable deletion for key %q: %s", name, err)
 	}
 
-	// Now permanently delete the key. If deletion fails, restore deletion_allowed=false
-	// to avoid leaving the key permanently unprotected.
+	// Now permanently delete the key. If deletion fails, restore deletion_allowed to its
+	// original value to avoid permanently changing the key's deletion policy.
 	_, err = callTransit(ctx, b, storage, logical.DeleteOperation, "keys/"+name, nil)
 	if err != nil {
 		if _, restoreErr := callTransit(ctx, b, storage, logical.UpdateOperation, "keys/"+name+"/config", map[string]interface{}{
-			"deletion_allowed": false,
+			"deletion_allowed": originalDeletionAllowed,
 		}); restoreErr != nil {
-			b.Logger().Error("Failed to restore deletion_allowed=false after failed destroy", "key", name, "error", restoreErr)
+			b.Logger().Error("Failed to restore deletion_allowed after failed destroy", "key", name, "original", originalDeletionAllowed, "error", restoreErr)
 		}
 		return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "failed to destroy key %q: %s", name, err)
 	}

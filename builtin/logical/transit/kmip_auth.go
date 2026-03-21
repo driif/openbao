@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/ovh/kmip-go"
 	"github.com/ovh/kmip-go/kmipserver"
 	"github.com/ovh/kmip-go/ttlv"
@@ -53,7 +54,7 @@ func authMiddleware(b *backend) kmipserver.Middleware {
 
 		subjectDN := certs[0].Subject.String()
 
-		role, err := b.findKmipRoleByDN(ctx, subjectDN)
+		role, err := b.findKmipRoleByDN(ctx, b.storage, subjectDN)
 		if err != nil {
 			return nil, kmipserver.Errorf(kmip.ResultReasonGeneralFailure, "auth: failed to look up role: %s", err)
 		}
@@ -68,18 +69,20 @@ func authMiddleware(b *backend) kmipserver.Middleware {
 
 // findKmipRoleByDN iterates all stored kmipRoles and returns the first whose
 // CertSubjectDN matches dn. Returns (nil, nil) when no match is found.
-func (b *backend) findKmipRoleByDN(ctx context.Context, dn string) (*kmipRole, error) { //nolint:nilnil
-	if b.storage == nil {
+// The caller must provide the storage to use; the auth middleware passes b.storage,
+// while request handlers should pass req.Storage for consistency.
+func (b *backend) findKmipRoleByDN(ctx context.Context, storage logical.Storage, dn string) (*kmipRole, error) { //nolint:nilnil
+	if storage == nil {
 		return nil, nil //nolint:nilnil
 	}
 
-	names, err := b.storage.List(ctx, kmipRoleStoragePrefix)
+	names, err := storage.List(ctx, kmipRoleStoragePrefix)
 	if err != nil {
 		return nil, fmt.Errorf("listing kmip roles: %w", err)
 	}
 
 	for _, name := range names {
-		role, err := b.getKmipRole(ctx, b.storage, name)
+		role, err := b.getKmipRole(ctx, storage, name)
 		if err != nil {
 			return nil, err
 		}

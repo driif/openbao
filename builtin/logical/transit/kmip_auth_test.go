@@ -110,7 +110,7 @@ func TestFindKmipRoleByDN(t *testing.T) {
 	ctx := context.Background()
 
 	// No roles yet.
-	role, err := b.findKmipRoleByDN(ctx, "CN=alice")
+	role, err := b.findKmipRoleByDN(ctx, storage, "CN=alice")
 	require.NoError(t, err)
 	require.Nil(t, role)
 
@@ -123,14 +123,14 @@ func TestFindKmipRoleByDN(t *testing.T) {
 	require.NoError(t, b.putKmipRole(ctx, storage, "alice", aliceRole))
 
 	// Should find alice now.
-	found, err := b.findKmipRoleByDN(ctx, "CN=alice")
+	found, err := b.findKmipRoleByDN(ctx, storage, "CN=alice")
 	require.NoError(t, err)
 	require.NotNil(t, found)
 	require.Equal(t, "CN=alice", found.CertSubjectDN)
 	require.Equal(t, []string{"Create"}, found.AllowedOperations)
 
 	// Should not find bob.
-	notFound, err := b.findKmipRoleByDN(ctx, "CN=bob")
+	notFound, err := b.findKmipRoleByDN(ctx, storage, "CN=bob")
 	require.NoError(t, err)
 	require.Nil(t, notFound)
 }

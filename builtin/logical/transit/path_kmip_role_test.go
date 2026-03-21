@@ -213,3 +213,53 @@ func TestKmipRole_AllowedKeyNamesEmpty(t *testing.T) {
 	// allowed_key_names should be empty (all keys allowed)
 	require.Empty(t, resp.Data["allowed_key_names"])
 }
+
+func TestKmipRole_DuplicateDNRejected(t *testing.T) {
+	b, storage := createBackendWithSysView(t)
+	b.storage = storage
+
+	writeFirst := &logical.Request{
+		Storage:   storage,
+		Operation: logical.UpdateOperation,
+		Path:      "kmip/roles/role1",
+		Data: map[string]interface{}{
+			"cert_subject_dn": "CN=shared,O=Acme",
+		},
+	}
+	resp, err := b.HandleRequest(context.Background(), writeFirst)
+	require.NoError(t, err)
+	require.Nil(t, resp)
+
+	// Attempt to assign the same DN to a different role.
+	writeSecond := &logical.Request{
+		Storage:   storage,
+		Operation: logical.UpdateOperation,
+		Path:      "kmip/roles/role2",
+		Data: map[string]interface{}{
+			"cert_subject_dn": "CN=shared,O=Acme",
+		},
+	}
+	resp, err = b.HandleRequest(context.Background(), writeSecond)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.True(t, resp.IsError(), "expected error response for duplicate DN")
+	require.Contains(t, resp.Error().Error(), "already claimed")
+}
+
+func TestKmipRole_InvalidOperationRejected(t *testing.T) {
+	b, storage := createBackendWithSysView(t)
+
+	writeReq := &logical.Request{
+		Storage:   storage,
+		Operation: logical.UpdateOperation,
+		Path:      "kmip/roles/testrole",
+		Data: map[string]interface{}{
+			"allowed_operations": "Create,InvalidOperation",
+		},
+	}
+	resp, err := b.HandleRequest(context.Background(), writeReq)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.True(t, resp.IsError(), "expected error for invalid operation name")
+	require.Contains(t, resp.Error().Error(), "InvalidOperation")
+}

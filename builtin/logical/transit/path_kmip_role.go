@@ -178,7 +178,7 @@ func (b *backend) pathKmipRoleWrite(ctx context.Context, req *logical.Request, d
 	if v, ok := d.GetOk("cert_subject_dn"); ok {
 		newDN := v.(string)
 		// Reject if another role already claims this Subject DN.
-		existing, err := b.findKmipRoleByDN(ctx, newDN)
+		existing, err := b.findKmipRoleByDN(ctx, req.Storage, newDN)
 		if err != nil {
 			return nil, err
 		}

@@ -1,0 +1,214 @@
+---
+sidebar_label: Transit KMIP Server
+description: |-
+  An OpenBao RFC for exposing the transit secrets engine as a KMIP server over
+  mTLS, with explicit mappings from KMIP operations and objects to transit
+  semantics and implementation.
+---
+
+# Transit KMIP Server
+
+## Summary
+
+This RFC proposes that the transit secrets engine expose an embedded **Key Management Interoperability Protocol (KMIP)**
+server with mutual TLS authentication. External KMIP clients use this standard-based protocol to create, locate, manage, and use
+transit-managed keys without directly integrating with the OpenBao HTTP API.
+
+The proposed design binds the KMIP listener to a transit mount instead of creating a standalone secrets engine.
+Keys created or imported through KMIP are regular transit keys, managed by the same storage, lifecycle, and policy systems already used by transit.
+
+This RFC aligns with the KMIP 1.4 specification and profiles:
+
+- KMIP 1.4:
+  `https://docs.oasis-open.org/kmip/spec/v1.4/kmip-spec-v1.4.html`
+- KMIP Profiles 1.4:
+  `https://docs.oasis-open.org/kmip/profiles/v1.4/kmip-profiles-v1.4.html`
+
+## Problem Statement
+
+Transit already provides APIs for key management and cryptographic operations, but KMIP and PKCS#11 are widely used protocols.
+Instead of building custom OpenBao-specific integrations, clients could connect to a KMIP server and use that protocol directly.
+
+## User-facing Description
+
+When enabled on a transit mount, it starts a dedicated TLS listener for KMIP traffic. Clients authenticate using x.509 certificates.
+The certificate subject distinguished name (DN) is matched to a configured KMIP role on that transit mount.
+
+Keys created via KMIP are regular transit keys. Operators may inspect or manage them through the transit API, and transit-side
+operations continue to apply to them.
+
+This RFC covers the following implemented KMIP operations:
+
+- `Create`
+- `Register`
+- `Get`
+- `GetAttributes`
+- `Locate`
+- `Activate`
+- `Revoke`
+- `Destroy`
+- `Encrypt`
+- `Decrypt`
+- `Sign`
+- `SignatureVerify`
+- `Query`
+
+Config - `builtin/logical/transit/path_kmip_config.go`:  
+- `transit/config/kmip`
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | enables or disables the listener |
+| `listen_addr` | string | `0.0.0.0:5696` | TCP `host:port` - listen address |
+| `server_cert_pem` | string | (none) | PEM-encoded X.509 certificate |
+| `server_key_pem` | string | (none) | Write-only; not returned on read |
+| `tls_ca_cert_pem` | string | (none) | PEM-encoded CA chain |
+| `require_client_cert` | bool | `true` | whether the TLS layer requires a client certificate |
+
+- `transit/kmip/roles/<name>`
+   - maps a client certificate subject DN to allowed operations and allowed key names
+
+## Technical Description
+
+Validation rules enforced on every write to `transit/config/kmip`:
+
+- if `server_cert_pem` and `server_key_pem` are both non-empty, they must form
+  a valid X.509 key pair; the pair is validated before the config is persisted
+- `enabled=true` requires both `server_cert_pem` and `server_key_pem` to be
+  non-empty
+- `enabled=true` requires `tls_ca_cert_pem` to be non-empty
+- if `tls_ca_cert_pem` is non-empty, it must contain at least one valid
+  `CERTIFICATE` PEM block parseable as a DER-encoded X.509 certificate
+
+Supported role fields:
+
+- `cert_subject_dn`
+- `allowed_operations`
+- `allowed_key_names`
+
+Behavioral requirements:
+
+- `cert_subject_dn` is required
+- a DN may be claimed by only one role on the mount; this uniqueness constraint
+  is enforced atomically: a backend-level mutex is held across the uniqueness
+  scan and the subsequent storage write, preventing concurrent role-write
+  requests from both claiming the same DN
+- operation names must be the canonical KMIP operation strings
+- an empty `allowed_operations` list means all implemented operations
+- an empty `allowed_key_names` list means all keys on the mount
+
+### External Dependencies
+
+The KMIP protocol implementation depends on `github.com/ovh/kmip-go`. This library provides:
+
+- TTLV encoding and decoding for all KMIP message structures
+- the `BatchExecutor` and `HandleFunc` interfaces used to register operation
+  handlers
+- the `kmipserver.Server` type that drives the accept loop
+- error construction helpers (`kmipserver.Errorf`) that set KMIP result reason
+  codes
+
+All key management and cryptographic operations are performed by the existing
+transit backend; the library handles only protocol framing and routing. The
+handler signatures, payload types, and error model are defined by this
+library's API surface, not by the OpenBao SDK.
+
+### TLS And Client Authentication
+
+The KMIP listener is always TLS-enabled. The server uses the configured server
+certificate and private key. The configured CA certificate is loaded into the
+TLS client CA pool.
+
+If `require_client_cert=true`, the TLS layer requires and verifies a client
+certificate. If `require_client_cert=false`, the listener may permit a TLS
+connection without a certificate, but the application layer still requires one
+for authorization. This is intentional: TLS policy and KMIP caller identity are
+separate concerns.
+
+The TLS `ClientAuth` value is set based on configuration as follows:
+
+| `require_client_cert` | `tls_ca_cert_pem` present | TLS `ClientAuth` mode |
+| --- | --- | --- |
+| `true` | any | `RequireAndVerifyClientCert` |
+| `false` | yes | `VerifyClientCertIfGiven` |
+| `false` | no | `RequestClientCert` |
+
+In all three cases the application-layer authentication middleware
+(`authMiddleware`) independently requires a valid client certificate and rejects
+connections that present none. The TLS layer controls whether the handshake
+itself rejects certificate-less connections; the KMIP auth layer always enforces
+role lookup regardless of TLS mode.
+
+### Role Lookup
+
+Caller identity is established from the Subject Distinguished Name of the first
+peer certificate presented by the client. That DN is matched against the
+`cert_subject_dn` stored in KMIP roles.
+
+DN comparison must be **structurally correct** according to [RFC 5280 §7.1](https://datatracker.ietf.org/doc/html/rfc5280#section-7.1):
+Relative Distinguished Names are compared attribute by attribute (OID and
+value), with attribute values compared case-insensitively and with whitespace
+normalized. This means that two certificates with semantically equivalent
+Subjects — differing only in attribute ordering, case, or whitespace — must
+match the same role.
+
+The `cert_subject_dn` field stores a canonical RFC 4514 string representation
+of the DN. When a role is created, the stored DN must be validated as a
+parseable RFC 4514 string. At lookup time, the incoming certificate subject is
+converted to the same canonical form before comparison.
+
+### Operation Authorization
+
+Authorization occurs in two layers:
+
+1. authentication middleware establishes the caller role
+2. per-handler authorization checks enforce:
+   - operation allowlist
+   - key-name allowlist
+
+If no role is present in the request context, the request is denied.
+
+The operation string used for authorization is the canonical KMIP operation
+name returned by `ttlv.EnumStr`. For example, the verify operation must be
+allowed as `SignatureVerify`, not `Verify`.
+
+### Object Model Mapping
+
+The design intentionally avoids introducing a second persistent object model.
+KMIP objects are projections of transit keys.
+
+### UniqueIdentifier
+
+`UniqueIdentifier` maps directly to the transit key name. This choice keeps the
+implementation simple, avoids a separate ID registry, and lets KMIP-created
+objects remain first-class transit keys.
+
+To prevent path traversal and unusable identifiers, the KMIP layer restricts
+names to:
+
+- letters
+- digits
+- underscore
+- hyphen
+
+Names with `/`, `.`, or other unsupported characters are rejected by KMIP.
+
+### Key Material Exportability
+
+KMIP `Get` returns raw key material only when transit marks the key as
+exportable and the key type has an implemented KMIP representation. This is an
+important design boundary: KMIP `Get` is not a privileged bypass around
+transit's export rules.
+
+### Algorithm Mapping
+| KMIP Algorithm | Bit Length | Transit Key Type |
+| --- | --- | --- |
+| `AES` | `128` | `aes128-gcm96` |
+| `AES` | `256` or omitted | `aes256-gcm96` |
+| `RSA` | `2048` | `rsa-2048` |
+| `RSA` | `3072` | `rsa-3072` |
+| `RSA` | `4096` or omitted | `rsa-4096` |
+| `ECDSA` / `EC` | `256` or omitted | `ecdsa-p256` |
+| `ECDSA` / `EC` | `384` | `ecdsa-p384` |
+| `ECDSA` / `EC` | `521` | `ecdsa-p521` |
+

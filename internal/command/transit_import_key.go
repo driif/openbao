@@ -5,9 +5,7 @@ package command
 
 import (
 	"bytes"
-	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
@@ -19,8 +17,7 @@ import (
 	"strings"
 
 	"github.com/openbao/openbao/api/v2"
-
-	"github.com/tink-crypto/tink-go/v2/kwp/subtle"
+	"github.com/openbao/openbao/v2/internal/helper/keywrap"
 
 	"github.com/hashicorp/cli"
 	"github.com/posener/complete"
@@ -109,11 +106,6 @@ func ImportKey(c *BaseCommand, operation string, pathFunc ImportKeyFunc, flags *
 		return 2
 	}
 
-	ephemeralAESKey := make([]byte, 32)
-	_, err = rand.Read(ephemeralAESKey)
-	if err != nil {
-		c.UI.Error(fmt.Sprintf("failed to generate ephemeral key: %v", err))
-	}
 	path, apiPath, err := pathFunc(args[0], operation)
 	if err != nil {
 		c.UI.Error(err.Error())
@@ -143,29 +135,11 @@ func ImportKey(c *BaseCommand, operation string, pathFunc ImportKeyFunc, flags *
 		return 3
 	}
 	c.UI.Output("Wrapping source key with ephemeral key.")
-	wrapKWP, err := subtle.NewKWP(ephemeralAESKey)
+	combinedCiphertext, err := keywrap.Wrap(wrappingKey.(*rsa.PublicKey), key)
 	if err != nil {
-		c.UI.Error(fmt.Sprintf("failure building key wrapping key: %v", err))
+		c.UI.Error(err.Error())
 		return 2
 	}
-	wrappedTargetKey, err := wrapKWP.Wrap(key)
-	if err != nil {
-		c.UI.Error(fmt.Sprintf("failure wrapping source key: %v", err))
-		return 2
-	}
-	c.UI.Output("Encrypting ephemeral key with wrapping key.")
-	wrappedAESKey, err := rsa.EncryptOAEP(
-		sha256.New(),
-		rand.Reader,
-		wrappingKey.(*rsa.PublicKey),
-		ephemeralAESKey,
-		[]byte{},
-	)
-	if err != nil {
-		c.UI.Error(fmt.Sprintf("failure encrypting wrapped key: %v", err))
-		return 2
-	}
-	combinedCiphertext := append(wrappedAESKey, wrappedTargetKey...)
 	importCiphertext := base64.StdEncoding.EncodeToString(combinedCiphertext)
 
 	// Parse all the key options

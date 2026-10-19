@@ -4,10 +4,7 @@
 package kmip
 
 import (
-	"slices"
-
 	kmiplib "github.com/ovh/kmip-go"
-	"github.com/ovh/kmip-go/ttlv"
 )
 
 var SupportedOperations = []kmiplib.Operation{
@@ -30,17 +27,4 @@ var SupportedObjectTypes = []kmiplib.ObjectType{
 	kmiplib.ObjectTypeSymmetricKey,
 	kmiplib.ObjectTypePrivateKey,
 	kmiplib.ObjectTypePublicKey,
-}
-
-func ValidOperations() []string {
-	names := make([]string, len(SupportedOperations))
-	for i, op := range SupportedOperations {
-		names[i] = ttlv.EnumStr(op)
-	}
-	slices.Sort(names)
-	return names
-}
-
-func IsValidOperation(name string) bool {
-	return slices.Contains(ValidOperations(), name)
 }

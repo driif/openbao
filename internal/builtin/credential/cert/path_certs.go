@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -196,6 +197,20 @@ separated by a dash (-) instead of a dot (.) to allow usage in ACL templates.`,
 certificate.`,
 			},
 
+			"kmip_transit_mount": {
+				Type: framework.TypeString,
+				Description: `The transit mount, in this auth mount's namespace,
+that KMIP clients logging in with this certificate use. Overrides the kmip
+listener's default_transit_mount.`,
+			},
+
+			"kmip_key_prefix": {
+				Type: framework.TypeString,
+				Description: `Prefix for the names of keys KMIP clients logging
+in with this certificate create or register without a name. The key is named
+the prefix followed by a UUID.`,
+			},
+
 			"policies": {
 				Type:        framework.TypeCommaStringSlice,
 				Description: tokenutil.DeprecationText("token_policies"),
@@ -334,6 +349,8 @@ func (b *backend) pathCertRead(ctx context.Context, req *logical.Request, d *fra
 		"ocsp_servers_override":        cert.OcspServersOverride,
 		"ocsp_fail_open":               cert.OcspFailOpen,
 		"ocsp_query_all_servers":       cert.OcspQueryAllServers,
+		"kmip_transit_mount":           cert.KMIPTransitMount,
+		"kmip_key_prefix":              cert.KMIPKeyPrefix,
 	}
 	cert.PopulateTokenData(data)
 
@@ -417,6 +434,15 @@ func (b *backend) pathCertWrite(ctx context.Context, req *logical.Request, d *fr
 	}
 	if allowedMetadataExtensionsRaw, ok := d.GetOk("allowed_metadata_extensions"); ok {
 		cert.AllowedMetadataExtensions = allowedMetadataExtensionsRaw.([]string)
+	}
+	if kmipTransitMountRaw, ok := d.GetOk("kmip_transit_mount"); ok {
+		cert.KMIPTransitMount = strings.Trim(kmipTransitMountRaw.(string), "/")
+	}
+	if kmipKeyPrefixRaw, ok := d.GetOk("kmip_key_prefix"); ok {
+		cert.KMIPKeyPrefix = kmipKeyPrefixRaw.(string)
+		if cert.KMIPKeyPrefix != "" && !kmipKeyPrefixRegex.MatchString(cert.KMIPKeyPrefix) {
+			return logical.ErrorResponse("kmip_key_prefix must start with a letter, digit or '_' and contain only letters, digits, '_', '-' and '.'"), nil
+		}
 	}
 
 	// Get tokenutil fields
@@ -541,7 +567,13 @@ type CertEntry struct {
 	OcspServersOverride []string
 	OcspFailOpen        bool
 	OcspQueryAllServers bool
+
+	KMIPTransitMount string
+	KMIPKeyPrefix    string
 }
+
+// kmipKeyPrefixRegex keeps prefix plus UUID a valid transit key name.
+var kmipKeyPrefixRegex = regexp.MustCompile(`^\w[\w\-.]*$`)
 
 const pathCertHelpSyn = `
 Manage trusted certificates used for authentication.

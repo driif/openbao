@@ -25,6 +25,7 @@ type ListenerFactory func(*configutil.Listener, hclog.Logger, cli.Ui) (net.Liste
 var BuiltinListeners = map[string]ListenerFactory{
 	"tcp":  tcpListenerFactory,
 	"unix": unixListenerFactory,
+	"kmip": kmipListenerFactory,
 }
 
 // NewListener creates a new listener of the given type with the given

@@ -19,9 +19,16 @@ import (
 )
 
 func tcpListenerFactory(l *configutil.Listener, logger hclog.Logger, ui cli.Ui) (net.Listener, map[string]string, listenerutil.ReloadableCertGetter, error) {
+	return newTCPListener(l, logger, ui, "127.0.0.1:8200", nil)
+}
+
+// newTCPListener opens a TCP listener on l.Address, or defaultAddr when it
+// is empty. tlsHook, when set, adjusts the TLS configuration before the
+// listener starts using it.
+func newTCPListener(l *configutil.Listener, logger hclog.Logger, ui cli.Ui, defaultAddr string, tlsHook func(*tls.Config)) (net.Listener, map[string]string, listenerutil.ReloadableCertGetter, error) {
 	addr := l.Address
 	if addr == "" {
-		addr = "127.0.0.1:8200"
+		addr = defaultAddr
 	}
 
 	bindProto := "tcp"
@@ -71,6 +78,9 @@ func tcpListenerFactory(l *configutil.Listener, logger hclog.Logger, ui cli.Ui) 
 		return nil, nil, nil, err
 	}
 	if tlsConfig != nil {
+		if tlsHook != nil {
+			tlsHook(tlsConfig)
+		}
 		ln = tls.NewListener(ln, tlsConfig)
 	}
 

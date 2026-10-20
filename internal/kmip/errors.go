@@ -18,7 +18,7 @@ func mapError(err error) error {
 		return nil
 	}
 
-	if _, ok := errors.AsType[*kmipserver.Error](err); ok {
+	if _, ok := errors.AsType[kmipserver.Error](err); ok {
 		return err
 	}
 

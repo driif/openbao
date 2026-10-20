@@ -12,64 +12,27 @@ import (
 	"github.com/ovh/kmip-go/ttlv"
 )
 
-// bindAdapter wraps a handler function that accepts an Adapter into an OperationHandler.
-func bindAdapter[Req, Resp kmiplib.OperationPayload](
-	a Adapter,
-	fn func(context.Context, Adapter, Req) (Resp, error),
-) kmipserver.OperationHandler {
-	return kmipserver.HandleFunc(func(ctx context.Context, req Req) (Resp, error) {
-		return fn(ctx, a, req)
-	})
-}
-
-// bindCrypto wraps a handler function to bind crypto adapter
-func bindCrypto[Req, Resp kmiplib.OperationPayload](
-	c CryptoAdapter,
-	fn func(context.Context, CryptoAdapter, Req) (Resp, error),
-) kmipserver.OperationHandler {
-	return kmipserver.HandleFunc(func(ctx context.Context, req Req) (Resp, error) {
-		return fn(ctx, c, req)
-	})
-}
-
-func coreRoutes(a Adapter) map[kmiplib.Operation]kmipserver.OperationHandler {
+func routes() map[kmiplib.Operation]kmipserver.OperationHandler {
 	return map[kmiplib.Operation]kmipserver.OperationHandler{
-		kmiplib.OperationRegister:      bindAdapter(a, handleRegister),
-		kmiplib.OperationCreate:        bindAdapter(a, handleCreate),
-		kmiplib.OperationGet:           bindAdapter(a, handleGet),
-		kmiplib.OperationGetAttributes: bindAdapter(a, handleGetAttributes),
-		kmiplib.OperationLocate:        bindAdapter(a, handleLocate),
-		kmiplib.OperationActivate:      bindAdapter(a, handleActivate),
-		kmiplib.OperationRevoke:        bindAdapter(a, handleRevoke),
-		kmiplib.OperationDestroy:       bindAdapter(a, handleDestroy),
-		kmiplib.OperationQuery:         bindAdapter(a, handleQuery),
-	}
-}
-
-func cryptoRoutes(c CryptoAdapter) map[kmiplib.Operation]kmipserver.OperationHandler {
-	return map[kmiplib.Operation]kmipserver.OperationHandler{
-		kmiplib.OperationEncrypt:         bindCrypto(c, handleEncrypt),
-		kmiplib.OperationDecrypt:         bindCrypto(c, handleDecrypt),
-		kmiplib.OperationSign:            bindCrypto(c, handleSign),
-		kmiplib.OperationSignatureVerify: bindCrypto(c, handleVerify),
-	}
-}
-
-func registerHandlers(executor *kmipserver.BatchExecutor, a Adapter) {
-	for op, h := range coreRoutes(a) {
-		executor.Route(op, h)
-	}
-
-	if cryptoA, ok := a.(CryptoAdapter); ok {
-		for op, h := range cryptoRoutes(cryptoA) {
-			executor.Route(op, h)
-		}
+		kmiplib.OperationRegister:        kmipserver.HandleFunc(handleRegister),
+		kmiplib.OperationCreate:          kmipserver.HandleFunc(handleCreate),
+		kmiplib.OperationGet:             kmipserver.HandleFunc(handleGet),
+		kmiplib.OperationGetAttributes:   kmipserver.HandleFunc(handleGetAttributes),
+		kmiplib.OperationLocate:          kmipserver.HandleFunc(handleLocate),
+		kmiplib.OperationActivate:        kmipserver.HandleFunc(handleActivate),
+		kmiplib.OperationRevoke:          kmipserver.HandleFunc(handleRevoke),
+		kmiplib.OperationDestroy:         kmipserver.HandleFunc(handleDestroy),
+		kmiplib.OperationQuery:           kmipserver.HandleFunc(handleQuery),
+		kmiplib.OperationEncrypt:         kmipserver.HandleFunc(handleEncrypt),
+		kmiplib.OperationDecrypt:         kmipserver.HandleFunc(handleDecrypt),
+		kmiplib.OperationSign:            kmipserver.HandleFunc(handleSign),
+		kmiplib.OperationSignatureVerify: kmipserver.HandleFunc(handleVerify),
 	}
 }
 
 // handleQuery used by the client to interrogate the server to determine its capabilities and/or protocol mechanisms.
-// Per spec, Query is invocable by unauthenticated clients - no authOp
-func handleQuery(ctx context.Context, a Adapter, req *payloads.QueryRequestPayload) (*payloads.QueryResponsePayload, error) {
+// Per spec, Query is invocable by unauthenticated clients, so it is answered here without logging in.
+func handleQuery(ctx context.Context, req *payloads.QueryRequestPayload) (*payloads.QueryResponsePayload, error) {
 	resp := &payloads.QueryResponsePayload{}
 
 	for _, qf := range req.QueryFunction {
@@ -105,11 +68,7 @@ func handleQuery(ctx context.Context, a Adapter, req *payloads.QueryRequestPaylo
 
 // handleRegister implements the KMIP Register operation by importing a pre-existing key into transit.
 // Supported object types: SymmetricKey (raw bytes), PrivateKey (PKCS8 DER).
-func handleRegister(ctx context.Context, a Adapter, req *payloads.RegisterRequestPayload) (*payloads.RegisterResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationRegister); err != nil {
-		return nil, err
-	}
-
+func handleRegister(ctx context.Context, req *payloads.RegisterRequestPayload) (*payloads.RegisterResponsePayload, error) {
 	if req.Object == nil || req.ObjectType == 0 {
 		return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "Object and ObjectType are required for Register")
 	}
@@ -159,8 +118,12 @@ func handleRegister(ctx context.Context, a Adapter, req *payloads.RegisterReques
 		return nil, err
 	}
 
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
 	name := NameFromTemplateAttribute(req.TemplateAttribute)
-	id, err := a.ImportKey(ctx, name, alg, bitlen, material)
+	id, err := c.register(ctx, name, alg, bitlen, material)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -171,11 +134,7 @@ func handleRegister(ctx context.Context, a Adapter, req *payloads.RegisterReques
 }
 
 // handleCreateKey implements the KMIP CreateKey operation by creating a new key in transit.
-func handleCreate(ctx context.Context, a Adapter, req *payloads.CreateRequestPayload) (*payloads.CreateResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationCreate); err != nil {
-		return nil, err
-	}
-
+func handleCreate(ctx context.Context, req *payloads.CreateRequestPayload) (*payloads.CreateResponsePayload, error) {
 	alg, bitlen := AlgAndBitLenFromTemplateAttribute(req.TemplateAttribute)
 	if alg == 0 {
 		return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "Cryptographic algorithm is required")
@@ -184,8 +143,12 @@ func handleCreate(ctx context.Context, a Adapter, req *payloads.CreateRequestPay
 		return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "Cryptographic length is required")
 	}
 
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
 	name := NameFromTemplateAttribute(req.TemplateAttribute)
-	id, err := a.CreateKey(ctx, name, alg, bitlen)
+	id, err := c.create(ctx, name, alg, bitlen)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -197,11 +160,7 @@ func handleCreate(ctx context.Context, a Adapter, req *payloads.CreateRequestPay
 }
 
 // handleGet implements the KMIP Get for Managed Object specified by it's Unique Identifier
-func handleGet(ctx context.Context, a Adapter, req *payloads.GetRequestPayload) (*payloads.GetResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationGet); err != nil {
-		return nil, err
-	}
-
+func handleGet(ctx context.Context, req *payloads.GetRequestPayload) (*payloads.GetResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -209,12 +168,14 @@ func handleGet(ctx context.Context, a Adapter, req *payloads.GetRequestPayload) 
 			"UniqueIdentifier omitted and ID Placeholder is empty",
 		)
 	}
-	obj, err := a.GetKey(ctx, uid)
+
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	obj, err := c.get(ctx, uid)
 	if err != nil {
 		return nil, mapError(err)
-	}
-	if obj == nil {
-		return nil, kmipserver.Errorf(kmiplib.ResultReasonItemNotFound, "object %q not found", uid)
 	}
 
 	return &payloads.GetResponsePayload{
@@ -226,13 +187,14 @@ func handleGet(ctx context.Context, a Adapter, req *payloads.GetRequestPayload) 
 
 // handleLocate - this operation requests that the server search for one or more Managed Objects,
 // depending on the attributes specified in the request.
-func handleLocate(ctx context.Context, a Adapter, req *payloads.LocateRequestPayload) (*payloads.LocateResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationLocate); err != nil {
+func handleLocate(ctx context.Context, req *payloads.LocateRequestPayload) (*payloads.LocateResponsePayload, error) {
+	c, err := begin(ctx)
+	if err != nil {
 		return nil, err
 	}
 
 	// TODO: Storage Status Mask and Object Group Member are skipped initially
-	ids, err := a.LocateKeys(ctx, req.Attribute)
+	ids, err := c.locate(ctx, req.Attribute)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -260,11 +222,7 @@ func handleLocate(ctx context.Context, a Adapter, req *payloads.LocateRequestPay
 
 // handleGetAttributes requests attributes associated with a ManagedObject. Object specified by it's Unique Identifier
 // and the attributes by their name in the request.
-func handleGetAttributes(ctx context.Context, a Adapter, req *payloads.GetAttributesRequestPayload) (*payloads.GetAttributesResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationGetAttributes); err != nil {
-		return nil, err
-	}
-
+func handleGetAttributes(ctx context.Context, req *payloads.GetAttributesRequestPayload) (*payloads.GetAttributesResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -273,7 +231,11 @@ func handleGetAttributes(ctx context.Context, a Adapter, req *payloads.GetAttrib
 		)
 	}
 
-	attrs, err := a.GetAttributes(ctx, uid, req.AttributeName)
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	attrs, err := c.getAttributes(ctx, uid, req.AttributeName)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -285,11 +247,7 @@ func handleGetAttributes(ctx context.Context, a Adapter, req *payloads.GetAttrib
 }
 
 // handleActivate - This operation requests the server to activate a Managed Cryptographic Object.
-func handleActivate(ctx context.Context, a Adapter, req *payloads.ActivateRequestPayload) (*payloads.ActivateResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationActivate); err != nil {
-		return nil, err
-	}
-
+func handleActivate(ctx context.Context, req *payloads.ActivateRequestPayload) (*payloads.ActivateResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -298,7 +256,11 @@ func handleActivate(ctx context.Context, a Adapter, req *payloads.ActivateReques
 		)
 	}
 
-	if err = a.ActivateKey(ctx, uid); err != nil {
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err = c.activate(ctx, uid); err != nil {
 		return nil, mapError(err)
 	}
 
@@ -306,11 +268,7 @@ func handleActivate(ctx context.Context, a Adapter, req *payloads.ActivateReques
 }
 
 // handleRevoke - This operation requests the server to revoke a Managed Cryptographic Object or an Opaque Object.
-func handleRevoke(ctx context.Context, a Adapter, req *payloads.RevokeRequestPayload) (*payloads.RevokeResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationRevoke); err != nil {
-		return nil, err
-	}
-
+func handleRevoke(ctx context.Context, req *payloads.RevokeRequestPayload) (*payloads.RevokeResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -319,8 +277,12 @@ func handleRevoke(ctx context.Context, a Adapter, req *payloads.RevokeRequestPay
 		)
 	}
 
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// TODO: Revocation Reason, Compromise Occurrence Date are skipped initially
-	if err = a.RevokeKey(ctx, uid); err != nil {
+	if err = c.revoke(ctx, uid); err != nil {
 		return nil, mapError(err)
 	}
 
@@ -329,11 +291,7 @@ func handleRevoke(ctx context.Context, a Adapter, req *payloads.RevokeRequestPay
 
 // handleDestroy - This operation is used to indicate to the server that
 // the key material for the specified Managed Object SHALL be destroyed.
-func handleDestroy(ctx context.Context, a Adapter, req *payloads.DestroyRequestPayload) (*payloads.DestroyResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationDestroy); err != nil {
-		return nil, err
-	}
-
+func handleDestroy(ctx context.Context, req *payloads.DestroyRequestPayload) (*payloads.DestroyResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -342,21 +300,21 @@ func handleDestroy(ctx context.Context, a Adapter, req *payloads.DestroyRequestP
 		)
 	}
 
-	if err = a.DestroyKey(ctx, uid); err != nil {
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err = c.destroy(ctx, uid); err != nil {
 		return nil, mapError(err)
 	}
 
 	return &payloads.DestroyResponsePayload{UniqueIdentifier: uid}, nil
 }
 
-// === CRYPTO ADAPTER OPERATIONS === //
+// === CRYPTO OPERATIONS === //
 
 // handleEncrypt implement single-part only
-func handleEncrypt(ctx context.Context, ca CryptoAdapter, req *payloads.EncryptRequestPayload) (*payloads.EncryptResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationEncrypt); err != nil {
-		return nil, err
-	}
-
+func handleEncrypt(ctx context.Context, req *payloads.EncryptRequestPayload) (*payloads.EncryptResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -388,7 +346,11 @@ func handleEncrypt(ctx context.Context, ca CryptoAdapter, req *payloads.EncryptR
 		)
 	}
 
-	ct, err := ca.Encrypt(ctx, uid, req.Data)
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ct, err := c.encrypt(ctx, uid, req.Data)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -400,11 +362,7 @@ func handleEncrypt(ctx context.Context, ca CryptoAdapter, req *payloads.EncryptR
 }
 
 // handleDecrypt support only single-part Decrypt
-func handleDecrypt(ctx context.Context, ca CryptoAdapter, req *payloads.DecryptRequestPayload) (*payloads.DecryptResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationDecrypt); err != nil {
-		return nil, err
-	}
-
+func handleDecrypt(ctx context.Context, req *payloads.DecryptRequestPayload) (*payloads.DecryptResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -438,7 +396,11 @@ func handleDecrypt(ctx context.Context, ca CryptoAdapter, req *payloads.DecryptR
 		)
 	}
 
-	pt, err := ca.Decrypt(ctx, uid, req.Data)
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := c.decrypt(ctx, uid, req.Data)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -449,11 +411,7 @@ func handleDecrypt(ctx context.Context, ca CryptoAdapter, req *payloads.DecryptR
 	}, nil
 }
 
-func handleSign(ctx context.Context, ca CryptoAdapter, req *payloads.SignRequestPayload) (*payloads.SignResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationSign); err != nil {
-		return nil, err
-	}
-
+func handleSign(ctx context.Context, req *payloads.SignRequestPayload) (*payloads.SignResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -478,7 +436,11 @@ func handleSign(ctx context.Context, ca CryptoAdapter, req *payloads.SignRequest
 		return nil, kmipserver.Errorf(kmiplib.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for Sign")
 	}
 
-	sig, err := ca.Sign(ctx, uid, req.Data)
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := c.sign(ctx, uid, req.Data)
 	if err != nil {
 		return nil, mapError(err)
 	}
@@ -489,11 +451,7 @@ func handleSign(ctx context.Context, ca CryptoAdapter, req *payloads.SignRequest
 	}, nil
 }
 
-func handleVerify(ctx context.Context, ca CryptoAdapter, req *payloads.SignatureVerifyRequestPayload) (*payloads.SignatureVerifyResponsePayload, error) {
-	if err := authOp(ctx, kmiplib.OperationSignatureVerify); err != nil {
-		return nil, err
-	}
-
+func handleVerify(ctx context.Context, req *payloads.SignatureVerifyRequestPayload) (*payloads.SignatureVerifyResponsePayload, error) {
 	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, kmipserver.Errorf(
@@ -521,7 +479,11 @@ func handleVerify(ctx context.Context, ca CryptoAdapter, req *payloads.Signature
 		return nil, kmipserver.Errorf(kmiplib.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for SignatureVerify")
 	}
 
-	valid, err := ca.Verify(ctx, uid, req.Data, req.SignatureData)
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	valid, err := c.verify(ctx, uid, req.Data, req.SignatureData)
 	if err != nil {
 		return nil, mapError(err)
 	}

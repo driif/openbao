@@ -143,6 +143,37 @@ management tool.
    clients is given by the "web-cert.pem" file. Lastly, an optional `ttl` value
    can be provided in seconds to limit the lease duration.
 
+## KMIP listener
+
+The [`kmip` listener](../configuration/listener/kmip.mdx) authenticates KMIP
+clients through a cert auth mount. For each connection it logs in without a
+role name, so the first role whose constraints match the client certificate is
+used. Constrain KMIP roles, for example with `allowed_common_names`, so that
+each client certificate matches exactly one role.
+
+Two role parameters only matter to the `kmip` listener, which reads them from
+the login token's metadata:
+
+- `kmip_transit_mount` – The transit mount, in this auth mount's namespace,
+  that the client's KMIP operations use. Overrides the listener's
+  `default_transit_mount`.
+
+- `kmip_key_prefix` – The prefix for the names of keys the client creates or
+  registers without a name. Such a key is named the prefix followed by a UUID.
+
+```shell-session
+$ bao write auth/cert/certs/app \
+    certificate=@kmip-clients-ca.pem \
+    allowed_common_names=app.example.com \
+    token_policies=kmip-app \
+    kmip_transit_mount=transit \
+    kmip_key_prefix=app-
+```
+
+The role's token policies decide which KMIP operations the client may perform;
+see [permissions](../configuration/listener/kmip.mdx#permissions) for the
+transit paths each operation needs.
+
 ## API
 
 The TLS Certificate auth method has a full HTTP API. Please see the

@@ -138,6 +138,12 @@ type Listener struct {
 	SocketUser  string `hcl:"socket_user"`
 	SocketGroup string `hcl:"socket_group"`
 
+	// AuthMount and DefaultTransitMount configure a kmip listener: the
+	// namespace-qualified cert auth mount KMIP clients log in through, and
+	// the transit mount for clients whose cert role names none.
+	AuthMount           string `hcl:"auth_mount"`
+	DefaultTransitMount string `hcl:"default_transit_mount"`
+
 	AgentAPI *AgentAPI `hcl:"agent_api"`
 
 	ProxyAPI *ProxyAPI `hcl:"proxy_api"`
@@ -238,7 +244,7 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 
 			l.Type = strings.ToLower(l.Type)
 			switch l.Type {
-			case "tcp", "unix":
+			case "tcp", "unix", "kmip":
 				result.found(l.Type, l.Type)
 			default:
 				return multierror.Prefix(fmt.Errorf("unsupported listener type %q", l.Type), fmt.Sprintf("listeners.%d:", i))
@@ -628,10 +634,59 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 			}
 		}
 
+		if err := validateKMIPListener(&l); err != nil {
+			return multierror.Prefix(err, fmt.Sprintf("listeners.%d", i))
+		}
+
 		result.Listeners = append(result.Listeners, &l)
 	}
 
 	return nil
+}
+
+// validateKMIPListener checks the kmip-only settings, and that a kmip
+// listener has what KMIP needs: TLS with verified client certificates and
+// none of the HTTP listener's clustering or ACME.
+func validateKMIPListener(l *Listener) error {
+	if l.Type != "kmip" {
+		if l.AuthMount != "" || l.DefaultTransitMount != "" {
+			return errors.New("auth_mount and default_transit_mount are only valid on kmip listeners")
+		}
+		return nil
+	}
+
+	l.AuthMount = strings.Trim(l.AuthMount, "/")
+	l.DefaultTransitMount = strings.Trim(l.DefaultTransitMount, "/")
+	segments := strings.Split(l.AuthMount, "/")
+	authAt := slices.Index(segments, "auth")
+
+	switch {
+	case l.AuthMount == "":
+		return errors.New("kmip listener requires auth_mount")
+	case authAt < 0 || authAt == len(segments)-1:
+		return fmt.Errorf("auth_mount %q must name a mount under auth/, such as auth/cert or ns1/auth/cert", l.AuthMount)
+	case l.TLSDisable:
+		return errors.New("kmip listener cannot set tls_disable")
+	case l.TLSDisableClientCerts:
+		return errors.New("kmip listener cannot set tls_disable_client_certs: KMIP clients authenticate with certificates")
+	case l.TLSCertFile == "" || l.TLSKeyFile == "":
+		// Without a certificate file the TCP listener falls back to ACME.
+		return errors.New("kmip listener requires tls_cert_file and tls_key_file")
+	case l.TLSClientCAFile == "":
+		return errors.New("kmip listener requires tls_client_ca_file")
+	case l.ClusterAddress != "":
+		return errors.New("kmip listener cannot set cluster_address")
+	case l.usesACME():
+		return errors.New("kmip listener cannot use tls_acme_* settings")
+	}
+	return nil
+}
+
+func (l *Listener) usesACME() bool {
+	return l.TLSACMECachePath != "" || l.TLSACMECADirectory != "" || l.TLSACMETestCADirectory != "" ||
+		l.TLSACMECARoot != "" || l.TLSACMEEABKeyId != "" || l.TLSACMEEABMacKey != "" ||
+		l.TLSACMEKeyType != "" || l.TLSACMEEmail != "" || len(l.TLSACMEDomains) > 0 ||
+		l.TLSACMEDisableHttpChallenge || l.TLSACMEDisableAlpnChallenge
 }
 
 // ParseSingleIPTemplate is used as a helper function to parse out a single IP

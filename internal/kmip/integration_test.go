@@ -19,6 +19,7 @@ import (
 
 	kmiplib "github.com/ovh/kmip-go"
 	"github.com/ovh/kmip-go/kmipclient"
+	"github.com/ovh/kmip-go/ttlv"
 	"github.com/stretchr/testify/require"
 
 	"github.com/openbao/openbao/api/v2"
@@ -106,6 +107,8 @@ func TestKMIPListener(t *testing.T) {
 		require.NoError(t, err)
 		require.Contains(t, paths, "transit/encrypt/app-active-aes")
 		require.Contains(t, paths, "transit/keys/app-active-imported/import")
+		require.Contains(t, paths, "transit/keys/app-active-rekey/metadata")
+		require.Contains(t, paths, "transit/keys/app-active-rekey.2/metadata")
 
 		// Closing the connection revokes the session's token.
 		revocations := countOf(paths, "auth/token/revoke-self")
@@ -197,6 +200,39 @@ func exercise(t *testing.T, c *kmipclient.Client, admin *api.Client, prefix stri
 	byName, err := c.Locate().WithName(aesName).Exec()
 	require.NoError(t, err)
 	require.Equal(t, []string{aesName}, byName.UniqueIdentifier)
+
+	// Attributes are stored, listed and returned; ReKey hands the Name to a
+	// replacement and keeps the predecessor readable.
+	rekeyName := prefix + "-rekey"
+	_, err = c.Create().AES(256, kmiplib.CryptographicUsageEncrypt).WithName(rekeyName).Exec()
+	require.NoError(t, err)
+	_, err = c.AddAttribute(rekeyName, "x-owner", "storage-team").Exec()
+	require.NoError(t, err)
+	list, err := c.GetAttributeList(rekeyName).Exec()
+	require.NoError(t, err)
+	require.Contains(t, list.AttributeName, kmiplib.AttributeName("x-owner"))
+	owner, err := c.GetAttributes(rekeyName, "x-owner").Exec()
+	require.NoError(t, err)
+	require.Len(t, owner.Attribute, 1)
+	require.Equal(t, "storage-team", owner.Attribute[0].AttributeValue.(ttlv.Value).Value)
+
+	rekeyed, err := c.Rekey(rekeyName).Exec()
+	require.NoError(t, err)
+	successor := rekeyName + ".2"
+	require.Equal(t, successor, rekeyed.UniqueIdentifier)
+	for _, uid := range []string{successor, rekeyName} {
+		_, err = c.Get(uid).Exec()
+		require.NoError(t, err, uid)
+	}
+	state, err := c.GetAttributes(rekeyName, kmiplib.AttributeNameState).Exec()
+	require.NoError(t, err)
+	require.Equal(t, kmiplib.StateDeactivated, state.Attribute[0].AttributeValue)
+	owner, err = c.GetAttributes(successor, "x-owner", kmiplib.AttributeNameName).Exec()
+	require.NoError(t, err)
+	require.Len(t, owner.Attribute, 2)
+	byRekeyedName, err := c.Locate().WithName(rekeyName).Exec()
+	require.NoError(t, err)
+	require.Equal(t, []string{successor}, byRekeyedName.UniqueIdentifier)
 
 	// Locate skips the key the policy hides, and Get is refused it.
 	symmetric, err := c.Locate().WithObjectType(kmiplib.ObjectTypeSymmetricKey).Exec()

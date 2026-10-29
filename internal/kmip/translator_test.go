@@ -4,6 +4,7 @@
 package kmip
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -19,17 +20,22 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	kmiplib "github.com/ovh/kmip-go"
+	"github.com/ovh/kmip-go/kmipserver"
 	"github.com/ovh/kmip-go/payloads"
 	"github.com/stretchr/testify/require"
 	"github.com/tink-crypto/tink-go/v2/kwp/subtle"
 
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
+	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/openbao/openbao/v2/internal/builtin/logical/transit"
 )
 
 const (
@@ -852,4 +858,1495 @@ func TestSession_Close(t *testing.T) {
 			require.NoError(t, revokes[0].ctxErr)
 		})
 	}
+}
+
+// transitMount serves the fakeBao's transit mount from a real transit
+// backend, the way the HTTP handler would, so the translator meets
+// transit's own answers: its metadata operations and locking, and its
+// create of an existing key, which returns that key without a warning.
+type transitMount struct {
+	t       *testing.T
+	backend logical.Backend
+	storage *observedStorage
+
+	mu sync.Mutex
+	// intercept, when set, sees each request first. It answers the request
+	// itself, or calls serve and returns that answer or another.
+	intercept func(r fakeRequest, serve func() (int, any)) (int, any)
+}
+
+// observedStorage reports each write. Transit writes a key's metadata under
+// the key's exclusive lock, so writes to one record arrive in commit order.
+type observedStorage struct {
+	*logical.InmemStorage
+
+	mu    sync.Mutex
+	onPut func(*logical.StorageEntry)
+}
+
+func (s *observedStorage) Put(ctx context.Context, entry *logical.StorageEntry) error {
+	if err := s.InmemStorage.Put(ctx, entry); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	onPut := s.onPut
+	s.mu.Unlock()
+	if onPut != nil {
+		onPut(entry)
+	}
+	return nil
+}
+
+// transitBao returns a fakeBao whose transit mount is a real transit
+// backend. Routes set on the fakeBao still come first.
+func transitBao(t *testing.T) (*fakeBao, *transitMount) {
+	t.Helper()
+
+	config := logical.TestBackendConfig()
+	storage := &observedStorage{InmemStorage: &logical.InmemStorage{}}
+	config.StorageView = storage
+	backend, err := transit.Factory(t.Context(), config)
+	require.NoError(t, err)
+
+	m := &transitMount{t: t, backend: backend, storage: storage}
+	bao := newFakeBao(t)
+	bao.fallback = m.serve
+	return bao, m
+}
+
+func (m *transitMount) serve(r fakeRequest) (int, any) {
+	m.mu.Lock()
+	intercept := m.intercept
+	m.mu.Unlock()
+	if intercept != nil {
+		return intercept(r, func() (int, any) { return m.handle(r) })
+	}
+	return m.handle(r)
+}
+
+func (m *transitMount) handle(r fakeRequest) (int, any) {
+	path, ok := strings.CutPrefix(r.path, "transit/")
+	if !ok {
+		return http.StatusNotFound, withErrors()
+	}
+	operation := map[string]logical.Operation{
+		http.MethodGet:    logical.ReadOperation,
+		http.MethodPost:   logical.UpdateOperation,
+		http.MethodDelete: logical.DeleteOperation,
+		"LIST":            logical.ListOperation,
+	}[r.method]
+
+	req := &logical.Request{Operation: operation, Path: path, Data: r.body, Storage: m.storage}
+	resp, err := m.backend.HandleRequest(context.Background(), req)
+	if status, err := logical.RespondErrorCommon(req, resp, err); status != 0 {
+		if err != nil {
+			return status, withErrors(err.Error())
+		}
+		return status, withErrors()
+	}
+	if resp == nil {
+		return http.StatusNoContent, nil
+	}
+	return http.StatusOK, map[string]any{"data": resp.Data, "warnings": resp.Warnings}
+}
+
+// do sends a request to the mount directly, not through KMIP.
+func (m *transitMount) do(method, path string, body map[string]any) (int, []byte) {
+	m.t.Helper()
+	status, out := m.handle(fakeRequest{method: method, path: "transit/" + path, body: body})
+	raw, err := json.Marshal(out)
+	require.NoError(m.t, err)
+	return status, raw
+}
+
+func (m *transitMount) createKey(name string) {
+	m.t.Helper()
+	status, raw := m.do(http.MethodPost, "keys/"+name, map[string]any{"type": "aes256-gcm96", "exportable": true})
+	require.Equal(m.t, http.StatusOK, status, string(raw))
+}
+
+func (m *transitMount) write(name string, ops ...metadataOp) {
+	m.t.Helper()
+	raw, err := json.Marshal(map[string]any{"operations": ops})
+	require.NoError(m.t, err)
+	var body map[string]any
+	require.NoError(m.t, json.Unmarshal(raw, &body))
+	status, out := m.do(http.MethodPost, "keys/"+name+"/metadata", body)
+	require.Equal(m.t, http.StatusOK, status, string(out))
+}
+
+// key reads a key as KMIP does, or returns nil when it is missing.
+func (m *transitMount) key(name string) *keyInfo {
+	m.t.Helper()
+	status, raw := m.do(http.MethodGet, "keys/"+name, nil)
+	if status == http.StatusNotFound {
+		return nil
+	}
+	require.Equal(m.t, http.StatusOK, status, string(raw))
+	var out struct {
+		Data keyInfo `json:"data"`
+	}
+	require.NoError(m.t, json.Unmarshal(raw, &out))
+	return &out.Data
+}
+
+// record returns the kmip scope of a key's metadata record.
+func (m *transitMount) record(name string) map[string][]string {
+	m.t.Helper()
+	info := m.key(name)
+	require.NotNil(m.t, info, "key %s", name)
+	return info.Metadata[metadataScope]
+}
+
+func (m *transitMount) keys() []string {
+	m.t.Helper()
+	status, raw := m.do("LIST", "keys", nil)
+	require.Equal(m.t, http.StatusOK, status, string(raw))
+	var out struct {
+		Data struct {
+			Keys []string `json:"keys"`
+		} `json:"data"`
+	}
+	require.NoError(m.t, json.Unmarshal(raw, &out))
+	return out.Data.Keys
+}
+
+// failOnce fails the first request that matches with a 500. With applied,
+// the mount serves the request first, so it takes effect and only its
+// answer is lost.
+func (m *transitMount) failOnce(match func(fakeRequest) bool, applied bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var once sync.Once
+	m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+		fail := false
+		if match(r) {
+			once.Do(func() { fail = true })
+		}
+		if !fail {
+			return serve()
+		}
+		if applied {
+			serve()
+		}
+		return http.StatusInternalServerError, withErrors("injected failure")
+	}
+}
+
+// pauseAt holds the first request with token that matches until release
+// is closed. It closes reached when that request arrives.
+func (m *transitMount) pauseAt(token string, match func(fakeRequest) bool) (reached, release chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reached, release = make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+		pause := false
+		if r.token == token && match(r) {
+			once.Do(func() { pause = true })
+		}
+		if pause {
+			close(reached)
+			<-release
+		}
+		return serve()
+	}
+	return reached, release
+}
+
+// firstOp returns the op and entry of a metadata write's first operation.
+func firstOp(r fakeRequest) (op, entry string) {
+	ops, _ := r.body["operations"].([]any)
+	if len(ops) == 0 {
+		return "", ""
+	}
+	first, _ := ops[0].(map[string]any)
+	op, _ = first["op"].(string)
+	entry, _ = first["entry"].(string)
+	return op, entry
+}
+
+func isMetadataWrite(r fakeRequest, key, op, entry string) bool {
+	if r.method != http.MethodPost || r.path != "transit/keys/"+key+"/metadata" {
+		return false
+	}
+	gotOp, gotEntry := firstOp(r)
+	return gotOp == op && gotEntry == entry
+}
+
+// since returns the requests after the first n, as "METHOD path", and
+// leaves out logins.
+func since(bao *fakeBao, n int) []string {
+	var out []string
+	for _, r := range bao.all()[n:] {
+		if strings.HasSuffix(r.path, "/login") {
+			continue
+		}
+		out = append(out, r.method+" "+r.path)
+	}
+	return out
+}
+
+func customAttr(name, value string) kmiplib.Attribute {
+	return kmiplib.Attribute{AttributeName: kmiplib.AttributeName(name), AttributeValue: value}
+}
+
+func attrsNamed(attrs []kmiplib.Attribute, name kmiplib.AttributeName) []kmiplib.Attribute {
+	var out []kmiplib.Attribute
+	for _, attr := range attrs {
+		if attr.AttributeName == name {
+			out = append(out, attr)
+		}
+	}
+	return out
+}
+
+// requireAttr checks that attrs hold exactly one instance named name, equal
+// to value.
+func requireAttr(t *testing.T, attrs []kmiplib.Attribute, name kmiplib.AttributeName, value any) {
+	t.Helper()
+	got := attrsNamed(attrs, name)
+	require.Len(t, got, 1, "instances of %s", name)
+	require.True(t, sameValue(kmiplib.Attribute{AttributeName: name, AttributeValue: value}, got[0]),
+		"%s is %v, want %v", name, got[0].AttributeValue, value)
+}
+
+var (
+	testActivation   = time.Unix(1700000000, 0)
+	testDeactivation = time.Unix(1800000000, 0)
+)
+
+// newRekeyKey creates the AES key app-r through KMIP with one instance of
+// each kind of stored attribute.
+func newRekeyKey(t *testing.T, ctx context.Context) {
+	t.Helper()
+
+	_, err := op(t, ctx).create(ctx, "app-r", kmiplib.CryptographicAlgorithmAES, 256)
+	require.NoError(t, err)
+	for _, attr := range []kmiplib.Attribute{
+		customAttr("x-tag", "blue"),
+		{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageEncrypt},
+		{AttributeName: kmiplib.AttributeNameActivationDate, AttributeValue: testActivation},
+		{AttributeName: kmiplib.AttributeNameDeactivationDate, AttributeValue: testDeactivation},
+	} {
+		require.NoError(t, op(t, ctx).addAttribute(ctx, "app-r", attr))
+	}
+}
+
+// requireRekeyed checks that ReKey replaced pred with succ, generation gen
+// of the Name anchor, exactly once: one instance of every entry, both
+// links, no marker left behind.
+func requireRekeyed(t *testing.T, m *transitMount, anchor, pred, succ string, gen int) {
+	t.Helper()
+
+	p, s := m.record(pred), m.record(succ)
+	require.Equal(t, []string{succ}, p[linkEntry(kmiplib.LinkTypeReplacementObjectLink)])
+	require.NotContains(t, p, entryPending)
+	require.Equal(t, []string{pred}, s[linkEntry(kmiplib.LinkTypeReplacedObjectLink)])
+	require.Equal(t, []string{anchor}, s[entryAnchor])
+	require.Equal(t, []string{strconv.Itoa(gen)}, s[entryGeneration])
+	for entry, values := range p {
+		if strings.HasPrefix(entry, entryAttrPrefix) {
+			require.Equal(t, values, s[entry], "entry %s", entry)
+		}
+	}
+	for entry, values := range s {
+		require.Len(t, values, 1, "entry %s", entry)
+	}
+}
+
+func TestTranslator_AddAttribute(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256)
+	require.NoError(t, err)
+
+	start := len(bao.all())
+	tag := customAttr("x-tag", "blue")
+	require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", tag))
+	writes := bao.sent(http.MethodPost, "transit/keys/app-a/metadata")
+	require.Len(t, writes, 1)
+	require.Equal(t, map[string]any{"operations": []any{map[string]any{
+		"op": "add", "scope": "kmip", "entry": "attr/x-tag", "value": encodeAttr(tag),
+	}}}, writes[0].body)
+	require.Equal(t, []string{"GET transit/keys/app-a", "POST transit/keys/app-a/metadata"}, since(bao, start))
+
+	// GetAttributes returns it beside the derived attributes, from one read.
+	start = len(bao.all())
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-a", nil)
+	require.NoError(t, err)
+	require.Equal(t, []string{"GET transit/keys/app-a"}, since(bao, start))
+	requireAttr(t, attrs, "x-tag", "blue")
+	requireAttr(t, attrs, kmiplib.AttributeNameName, kmiplib.Name{NameValue: "app-a", NameType: kmiplib.NameTypeUninterpretedTextString})
+	requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StateActive)
+	requireAttr(t, attrs, kmiplib.AttributeNameCryptographicLength, int32(256))
+
+	names, err := op(t, ctx).getAttributeList(ctx, "app-a")
+	require.NoError(t, err)
+	require.Equal(t, []kmiplib.AttributeName{
+		kmiplib.AttributeNameName,
+		kmiplib.AttributeNameUniqueIdentifier,
+		kmiplib.AttributeNameObjectType,
+		kmiplib.AttributeNameCryptographicAlgorithm,
+		kmiplib.AttributeNameCryptographicLength,
+		kmiplib.AttributeNameState,
+		kmiplib.AttributeNameInitialDate,
+		kmiplib.AttributeNameActivationDate,
+		"x-tag",
+	}, names)
+
+	// A multi-instance attribute keeps every instance, and the filter
+	// returns every instance with its index.
+	require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", customAttr("x-tag", "green")))
+	attrs, err = op(t, ctx).getAttributes(ctx, "app-a", []kmiplib.AttributeName{"x-tag"})
+	require.NoError(t, err)
+	require.Len(t, attrs, 2)
+	require.Nil(t, attrs[0].AttributeIndex)
+	require.Equal(t, int32(1), *attrs[1].AttributeIndex)
+	require.True(t, sameValue(customAttr("x-tag", "green"), attrs[1]))
+}
+
+func TestTranslator_AddAttributeRefusals(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256)
+	require.NoError(t, err)
+	start := len(bao.all())
+
+	// A derived attribute is refused before any request.
+	err = op(t, ctx).addAttribute(ctx, "app-a", kmiplib.Attribute{AttributeName: kmiplib.AttributeNameState, AttributeValue: kmiplib.StateActive})
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "attribute State is set by the server")
+	require.Empty(t, since(bao, start))
+
+	// The object's own Name is a no-op; another Name is a rename.
+	sameName := kmiplib.Attribute{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-a"}}
+	require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", sameName))
+	otherName := kmiplib.Attribute{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-b"}}
+	err = op(t, ctx).addAttribute(ctx, "app-a", otherName)
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, `renaming is not supported: object "app-a" has the Name "app-a"`)
+
+	// A malformed value is an invalid field.
+	err = op(t, ctx).addAttribute(ctx, "app-a", kmiplib.Attribute{AttributeName: "x-empty"})
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, "attribute x-empty has no value")
+	err = op(t, ctx).addAttribute(ctx, "app-a", kmiplib.Attribute{AttributeName: kmiplib.AttributeNameName, AttributeValue: "app-a"})
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, "Name attribute is empty or invalid")
+
+	require.Empty(t, bao.sent(http.MethodPost, "transit/keys/app-a/metadata"))
+
+	// A single-instance attribute takes one value.
+	mask := func(m kmiplib.CryptographicUsageMask) kmiplib.Attribute {
+		return kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: m}
+	}
+	require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", mask(kmiplib.CryptographicUsageEncrypt)))
+	require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", mask(kmiplib.CryptographicUsageEncrypt)))
+	err = op(t, ctx).addAttribute(ctx, "app-a", mask(kmiplib.CryptographicUsageDecrypt))
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, `object "app-a" already has a Cryptographic Usage Mask`)
+
+	// A record over transit's bounds is an invalid field.
+	err = op(t, ctx).addAttribute(ctx, "app-a", customAttr("x-big", strings.Repeat("v", 8<<10)))
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, "the limit is 8192")
+
+	// A missing object is not found.
+	err = op(t, ctx).addAttribute(ctx, "app-missing", customAttr("x-tag", "blue"))
+	requireReason(t, err, kmiplib.ResultReasonItemNotFound, `object "app-missing" not found`)
+}
+
+func requireReason(t *testing.T, err error, reason kmiplib.ResultReason, msg string) {
+	t.Helper()
+	require.ErrorContains(t, err, msg)
+	kerr, ok := err.(kmipserver.Error)
+	require.True(t, ok, "%T: %v", err, err)
+	require.Equal(t, reason, kerr.Reason)
+}
+
+func TestTranslator_MetadataWriteDenied(t *testing.T) {
+	bao := newFakeBao(t)
+	bao.route(http.MethodGet, "transit/keys/k", keyRoute("aes256-gcm96", nil))
+	bao.route(http.MethodPost, "transit/keys/k/metadata", respond(http.StatusForbidden, withErrors("permission denied")))
+	ctx, _ := newTestSession(t, bao, Config{})
+
+	err := op(t, ctx).addAttribute(ctx, "k", customAttr("x-tag", "blue"))
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied,
+		`permission denied: POST transit/keys/k/metadata requires the "update" capability`)
+}
+
+// The mask is stored and reported, not enforced: transit has no use mask,
+// and gating the crypto operations on it would cost them a read.
+func TestTranslator_UsageMaskIsNotEnforced(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256)
+	require.NoError(t, err)
+
+	verifyOnly := kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageVerify}
+	require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", verifyOnly))
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-a", []kmiplib.AttributeName{kmiplib.AttributeNameCryptographicUsageMask})
+	require.NoError(t, err)
+	requireAttr(t, attrs, kmiplib.AttributeNameCryptographicUsageMask, kmiplib.CryptographicUsageVerify)
+
+	_, err = op(t, ctx).encrypt(ctx, "app-a", []byte("still allowed"))
+	require.NoError(t, err)
+
+	// A revoked key is refused by transit itself.
+	require.NoError(t, op(t, ctx).revoke(ctx, "app-a"))
+	_, err = op(t, ctx).encrypt(ctx, "app-a", []byte("refused"))
+	require.ErrorContains(t, err, "refusing to use soft-deleted key")
+}
+
+// The crypto operations send one request each, as before attributes
+// existed: no key read and no metadata read.
+func TestTranslator_CryptoRequestsUnchanged(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	m.createKey("app-aes")
+	status, raw := m.do(http.MethodPost, "keys/app-rsa", map[string]any{"type": "rsa-2048"})
+	require.Equal(t, http.StatusOK, status, string(raw))
+
+	start := len(bao.all())
+	ciphertext, err := op(t, ctx).encrypt(ctx, "app-aes", []byte("data"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"POST transit/encrypt/app-aes"}, since(bao, start))
+
+	start = len(bao.all())
+	_, err = op(t, ctx).decrypt(ctx, "app-aes", ciphertext)
+	require.NoError(t, err)
+	require.Equal(t, []string{"POST transit/decrypt/app-aes"}, since(bao, start))
+
+	start = len(bao.all())
+	signature, err := op(t, ctx).sign(ctx, "app-rsa", []byte("data"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"POST transit/sign/app-rsa"}, since(bao, start))
+
+	start = len(bao.all())
+	valid, err := op(t, ctx).verify(ctx, "app-rsa", []byte("data"), signature)
+	require.NoError(t, err)
+	require.True(t, valid)
+	require.Equal(t, []string{"POST transit/verify/app-rsa"}, since(bao, start))
+}
+
+func TestTranslator_ReservedNameSuffix(t *testing.T) {
+	bao := newFakeBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+
+	_, err := op(t, ctx).create(ctx, "app-a.2", kmiplib.CryptographicAlgorithmAES, 256)
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, "reserved for the replacements ReKey creates")
+	_, err = op(t, ctx).register(ctx, "app-a.10", kmiplib.CryptographicAlgorithmAES, 256, make([]byte, 32))
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, "reserved for the replacements ReKey creates")
+	require.Empty(t, bao.all())
+}
+
+func TestTranslator_Rekey(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+
+	start := len(bao.all())
+	id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "app-r.2", id)
+
+	// The marker is written before the successor is created, and cleared
+	// after its record is written; the Name moves before the link.
+	require.Equal(t, []string{
+		"GET transit/keys/app-r",
+		"GET transit/keys/app-r.2",
+		"POST transit/keys/app-r/metadata",
+		"POST transit/keys/app-r.2",
+		"POST transit/keys/app-r.2/metadata",
+		"POST transit/keys/app-r/metadata",
+		"POST transit/keys/app-r/metadata",
+		"POST transit/keys/app-r/metadata",
+	}, since(bao, start))
+	writes := bao.sent(http.MethodPost, "transit/keys/app-r/metadata")
+	writes = writes[len(writes)-4:]
+	for i, want := range [][2]string{
+		{"claim", entryPending},
+		{"delete", entryPending},
+		{"claim", entryCurrent},
+		{"link", linkEntry(kmiplib.LinkTypeReplacementObjectLink)},
+	} {
+		op, entry := firstOp(writes[i])
+		require.Equal(t, want, [2]string{op, entry})
+	}
+	requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+	require.Equal(t, []string{"app-r", "app-r.2"}, m.keys())
+
+	// The replacement has the Name and the stored attributes.
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-r.2", nil)
+	require.NoError(t, err)
+	requireAttr(t, attrs, kmiplib.AttributeNameName, kmiplib.Name{NameValue: "app-r", NameType: kmiplib.NameTypeUninterpretedTextString})
+	requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StateActive)
+	requireAttr(t, attrs, kmiplib.AttributeNameLink, kmiplib.Link{LinkType: kmiplib.LinkTypeReplacedObjectLink, LinkedObjectIdentifier: "app-r"})
+	requireAttr(t, attrs, "x-tag", "blue")
+	requireAttr(t, attrs, kmiplib.AttributeNameCryptographicUsageMask, kmiplib.CryptographicUsageEncrypt)
+	requireAttr(t, attrs, kmiplib.AttributeNameActivationDate, testActivation)
+	requireAttr(t, attrs, kmiplib.AttributeNameDeactivationDate, testDeactivation)
+
+	// The predecessor stays readable, Deactivated and without a Name.
+	attrs, err = op(t, ctx).getAttributes(ctx, "app-r", nil)
+	require.NoError(t, err)
+	require.Empty(t, attrsNamed(attrs, kmiplib.AttributeNameName))
+	requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StateDeactivated)
+	requireAttr(t, attrs, kmiplib.AttributeNameLink, kmiplib.Link{LinkType: kmiplib.LinkTypeReplacementObjectLink, LinkedObjectIdentifier: "app-r.2"})
+	require.False(t, m.key("app-r").SoftDeleted)
+	_, err = op(t, ctx).get(ctx, "app-r")
+	require.NoError(t, err)
+
+	// The pending_successor marker is never an attribute.
+	names, err := op(t, ctx).getAttributeList(ctx, "app-r")
+	require.NoError(t, err)
+	for _, name := range names {
+		require.NotContains(t, string(name), "pending")
+	}
+
+	// Locate by Name follows the anchor to the replacement: two reads,
+	// no list.
+	start = len(bao.all())
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
+		AttributeName:  kmiplib.AttributeNameName,
+		AttributeValue: kmiplib.Name{NameValue: "app-r", NameType: kmiplib.NameTypeUninterpretedTextString},
+	}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"app-r.2"}, ids)
+	require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r.2"}, since(bao, start))
+
+	// The predecessor cannot be rekeyed again, and its Name is gone.
+	_, err = op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `ReKey replaced it with "app-r.2"`)
+	err = op(t, ctx).addAttribute(ctx, "app-r", kmiplib.Attribute{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-r"}})
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, `object "app-r" was replaced by "app-r.2" and has no Name`)
+}
+
+func TestTranslator_RekeyTemplateAndRefusals(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+
+	offset := time.Hour
+	_, err := op(t, ctx).rekey(ctx, "app-r", &offset, nil)
+	requireReason(t, err, kmiplib.ResultReasonFeatureNotSupported, "ReKey with an Offset is not supported")
+
+	longer := &kmiplib.TemplateAttribute{Attribute: []kmiplib.Attribute{
+		{AttributeName: kmiplib.AttributeNameCryptographicLength, AttributeValue: int32(128)},
+	}}
+	_, err = op(t, ctx).rekey(ctx, "app-r", nil, longer)
+	requireReason(t, err, kmiplib.ResultReasonFeatureNotSupported, "ReKey cannot change the Cryptographic Length")
+
+	rename := &kmiplib.TemplateAttribute{Attribute: []kmiplib.Attribute{
+		{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-other"}},
+	}}
+	_, err = op(t, ctx).rekey(ctx, "app-r", nil, rename)
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, "renaming is not supported")
+	require.Equal(t, []string{"app-r"}, m.keys())
+
+	// A template attribute replaces the copied one.
+	template := &kmiplib.TemplateAttribute{Attribute: []kmiplib.Attribute{
+		{AttributeName: kmiplib.AttributeNameCryptographicLength, AttributeValue: int32(256)},
+		{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-r"}},
+		customAttr("x-tag", "red"),
+	}}
+	id, err := op(t, ctx).rekey(ctx, "app-r", nil, template)
+	require.NoError(t, err)
+	attrs, err := op(t, ctx).getAttributes(ctx, id, []kmiplib.AttributeName{"x-tag"})
+	require.NoError(t, err)
+	requireAttr(t, attrs, "x-tag", "red")
+
+	// Only symmetric keys are rekeyed.
+	status, raw := m.do(http.MethodPost, "keys/app-rsa", map[string]any{"type": "rsa-2048"})
+	require.Equal(t, http.StatusOK, status, string(raw))
+	_, err = op(t, ctx).rekey(ctx, "app-rsa", nil, nil)
+	requireReason(t, err, kmiplib.ResultReasonFeatureNotSupported, "ReKey replaces symmetric keys only")
+
+	// A soft-deleted key is refused.
+	m.createKey("app-gone")
+	require.NoError(t, op(t, ctx).revoke(ctx, "app-gone"))
+	_, err = op(t, ctx).rekey(ctx, "app-gone", nil, nil)
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "wrong key lifecycle state")
+}
+
+// ReKey sets the ID Placeholder, so a later batch item without a UID acts
+// on the replacement.
+func TestHandleRekey_SetsIdPlaceholder(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+
+	exec := kmipserver.NewBatchExecutor()
+	for op, h := range routes() {
+		exec.Route(op, h)
+	}
+	msg := kmiplib.NewRequestMessage(
+		kmiplib.V1_4,
+		&payloads.RekeyRequestPayload{UniqueIdentifier: "app-r"},
+		&payloads.GetAttributesRequestPayload{AttributeName: []kmiplib.AttributeName{kmiplib.AttributeNameUniqueIdentifier}},
+	)
+	resp := exec.HandleRequest(ctx, &msg)
+	require.Len(t, resp.BatchItem, 2)
+	for _, item := range resp.BatchItem {
+		require.NoError(t, item.Err())
+	}
+	require.Equal(t, "app-r.2", resp.BatchItem[0].ResponsePayload.(*payloads.RekeyResponsePayload).UniqueIdentifier)
+	require.Equal(t, "app-r.2", resp.BatchItem[1].ResponsePayload.(*payloads.GetAttributesResponsePayload).UniqueIdentifier)
+}
+
+// AddAttribute answers with the Attribute Index that GetAttributes gives the
+// new instance. KMIP lets a response omit the index only when it is 0, so the
+// second and later instances must carry theirs.
+func TestHandleAddAttribute_ReturnsIndex(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	// newRekeyKey stores an x-tag, so use a name it leaves unset.
+	newRekeyKey(t, ctx)
+
+	exec := kmipserver.NewBatchExecutor()
+	for op, h := range routes() {
+		exec.Route(op, h)
+	}
+	add := func(value string) *int32 {
+		t.Helper()
+		msg := kmiplib.NewRequestMessage(
+			kmiplib.V1_4,
+			&payloads.AddAttributeRequestPayload{UniqueIdentifier: "app-r", Attribute: customAttr("x-color", value)},
+		)
+		resp := exec.HandleRequest(ctx, &msg)
+		require.Len(t, resp.BatchItem, 1)
+		require.NoError(t, resp.BatchItem[0].Err())
+		return resp.BatchItem[0].ResponsePayload.(*payloads.AddAttributeResponsePayload).Attribute.AttributeIndex
+	}
+
+	require.Nil(t, add("red"), "index 0 is omitted")
+	idx := add("green")
+	require.NotNil(t, idx)
+	require.Equal(t, int32(1), *idx)
+	idx = add("blue")
+	require.NotNil(t, idx)
+	require.Equal(t, int32(2), *idx)
+
+	// GetAttributes numbers the same instances the same way.
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-r", nil)
+	require.NoError(t, err)
+	tags := attrsNamed(attrs, "x-color")
+	require.Len(t, tags, 3)
+	require.Nil(t, tags[0].AttributeIndex)
+	require.Equal(t, int32(1), *tags[1].AttributeIndex)
+	require.Equal(t, int32(2), *tags[2].AttributeIndex)
+}
+
+func TestTranslator_RekeyRetention(t *testing.T) {
+	t.Run("retain 2", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		newRekeyKey(t, ctx)
+
+		id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		require.NoError(t, err)
+		require.False(t, m.key("app-r").SoftDeleted)
+		require.False(t, m.key("app-r.2").SoftDeleted)
+
+		id, err = op(t, ctx).rekey(ctx, id, nil, nil)
+		require.NoError(t, err)
+		require.Equal(t, "app-r.3", id)
+		requireRekeyed(t, m, "app-r", "app-r.2", "app-r.3", 3)
+
+		// The anchor's material is gone, its record is not: the Name still
+		// resolves.
+		require.True(t, m.key("app-r").SoftDeleted)
+		require.False(t, m.key("app-r.2").SoftDeleted)
+		require.Equal(t, []string{"1"}, m.record("app-r")[entrySwept])
+		ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
+			AttributeName:  kmiplib.AttributeNameName,
+			AttributeValue: kmiplib.Name{NameValue: "app-r"},
+		}})
+		require.NoError(t, err)
+		require.Equal(t, []string{"app-r.3"}, ids)
+	})
+
+	t.Run("retain 1", func(t *testing.T) {
+		bao, m := transitBao(t)
+		bao.metadata["kmip_rekey_retain"] = "1"
+		ctx, _ := newTestSession(t, bao, Config{})
+		newRekeyKey(t, ctx)
+
+		_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		require.NoError(t, err)
+		require.True(t, m.key("app-r").SoftDeleted)
+		require.False(t, m.key("app-r.2").SoftDeleted)
+	})
+
+	t.Run("sweep denied", func(t *testing.T) {
+		var logs bytes.Buffer
+		bao, m := transitBao(t)
+		bao.metadata["kmip_rekey_retain"] = "1"
+		bao.route(http.MethodDelete, "transit/keys/app-r/soft-delete", respond(http.StatusForbidden, withErrors("permission denied")))
+		ctx, _ := newTestSession(t, bao, Config{Logger: hclog.New(&hclog.LoggerOptions{Output: &logs})})
+		newRekeyKey(t, ctx)
+
+		// The ReKey succeeded at its commit; the sweep only warns.
+		id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		require.NoError(t, err)
+		require.Equal(t, "app-r.2", id)
+		require.False(t, m.key("app-r").SoftDeleted)
+		require.NotContains(t, m.record("app-r"), entrySwept)
+		require.Contains(t, logs.String(), "KMIP ReKey left an old generation readable")
+		require.Contains(t, logs.String(), "path=transit/keys/app-r/soft-delete capability=delete")
+		// A denied sweep does not log in again.
+		require.Equal(t, 1, bao.loginCount())
+
+		// Once the policy allows it, the next ReKey of the Name sweeps what
+		// the last one left.
+		bao.mu.Lock()
+		delete(bao.routes, http.MethodDelete+" transit/keys/app-r/soft-delete")
+		bao.mu.Unlock()
+		_, err = op(t, ctx).rekey(ctx, id, nil, nil)
+		require.NoError(t, err)
+		require.Len(t, bao.sent(http.MethodDelete, "transit/keys/app-r/soft-delete"), 2)
+		require.True(t, m.key("app-r").SoftDeleted)
+		require.True(t, m.key("app-r.2").SoftDeleted)
+		require.False(t, m.key("app-r.3").SoftDeleted)
+		require.Equal(t, []string{"2"}, m.record("app-r")[entrySwept])
+	})
+}
+
+func TestTranslator_RekeySuccessorExists(t *testing.T) {
+	t.Run("foreign key", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		newRekeyKey(t, ctx)
+		m.createKey("app-r.2")
+
+		start := len(bao.all())
+		_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `must create the key "app-r.2", which already exists and is not its replacement`)
+		// A recordless S with no marker is read again, with P, before it is
+		// called foreign: a concurrent ReKey may have made it.
+		require.Equal(t, []string{
+			"GET transit/keys/app-r", "GET transit/keys/app-r.2",
+			"GET transit/keys/app-r", "GET transit/keys/app-r.2",
+		}, since(bao, start))
+	})
+
+	t.Run("foreign record despite marker", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		newRekeyKey(t, ctx)
+		m.write("app-r", claimOp(entryPending, "app-r.2", ""))
+		m.createKey("app-r.2")
+		m.write("app-r.2", linkOp(linkEntry(kmiplib.LinkTypeReplacedObjectLink), "app-other"))
+
+		start := len(bao.all())
+		_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		require.ErrorContains(t, err, `"app-r.2", which already exists`)
+		require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r.2"}, since(bao, start))
+	})
+
+	t.Run("recordless with marker is adopted", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		newRekeyKey(t, ctx)
+		m.write("app-r", claimOp(entryPending, "app-r.2", ""))
+		m.createKey("app-r.2")
+
+		id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		require.NoError(t, err)
+		require.Equal(t, "app-r.2", id)
+		require.Empty(t, bao.sent(http.MethodPost, "transit/keys/app-r.2"))
+		requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+	})
+
+	t.Run("marker with missing successor creates it", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		newRekeyKey(t, ctx)
+		m.write("app-r", claimOp(entryPending, "app-r.2", ""))
+
+		// The marker is neither an attribute nor a state.
+		attrs, err := op(t, ctx).getAttributes(ctx, "app-r", nil)
+		require.NoError(t, err)
+		requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StateActive)
+		for _, attr := range attrs {
+			require.NotContains(t, string(attr.AttributeName), "pending")
+		}
+
+		id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		require.NoError(t, err)
+		require.Equal(t, "app-r.2", id)
+		require.Len(t, bao.sent(http.MethodPost, "transit/keys/app-r.2"), 1)
+		requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+	})
+
+	t.Run("record links back, so resume", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		newRekeyKey(t, ctx)
+		// Stop after step 4, the successor's record, and before the
+		// marker is cleared.
+		m.failOnce(func(r fakeRequest) bool { return isMetadataWrite(r, "app-r", "delete", entryPending) }, false)
+		_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		require.ErrorContains(t, err, "injected failure")
+
+		start := len(bao.all())
+		id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+		require.NoError(t, err)
+		require.Equal(t, "app-r.2", id)
+		require.NotContains(t, since(bao, start), "POST transit/keys/app-r.2")
+		require.NotContains(t, since(bao, start), "POST transit/keys/app-r.2/metadata")
+		requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+	})
+}
+
+// Transit answers a create of an existing key with that key and no
+// warning: backend.go getPolicy reports every policy as upserted. ReKey
+// therefore detects an existing successor by reading it, never by the
+// warning.
+func TestTranslator_TransitCreateOfExistingKeyHasNoWarning(t *testing.T) {
+	_, m := transitBao(t)
+	m.createKey("dup")
+	status, raw := m.do(http.MethodPost, "keys/dup", map[string]any{"type": "aes256-gcm96"})
+	require.Equal(t, http.StatusOK, status)
+	var out struct {
+		Warnings []string `json:"warnings"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &out))
+	require.Empty(t, out.Warnings)
+}
+
+// A ReKey interrupted at any step completes when the client retries it,
+// whether the failed request took effect or not.
+func TestTranslator_RekeyInterrupted(t *testing.T) {
+	boundaries := []struct {
+		name  string
+		match func(fakeRequest) bool
+	}{
+		{"marker", func(r fakeRequest) bool { return isMetadataWrite(r, "app-r", "claim", entryPending) }},
+		{"create", func(r fakeRequest) bool { return r.method == http.MethodPost && r.path == "transit/keys/app-r.2" }},
+		{"record", func(r fakeRequest) bool {
+			return r.method == http.MethodPost && r.path == "transit/keys/app-r.2/metadata"
+		}},
+		{"clear", func(r fakeRequest) bool { return isMetadataWrite(r, "app-r", "delete", entryPending) }},
+		{"commit", func(r fakeRequest) bool { return isMetadataWrite(r, "app-r", "claim", entryCurrent) }},
+		{"link", func(r fakeRequest) bool {
+			return isMetadataWrite(r, "app-r", "link", linkEntry(kmiplib.LinkTypeReplacementObjectLink))
+		}},
+	}
+	for _, b := range boundaries {
+		for _, applied := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s applied=%t", b.name, applied), func(t *testing.T) {
+				bao, m := transitBao(t)
+				ctx, _ := newTestSession(t, bao, Config{})
+				newRekeyKey(t, ctx)
+
+				m.failOnce(b.match, applied)
+				_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+				require.ErrorContains(t, err, "injected failure")
+
+				id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+				if b.name == "link" && applied {
+					// Only the answer was lost: the ReKey had completed.
+					requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `ReKey replaced it with "app-r.2"`)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, "app-r.2", id)
+				}
+				requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+				require.Equal(t, []string{"app-r.2"}, m.record("app-r")[entryCurrent])
+				require.Equal(t, []string{"app-r", "app-r.2"}, m.keys())
+			})
+		}
+	}
+}
+
+// A create that transit refuses, as a role without update on the
+// successor's name gets, did not run. The marker must go with it: left in
+// place, it would let a key an operator creates under that name at any later
+// time be adopted as the replacement.
+func TestTranslator_RekeyRefusedCreateClearsMarker(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+
+	m.mu.Lock()
+	m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+		if r.method == http.MethodPost && r.path == "transit/keys/app-r.2" {
+			return http.StatusForbidden, withErrors("permission denied")
+		}
+		return serve()
+	}
+	m.mu.Unlock()
+	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.Error(t, err)
+	require.Empty(t, m.record("app-r")[entryPending])
+
+	// Later, an operator makes a key of the same type under that name.
+	m.mu.Lock()
+	m.intercept = nil
+	m.mu.Unlock()
+	m.createKey("app-r.2")
+
+	_, err = op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.ErrorContains(t, err, "app-r.2")
+	require.Empty(t, m.record("app-r.2"), "the operator's key was adopted")
+	// No ReKey committed, so the Name never moved.
+	require.Empty(t, m.record("app-r")[entryCurrent])
+}
+
+// Destroying the first generation of a rekeyed Name would delete the record
+// that resolves the Name: Locate by Name would find nothing, the next ReKey
+// could not commit, and a Create could reuse the Name. deletion_allowed is
+// set, so without the guard the delete would go through.
+func TestTranslator_DestroyRefusesAnchorOfRekeyedName(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+	id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "app-r.2", id)
+
+	allowDeletion := func(name string) {
+		t.Helper()
+		status, raw := m.do(http.MethodPost, "keys/"+name+"/config", map[string]any{"deletion_allowed": true})
+		require.Equal(t, http.StatusOK, status, string(raw))
+	}
+	allowDeletion("app-r")
+
+	err = op(t, ctx).destroy(ctx, "app-r")
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `"app-r.2"`)
+	require.NotNil(t, m.key("app-r"), "the anchor was deleted")
+
+	// The Name still resolves to its current generation.
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
+		AttributeName:  kmiplib.AttributeNameName,
+		AttributeValue: kmiplib.Name{NameValue: "app-r"},
+	}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"app-r.2"}, ids)
+
+	// Destroying the later generation first releases the anchor: current
+	// still names app-r.2, but that key is gone, so the Name has nothing
+	// left to lose.
+	allowDeletion("app-r.2")
+	require.NoError(t, op(t, ctx).destroy(ctx, "app-r.2"))
+	require.NoError(t, op(t, ctx).destroy(ctx, "app-r"))
+	require.Nil(t, m.key("app-r"))
+
+	// A key that no ReKey replaced is destroyed as before.
+	_, err = op(t, ctx).create(ctx, "plain", kmiplib.CryptographicAlgorithmAES, 256)
+	require.NoError(t, err)
+	allowDeletion("plain")
+	require.NoError(t, op(t, ctx).destroy(ctx, "plain"))
+	require.Nil(t, m.key("plain"))
+}
+
+// A ReKey that committed and then failed to link the predecessor is
+// repaired by a retry, also after the Name moved past its replacement. The
+// retry leaves the Name where it is.
+func TestTranslator_RekeyRepairsLinkAfterNameMoved(t *testing.T) {
+	bao, m := transitBao(t)
+	bao.metadata["kmip_rekey_retain"] = "3"
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+
+	m.failOnce(func(r fakeRequest) bool {
+		return isMetadataWrite(r, "app-r", "link", linkEntry(kmiplib.LinkTypeReplacementObjectLink))
+	}, false)
+	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.ErrorContains(t, err, "injected failure")
+
+	// The Name already resolves to the replacement, and a client rekeys it.
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
+		AttributeName:  kmiplib.AttributeNameName,
+		AttributeValue: kmiplib.Name{NameValue: "app-r"},
+	}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"app-r.2"}, ids)
+	id, err := op(t, ctx).rekey(ctx, "app-r.2", nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "app-r.3", id)
+
+	// Without its link, the predecessor still has the Name and is Active.
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-r", nil)
+	require.NoError(t, err)
+	requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StateActive)
+	require.Len(t, attrsNamed(attrs, kmiplib.AttributeNameName), 1)
+
+	start := len(bao.all())
+	id, err = op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "app-r.2", id)
+	sent := since(bao, start)
+	require.NotContains(t, sent, "POST transit/keys/app-r.2")
+	require.NotContains(t, sent, "POST transit/keys/app-r.2/metadata")
+	for _, r := range sent {
+		require.NotContains(t, r, "soft-delete")
+	}
+
+	requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+	requireRekeyed(t, m, "app-r", "app-r.2", "app-r.3", 3)
+	require.Equal(t, []string{"app-r.3"}, m.record("app-r")[entryCurrent])
+	require.Equal(t, []string{"app-r", "app-r.2", "app-r.3"}, m.keys())
+
+	attrs, err = op(t, ctx).getAttributes(ctx, "app-r", nil)
+	require.NoError(t, err)
+	requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StateDeactivated)
+	require.Empty(t, attrsNamed(attrs, kmiplib.AttributeNameName))
+}
+
+// With kmip_rekey_retain=2, the sweep of the next ReKey soft-deletes a
+// predecessor that an interrupted ReKey committed and did not link. Without
+// the repair, a retry fails on the soft-deleted key and the predecessor never
+// gets the link a client holding its UID needs.
+func TestTranslator_RekeyRepairsLinkAfterSweep(t *testing.T) {
+	bao, m := transitBao(t)
+	bao.metadata["kmip_rekey_retain"] = "2"
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+
+	m.failOnce(func(r fakeRequest) bool {
+		return isMetadataWrite(r, "app-r", "link", linkEntry(kmiplib.LinkTypeReplacementObjectLink))
+	}, false)
+	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.ErrorContains(t, err, "injected failure")
+
+	id, err := op(t, ctx).rekey(ctx, "app-r.2", nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "app-r.3", id)
+
+	// The sweep reached the predecessor before its link was written.
+	pred := m.key("app-r")
+	require.True(t, pred.SoftDeleted)
+	require.Empty(t, pred.replacement())
+
+	start := len(bao.all())
+	id, err = op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "app-r.2", id)
+	// Only the link is written: nothing is created, nothing is swept, and the
+	// Name does not move back.
+	sent := since(bao, start)
+	require.NotContains(t, sent, "POST transit/keys/app-r.2")
+	require.NotContains(t, sent, "POST transit/keys/app-r.2/metadata")
+	for _, r := range sent {
+		require.NotContains(t, r, "soft-delete")
+	}
+	require.Equal(t, "app-r.2", m.key("app-r").replacement())
+	require.Equal(t, []string{"app-r.3"}, m.record("app-r")[entryCurrent])
+
+	// A client holding the predecessor's UID can follow the link.
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-r", nil)
+	require.NoError(t, err)
+	requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StateDeactivated)
+	found := false
+	for _, a := range attrsNamed(attrs, kmiplib.AttributeNameLink) {
+		if l := a.AttributeValue.(kmiplib.Link); l.LinkType == kmiplib.LinkTypeReplacementObjectLink {
+			require.Equal(t, "app-r.2", l.LinkedObjectIdentifier)
+			found = true
+		}
+	}
+	require.True(t, found, "predecessor has no ReplacementObjectLink")
+
+	// The repair is done; a second retry does not replace the key again.
+	_, err = op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.Error(t, err)
+}
+
+// Two ReKeys of one key can interleave so that this one read P before the
+// other marked and created S, and then finds S without a record. S is the
+// other ReKey's replacement, not a foreign key: this one adopts or resumes
+// it. Calling it foreign told an operator to delete the key that then held
+// the Name.
+func TestTranslator_RekeyRaceFindsUnrecordedSuccessor(t *testing.T) {
+	// recordS writes S's record and clears P's marker, as the other ReKey's
+	// next two steps do.
+	recordS := func(m *transitMount) {
+		ops := replaceOps(entryAnchor, "app-r")
+		ops = append(ops, replaceOps(entryGeneration, "2")...)
+		ops = append(ops, replaceOps(linkEntry(kmiplib.LinkTypeReplacedObjectLink), "app-r")...)
+		for entry, values := range m.record("app-r") {
+			if strings.HasPrefix(entry, entryAttrPrefix) {
+				ops = append(ops, replaceOps(entry, values...)...)
+			}
+		}
+		m.write("app-r.2", ops...)
+		m.write("app-r", deleteOp(entryPending))
+	}
+	for _, tc := range []struct {
+		name string
+		// recorded: the other ReKey also writes S's record and clears its
+		// marker after this one finds S without a record.
+		recorded bool
+	}{{"marker still set", false}, {"record written since", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			bao, m := transitBao(t)
+			ctx, _ := newTestSession(t, bao, Config{})
+			newRekeyKey(t, ctx)
+
+			var readP, readS sync.Once
+			m.mu.Lock()
+			m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+				status, out := serve()
+				switch {
+				case r.method == http.MethodGet && r.path == "transit/keys/app-r":
+					readP.Do(func() {
+						m.write("app-r", claimOp(entryPending, "app-r.2", ""))
+						m.createKey("app-r.2")
+					})
+				case tc.recorded && r.method == http.MethodGet && r.path == "transit/keys/app-r.2":
+					readS.Do(func() { recordS(m) })
+				}
+				return status, out
+			}
+			m.mu.Unlock()
+
+			id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+			require.NoError(t, err)
+			require.Equal(t, "app-r.2", id)
+			requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+		})
+	}
+}
+
+// Locate's read of the current generation follows a read of the anchor
+// that succeeded with the same token, so a 403 on it is a denial. It must
+// not revoke the token and log in again.
+func TestTranslator_LocateDeniedSuccessorReadDoesNotLogIn(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+
+	m.mu.Lock()
+	m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+		if r.method == http.MethodGet && r.path == "transit/keys/app-r.2" {
+			return http.StatusForbidden, withErrors("permission denied")
+		}
+		return serve()
+	}
+	m.mu.Unlock()
+
+	start := len(bao.all())
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
+		AttributeName:  kmiplib.AttributeNameName,
+		AttributeValue: kmiplib.Name{NameValue: "app-r"},
+	}})
+	require.NoError(t, err)
+	require.Empty(t, ids)
+	for _, r := range since(bao, start) {
+		require.NotContains(t, r, "login")
+	}
+	require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r.2"}, since(bao, start))
+}
+
+// Between creating its replacement and writing the replacement's record,
+// ReKey must not see that key written to: the record would replace the
+// write, or a retry would take the key for a foreign one.
+func TestTranslator_AddAttributeRefusesUninitializedSuccessor(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+	// An earlier ReKey created S and stopped before its record.
+	m.write("app-r", claimOp(entryPending, "app-r.2", ""))
+	m.createKey("app-r.2")
+
+	start := len(bao.all())
+	_, err := op(t, ctx).addAttributeAt(ctx, "app-r.2", customAttr("x-tag", "green"))
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "still being created")
+	require.NotContains(t, since(bao, start), "POST transit/keys/app-r.2/metadata")
+	require.Empty(t, m.record("app-r.2"))
+
+	// The retry still adopts S.
+	id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, "app-r.2", id)
+	requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+}
+
+// A transit key whose name only looks like a ReKey replacement takes
+// attributes like any other key: its predecessor is missing, is not a key of
+// the right shape, or does not name it as pending.
+func TestTranslator_AddAttributeOnDottedDigitsKey(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	m.createKey("svc")
+	for _, name := range []string{
+		"db.2024",  // predecessor db.2023 is missing
+		"orders.1", // generation 1 is never a replacement
+		"app.2",    // predecessor app is missing
+		"svc.2",    // predecessor svc exists and names nothing
+	} {
+		m.createKey(name)
+		_, err := op(t, ctx).addAttributeAt(ctx, name, customAttr("x-tag", "blue"))
+		require.NoError(t, err, name)
+		require.NotEmpty(t, m.record(name)[attrEntry("x-tag")], name)
+	}
+}
+
+// A key restored under a new name is an object of its own. It must not take
+// the KMIP identity of the key it was backed up from: Locate for the new Name
+// would follow that key's current pointer and return its current generation,
+// and a client would encrypt with the wrong key.
+func TestTranslator_RestoreUnderNewNameIsItsOwnObject(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+
+	status, raw := m.do(http.MethodPost, "keys/app-r/config", map[string]any{"allow_plaintext_backup": true})
+	require.Equal(t, http.StatusOK, status, string(raw))
+	status, raw = m.do(http.MethodGet, "backup/app-r", nil)
+	require.Equal(t, http.StatusOK, status, string(raw))
+	var backup struct {
+		Data struct {
+			Backup string `json:"backup"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &backup))
+	status, raw = m.do(http.MethodPost, "restore/app-b", map[string]any{"backup": backup.Data.Backup})
+	require.Equal(t, http.StatusNoContent, status, string(raw))
+
+	require.Empty(t, m.record("app-b"))
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
+		AttributeName:  kmiplib.AttributeNameName,
+		AttributeValue: kmiplib.Name{NameValue: "app-b"},
+	}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"app-b"}, ids)
+}
+
+// A ReKey whose Name holds an object that is not a later generation fails
+// at the commit and does not link the predecessor.
+func TestTranslator_RekeyNameHeldByAnotherObject(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+	m.write("app-r", claimOp(entryCurrent, "app-other", ""))
+
+	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `object "app-r" is no longer the current object of the Name "app-r"`)
+	require.NotContains(t, m.record("app-r"), linkEntry(kmiplib.LinkTypeReplacementObjectLink))
+	require.Equal(t, []string{"app-other"}, m.record("app-r")[entryCurrent])
+}
+
+// A ReKey that read the key before a concurrent ReKey of it completed
+// keeps the replacement's record, and the attributes added to it since.
+func TestTranslator_RekeyStaleRequestKeepsSuccessorRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		match func(fakeRequest) bool
+		// staleWrites is how many writes to the replacement's record the
+		// stale ReKey sends. None applies.
+		staleWrites int
+	}{
+		// The stale ReKey finds the replacement's record when it reads it.
+		{"before reading the replacement", func(r fakeRequest) bool {
+			return r.method == http.MethodGet && r.path == "transit/keys/app-r.2"
+		}, 0},
+		// The stale ReKey created the replacement; the other ReKey adopts it
+		// and writes its record first.
+		{"before writing its record", func(r fakeRequest) bool {
+			return r.method == http.MethodPost && r.path == "transit/keys/app-r.2/metadata"
+		}, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bao, m := transitBao(t)
+			ctx, _ := newTestSession(t, bao, Config{})
+			newRekeyKey(t, ctx)
+
+			staleCtx, stale := newTestSession(t, bao, Config{})
+			_, err := op(t, staleCtx).getAttributeList(staleCtx, "app-r")
+			require.NoError(t, err)
+			stale.mu.Lock()
+			token := stale.token
+			stale.mu.Unlock()
+			reached, release := m.pauseAt(token, tc.match)
+			resume := sync.OnceFunc(func() { close(release) })
+			defer resume()
+
+			staleOp := op(t, staleCtx)
+			var staleID string
+			var staleErr error
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				staleID, staleErr = staleOp.rekey(staleCtx, "app-r", nil, nil)
+			}()
+			select {
+			case <-reached:
+			case <-done:
+				t.Fatalf("the stale ReKey did not pause: %v", staleErr)
+			}
+
+			id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+			require.NoError(t, err)
+			require.Equal(t, "app-r.2", id)
+			require.NoError(t, op(t, ctx).addAttribute(ctx, "app-r.2", customAttr("x-tag", "green")))
+
+			resume()
+			<-done
+			require.NoError(t, staleErr)
+			require.Equal(t, "app-r.2", staleID)
+
+			attrs, err := op(t, ctx).getAttributes(ctx, "app-r.2", []kmiplib.AttributeName{"x-tag"})
+			require.NoError(t, err)
+			tags := attrsNamed(attrs, "x-tag")
+			require.Len(t, tags, 2)
+			require.True(t, slices.ContainsFunc(tags, func(a kmiplib.Attribute) bool {
+				return sameValue(customAttr("x-tag", "green"), a)
+			}))
+
+			staleWrites := 0
+			for _, r := range bao.sent(http.MethodPost, "transit/keys/app-r.2/metadata") {
+				if r.token == token {
+					staleWrites++
+				}
+			}
+			require.Equal(t, tc.staleWrites, staleWrites)
+
+			p := m.record("app-r")
+			require.Equal(t, []string{"app-r.2"}, p[linkEntry(kmiplib.LinkTypeReplacementObjectLink)])
+			require.Equal(t, []string{"app-r.2"}, p[entryCurrent])
+			require.NotContains(t, p, entryPending)
+			require.Equal(t, []string{"app-r", "app-r.2"}, m.keys())
+		})
+	}
+}
+
+// Concurrent ReKeys of one key make one replacement, with one instance of
+// each attribute.
+func TestTranslator_RekeyConcurrentSameKey(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+
+	const n = 8
+	calls := make([]*call, n)
+	ctxs := make([]context.Context, n)
+	for i := range n {
+		ctxs[i], _ = newTestSession(t, bao, Config{})
+		calls[i] = op(t, ctxs[i])
+	}
+
+	ids := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			ids[i], errs[i] = calls[i].rekey(ctxs[i], "app-r", nil, nil)
+		})
+	}
+	wg.Wait()
+
+	succeeded := 0
+	for i := range n {
+		if errs[i] != nil {
+			// A ReKey that lost the race fails cleanly and names why. It is
+			// never told the replacement is foreign: following that advice
+			// would delete the key that holds the Name.
+			require.Regexp(t, `ReKey replaced it with "app-r.2"`, errs[i].Error())
+			continue
+		}
+		succeeded++
+		require.Equal(t, "app-r.2", ids[i])
+	}
+	require.Positive(t, succeeded)
+	requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
+	require.Equal(t, []string{"app-r.2"}, m.record("app-r")[entryCurrent])
+	require.Equal(t, []string{"app-r", "app-r.2"}, m.keys())
+}
+
+// Clients that each rekey whatever the Name currently resolves to never
+// move the Name back to an older generation, and every generation links to
+// the next exactly once.
+func TestTranslator_RekeyConcurrentChain(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+
+	var mu sync.Mutex
+	var currents []int
+	m.storage.mu.Lock()
+	m.storage.onPut = func(entry *logical.StorageEntry) {
+		if entry.Key != "metadata/app-r" {
+			return
+		}
+		var record map[string]map[string][]string
+		if err := json.Unmarshal(entry.Value, &record); err != nil {
+			return
+		}
+		if current := record[metadataScope][entryCurrent]; len(current) == 1 {
+			gen, _ := strconv.Atoi(strings.TrimPrefix(current[0], "app-r."))
+			mu.Lock()
+			currents = append(currents, gen)
+			mu.Unlock()
+		}
+	}
+	m.storage.mu.Unlock()
+
+	const clients, rounds = 4, 5
+	calls := make([][]*call, clients)
+	ctxs := make([]context.Context, clients)
+	for i := range clients {
+		ctxs[i], _ = newTestSession(t, bao, Config{})
+		for range 2 * rounds {
+			calls[i] = append(calls[i], op(t, ctxs[i]))
+		}
+	}
+	byName := []kmiplib.Attribute{{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-r"}}}
+
+	var wg sync.WaitGroup
+	for i := range clients {
+		wg.Go(func() {
+			for r := range rounds {
+				ids, err := calls[i][2*r].locate(ctxs[i], byName)
+				if err != nil || len(ids) != 1 {
+					t.Errorf("locate: %v %v", ids, err)
+					return
+				}
+				_, _ = calls[i][2*r+1].rekey(ctxs[i], ids[0], nil, nil)
+			}
+		})
+	}
+	wg.Wait()
+
+	require.NotEmpty(t, currents)
+	require.True(t, slices.IsSorted(currents), "the Name moved back: %v", currents)
+
+	newest := currents[len(currents)-1]
+	require.Equal(t, []string{"app-r." + strconv.Itoa(newest)}, m.record("app-r")[entryCurrent])
+	want := []string{"app-r"}
+	for gen := 2; gen <= newest; gen++ {
+		pred := "app-r"
+		if gen > 2 {
+			pred = "app-r." + strconv.Itoa(gen-1)
+		}
+		requireRekeyed(t, m, "app-r", pred, "app-r."+strconv.Itoa(gen), gen)
+		want = append(want, "app-r."+strconv.Itoa(gen))
+	}
+	slices.Sort(want)
+	require.Equal(t, want, m.keys())
+}
+
+func TestTranslator_LocateByStoredAttribute(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	for name, tag := range map[string]string{"app-a": "blue", "app-b": "red"} {
+		_, err := op(t, ctx).create(ctx, name, kmiplib.CryptographicAlgorithmAES, 256)
+		require.NoError(t, err)
+		require.NoError(t, op(t, ctx).addAttribute(ctx, name, customAttr("x-tag", tag)))
+	}
+	_, err := op(t, ctx).create(ctx, "app-c", kmiplib.CryptographicAlgorithmAES, 256)
+	require.NoError(t, err)
+
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{customAttr("x-tag", "blue")})
+	require.NoError(t, err)
+	require.Equal(t, []string{"app-a"}, ids)
+
+	ids, err = op(t, ctx).locate(ctx, []kmiplib.Attribute{
+		customAttr("x-tag", "red"),
+		{AttributeName: kmiplib.AttributeNameObjectType, AttributeValue: kmiplib.ObjectTypeSymmetricKey},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"app-b"}, ids)
 }

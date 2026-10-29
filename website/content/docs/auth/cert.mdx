@@ -151,7 +151,7 @@ role name, so the first role whose constraints match the client certificate is
 used. Constrain KMIP roles, for example with `allowed_common_names`, so that
 each client certificate matches exactly one role.
 
-Two role parameters only matter to the `kmip` listener, which reads them from
+Three role parameters only matter to the `kmip` listener, which reads them from
 the login token's metadata:
 
 - `kmip_transit_mount` – The transit mount, in this auth mount's namespace,
@@ -160,6 +160,9 @@ the login token's metadata:
 
 - `kmip_key_prefix` – The prefix for the names of keys the client creates or
   registers without a name. Such a key is named the prefix followed by a UUID.
+
+- `kmip_rekey_retain` – How many generations of a key KMIP ReKey keeps
+  readable, the current one included. Defaults to `2`.
 
 ```shell-session
 $ bao write auth/cert/certs/app \

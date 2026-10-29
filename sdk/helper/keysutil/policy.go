@@ -227,6 +227,9 @@ func (kt KeyType) String() string {
 type KeyData struct {
 	Policy       *Policy       `json:"policy"`
 	ArchivedKeys *archivedKeys `json:"archived_keys"`
+	// Metadata is the key's metadata record, absent when the key has none
+	// and in backups taken before metadata existed.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // KeyEntry stores the key and metadata
@@ -525,6 +528,39 @@ func (p *Policy) storeArchive(ctx context.Context, storage logical.Storage, arch
 	}
 
 	return nil
+}
+
+// LoadMetadata returns the key's metadata record, stored beside the policy
+// and the archive, or nil when the key has none. The record is opaque to
+// this package; it is never cached and never loaded with the policy.
+func (p *Policy) LoadMetadata(ctx context.Context, storage logical.Storage) (json.RawMessage, error) {
+	raw, err := storage.Get(ctx, path.Join(p.StoragePrefix, "metadata", p.Name))
+	if err != nil {
+		return nil, err
+	}
+	if raw == nil {
+		return nil, nil
+	}
+	return json.RawMessage(raw.Value), nil
+}
+
+// StoreMetadata writes the key's metadata record. An empty record deletes
+// it. The caller must hold the policy's exclusive lock.
+func (p *Policy) StoreMetadata(ctx context.Context, storage logical.Storage, record json.RawMessage) error {
+	// A caller can hold a policy that a delete finished with while it waited
+	// for the lock. A key created since under the same name has its own
+	// record, which this write would replace.
+	if p.deleted.Load() {
+		return errors.New("key has been deleted, not storing metadata")
+	}
+	key := path.Join(p.StoragePrefix, "metadata", p.Name)
+	if len(record) == 0 {
+		return storage.Delete(ctx, key)
+	}
+	return storage.Put(ctx, &logical.StorageEntry{
+		Key:   key,
+		Value: record,
+	})
 }
 
 // handleArchiving manages the movement of keys to and from the policy archive.
@@ -1985,9 +2021,15 @@ func (p *Policy) Backup(ctx context.Context, storage logical.Storage) (out strin
 		return "", err
 	}
 
+	metadata, err := p.LoadMetadata(ctx, storage)
+	if err != nil {
+		return "", err
+	}
+
 	keyData := &KeyData{
 		Policy:       p,
 		ArchivedKeys: archivedKeys,
+		Metadata:     metadata,
 	}
 
 	encodedBackup, err := jsonutil.EncodeJSON(keyData)

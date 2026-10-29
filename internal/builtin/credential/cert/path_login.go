@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 
 	"github.com/openbao/openbao/sdk/v2/framework"
@@ -183,6 +184,9 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, data *fra
 	}
 	if matched.Entry.KMIPKeyPrefix != "" {
 		metadata["kmip_key_prefix"] = matched.Entry.KMIPKeyPrefix
+	}
+	if matched.Entry.KMIPRekeyRetain != 0 {
+		metadata["kmip_rekey_retain"] = strconv.Itoa(matched.Entry.KMIPRekeyRetain)
 	}
 
 	auth := &logical.Auth{

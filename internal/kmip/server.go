@@ -49,6 +49,9 @@ func NewServer(ln net.Listener, handler http.Handler, cfg Config) (*Server, erro
 	}
 
 	exec := kmipserver.NewBatchExecutor()
+	if dump := dumpMiddleware(t.logger); dump != nil {
+		exec.Use(dump)
+	}
 	for op, h := range routes() {
 		exec.Route(op, h)
 	}

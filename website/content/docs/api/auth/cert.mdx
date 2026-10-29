@@ -87,6 +87,11 @@ Sets a CA cert and associated parameters in a role name.
   is named the prefix followed by a UUID. Must start with a letter, digit, or
   `_`, and contain only letters, digits, `_`, `-`, and `.`. Added to the
   token's metadata as `kmip_key_prefix`. Set to an empty string to clear.
+- `kmip_rekey_retain` `(int: 2)` - How many generations of a key KMIP ReKey
+  keeps readable for [`kmip` listener](../../configuration/listener/kmip.mdx#rekey)
+  clients that authenticate with this role, the current generation included.
+  `1` soft-deletes the predecessor as soon as ReKey replaces it. Must be at
+  least `1`. Added to the token's metadata as `kmip_rekey_retain` when set.
 
 - `display_name` `(string: "")` - The `display_name` to set on tokens issued
   when authenticating against this CA certificate. If not set, defaults to the
@@ -151,6 +156,7 @@ $ curl \
     "required_extensions": "",
     "kmip_transit_mount": "",
     "kmip_key_prefix": "",
+    "kmip_rekey_retain": 2,
     "ttl": 2764800,
     "max_ttl": 2764800,
     "period": 0

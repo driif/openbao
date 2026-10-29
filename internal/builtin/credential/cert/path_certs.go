@@ -211,6 +211,13 @@ in with this certificate create or register without a name. The key is named
 the prefix followed by a UUID.`,
 			},
 
+			"kmip_rekey_retain": {
+				Type: framework.TypeInt,
+				Description: `How many generations of a key KMIP ReKey keeps
+readable, the current one included. Older generations are soft-deleted.
+Must be at least 1. Defaults to 2.`,
+			},
+
 			"policies": {
 				Type:        framework.TypeCommaStringSlice,
 				Description: tokenutil.DeprecationText("token_policies"),
@@ -351,6 +358,7 @@ func (b *backend) pathCertRead(ctx context.Context, req *logical.Request, d *fra
 		"ocsp_query_all_servers":       cert.OcspQueryAllServers,
 		"kmip_transit_mount":           cert.KMIPTransitMount,
 		"kmip_key_prefix":              cert.KMIPKeyPrefix,
+		"kmip_rekey_retain":            cert.kmipRekeyRetain(),
 	}
 	cert.PopulateTokenData(data)
 
@@ -442,6 +450,12 @@ func (b *backend) pathCertWrite(ctx context.Context, req *logical.Request, d *fr
 		cert.KMIPKeyPrefix = kmipKeyPrefixRaw.(string)
 		if cert.KMIPKeyPrefix != "" && !kmipKeyPrefixRegex.MatchString(cert.KMIPKeyPrefix) {
 			return logical.ErrorResponse("kmip_key_prefix must start with a letter, digit or '_' and contain only letters, digits, '_', '-' and '.'"), nil
+		}
+	}
+	if kmipRekeyRetainRaw, ok := d.GetOk("kmip_rekey_retain"); ok {
+		cert.KMIPRekeyRetain = kmipRekeyRetainRaw.(int)
+		if cert.KMIPRekeyRetain < 1 {
+			return logical.ErrorResponse("kmip_rekey_retain must be at least 1"), nil
 		}
 	}
 
@@ -570,6 +584,18 @@ type CertEntry struct {
 
 	KMIPTransitMount string
 	KMIPKeyPrefix    string
+	// KMIPRekeyRetain is zero until set, which means the default.
+	KMIPRekeyRetain int
+}
+
+// defaultKMIPRekeyRetain keeps the current generation and one predecessor.
+const defaultKMIPRekeyRetain = 2
+
+func (cert *CertEntry) kmipRekeyRetain() int {
+	if cert.KMIPRekeyRetain == 0 {
+		return defaultKMIPRekeyRetain
+	}
+	return cert.KMIPRekeyRetain
 }
 
 // kmipKeyPrefixRegex keeps prefix plus UUID a valid transit key name.

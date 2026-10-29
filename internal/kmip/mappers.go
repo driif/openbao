@@ -82,6 +82,42 @@ type keyInfo struct {
 	SoftDeleted          bool                       `json:"soft_deleted"`
 	KeySize              int                        `json:"key_size"`
 	Keys                 map[string]json.RawMessage `json:"keys"`
+
+	// Metadata is the key's metadata record, which transit includes in the
+	// read when it is not empty: scope, then entry, then values.
+	Metadata map[string]map[string][]string `json:"metadata"`
+}
+
+// entry returns the values of an entry in the kmip scope. ReKey's markers
+// live there too, and none of them is an attribute.
+func (k *keyInfo) entry(name string) []string {
+	return k.Metadata[metadataScope][name]
+}
+
+// single returns the value of a single-valued entry in the kmip scope.
+func (k *keyInfo) single(name string) string {
+	if values := k.entry(name); len(values) == 1 {
+		return values[0]
+	}
+	return ""
+}
+
+// replacement returns the UID of the object that ReKey replaced this one
+// with, if any.
+func (k *keyInfo) replacement() string {
+	return k.single(linkEntry(kmiplib.LinkTypeReplacementObjectLink))
+}
+
+// kmipName returns the object's Name: the UID of its first generation. An
+// object ReKey replaced has handed its Name on and has none.
+func (k *keyInfo) kmipName(uid string) (string, bool) {
+	if k.replacement() != "" {
+		return "", false
+	}
+	if anchor := k.single(entryAnchor); anchor != "" {
+		return anchor, true
+	}
+	return uid, true
 }
 
 // kmipAttrs returns the KMIP algorithm, length and object type of the key.
@@ -118,10 +154,11 @@ func (k *keyInfo) kmipAttrs() (kmiplib.CryptographicAlgorithm, int32, kmiplib.Ob
 	)
 }
 
-// state reports a soft-deleted key as Deactivated; every other key is
-// Active from the moment transit creates it.
+// state reports a soft-deleted key, and a key ReKey replaced, as
+// Deactivated; every other key is Active from the moment transit creates
+// it. A replaced key keeps its material until retention soft-deletes it.
 func (k *keyInfo) state() kmiplib.State {
-	if k.SoftDeleted {
+	if k.SoftDeleted || k.replacement() != "" {
 		return kmiplib.StateDeactivated
 	}
 	return kmiplib.StateActive

@@ -224,9 +224,18 @@ func (c *call) try(ctx context.Context, r request) (*reply, error) {
 	return c.s.send(ctx, r)
 }
 
+// generationSuffix matches the UIDs ReKey gives later generations of a Name.
+var generationSuffix = regexp.MustCompile(`\.[0-9]+$`)
+
 // keyName returns the client's Name, or for a nameless object the role's
 // kmip_key_prefix followed by a UUID.
 func (c *call) keyName(ctx context.Context, name string) (string, error) {
+	if generationSuffix.MatchString(name) {
+		return "", kmipserver.Errorf(
+			kmiplib.ResultReasonInvalidField,
+			"invalid Name %q: a Name ending in '.' and digits is reserved for the replacements ReKey creates", name,
+		)
+	}
 	if name == "" {
 		prefix, err := c.s.prefix(ctx)
 		if err != nil {
@@ -257,6 +266,15 @@ func keyRead(name string) request {
 
 // readKey reads keys/<uid>. A missing key is Item Not Found.
 func (c *call) readKey(ctx context.Context, uid string) (*keyInfo, error) {
+	info, err := c.lookupKey(ctx, uid)
+	if err == nil && info == nil {
+		return nil, errNotFound(uid)
+	}
+	return info, err
+}
+
+// lookupKey reads keys/<uid>, returning nil for a missing key.
+func (c *call) lookupKey(ctx context.Context, uid string) (*keyInfo, error) {
 	if err := checkName(uid); err != nil {
 		return nil, err
 	}
@@ -267,7 +285,7 @@ func (c *call) readKey(ctx context.Context, uid string) (*keyInfo, error) {
 	}
 	switch {
 	case rep.status == http.StatusNotFound:
-		return nil, errNotFound(uid)
+		return nil, nil
 	case !rep.ok():
 		return nil, rep.failure()
 	}
@@ -288,18 +306,9 @@ func (c *call) create(ctx context.Context, name string, alg kmiplib.Cryptographi
 		return "", err
 	}
 
-	// Get hands out key material, which transit only exports from keys
-	// created exportable.
-	body := map[string]any{"type": keyType, "exportable": true}
-	if keySize > 0 {
-		body["key_size"] = keySize
-	}
-	rep, err := c.do(ctx, request{method: http.MethodPost, path: "keys/" + name, capability: "update", body: body})
+	rep, err := c.createKey(ctx, name, keyType, keySize)
 	if err != nil {
 		return "", err
-	}
-	if !rep.ok() {
-		return "", rep.failure()
 	}
 
 	// Transit answers a write to an existing key with that key and a
@@ -310,6 +319,25 @@ func (c *call) create(ctx context.Context, name string, alg kmiplib.Cryptographi
 		}
 	}
 	return name, nil
+}
+
+// createKey posts keys/<name>. Get hands out key material, which transit
+// only exports from keys created exportable.
+func (c *call) createKey(ctx context.Context, name, keyType string, keySize int) (*reply, error) {
+	body := map[string]any{"type": keyType, "exportable": true}
+	if keySize > 0 {
+		body["key_size"] = keySize
+	}
+	rep, err := c.do(ctx, request{method: http.MethodPost, path: "keys/" + name, capability: "update", body: body})
+	if err != nil {
+		return nil, err
+	}
+	if !rep.ok() {
+		// The reply comes back with the error so a caller can tell a
+		// refusal from a failure that may hide an applied create.
+		return rep, rep.failure()
+	}
+	return rep, nil
 }
 
 // register imports key material: raw bytes for symmetric keys, PKCS#8 DER
@@ -447,64 +475,18 @@ func errNotExportable(uid string) error {
 	)
 }
 
-func (c *call) getAttributes(ctx context.Context, uid string, names []kmiplib.AttributeName) ([]kmiplib.Attribute, error) {
-	info, err := c.readKey(ctx, uid)
-	if err != nil {
-		return nil, err
-	}
-	alg, bitlen, objType, err := info.kmipAttrs()
-	if err != nil {
-		return nil, err
-	}
-
-	attrs := []kmiplib.Attribute{
-		{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: uid, NameType: kmiplib.NameTypeUninterpretedTextString}},
-		{AttributeName: kmiplib.AttributeNameUniqueIdentifier, AttributeValue: uid},
-		{AttributeName: kmiplib.AttributeNameObjectType, AttributeValue: objType},
-		{AttributeName: kmiplib.AttributeNameCryptographicAlgorithm, AttributeValue: alg},
-		{AttributeName: kmiplib.AttributeNameCryptographicLength, AttributeValue: bitlen},
-		{AttributeName: kmiplib.AttributeNameState, AttributeValue: info.state()},
-	}
-
-	// InitialDate/ActivationDate come from the first key version, not the latest
-	// rotation → fall back to MinDecryptionVersion if version 1 was archived.
-	created, ok := info.createdAt(1)
-	if !ok {
-		created, ok = info.createdAt(info.MinDecryptionVersion)
-	}
-	if ok {
-		attrs = append(
-			attrs,
-			kmiplib.Attribute{AttributeName: kmiplib.AttributeNameInitialDate, AttributeValue: created},
-			// State=Active is only consistent with an ActivationDate set → supply it.
-			kmiplib.Attribute{AttributeName: kmiplib.AttributeNameActivationDate, AttributeValue: created},
-		)
-	}
-
-	if len(names) == 0 {
-		return attrs, nil
-	}
-
-	filtered := make([]kmiplib.Attribute, 0, len(names))
-	for _, want := range names {
-		for _, attr := range attrs {
-			if attr.AttributeName == want {
-				filtered = append(filtered, attr)
-				break
-			}
-		}
-	}
-	return filtered, nil
-}
-
-// locateFilter holds the Locate attributes step 1 understood; any other
-// attribute is rejected.
+// locateFilter holds a Locate request's attributes. An exact Name or
+// UniqueIdentifier selects one object by reading it; the attributes derived
+// from the transit key are compared with it; every other attribute must
+// equal one of the object's instances.
 type locateFilter struct {
 	name    string
+	uid     string
 	objType kmiplib.ObjectType
 	alg     kmiplib.CryptographicAlgorithm
 	bitlen  int32
 	state   kmiplib.State
+	attrs   []kmiplib.Attribute
 	// empty is set when the filter contradicts itself, so nothing matches.
 	empty bool
 }
@@ -518,14 +500,14 @@ func parseLocateFilter(attrs []kmiplib.Attribute) (*locateFilter, error) {
 			if !ok || n.NameValue == "" {
 				return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "Name attribute is empty or invalid")
 			}
-			f.setName(n.NameValue)
+			f.setOnce(&f.name, n.NameValue)
 		case kmiplib.AttributeNameUniqueIdentifier:
 			// UniqueIdentifier is the key name in transit.
 			id, ok := attr.AttributeValue.(string)
 			if !ok || id == "" {
 				return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "UniqueIdentifier attribute is empty or invalid")
 			}
-			f.setName(id)
+			f.setOnce(&f.uid, id)
 		case kmiplib.AttributeNameObjectType:
 			ot, ok := attr.AttributeValue.(kmiplib.ObjectType)
 			if !ok {
@@ -542,25 +524,25 @@ func parseLocateFilter(attrs []kmiplib.Attribute) (*locateFilter, error) {
 		case kmiplib.AttributeNameState:
 			f.state, _ = attr.AttributeValue.(kmiplib.State)
 		default:
-			return nil, kmipserver.Errorf(
-				kmiplib.ResultReasonOperationNotSupported,
-				"Locate filter %s is not supported", attr.AttributeName,
-			)
+			if attr.AttributeValue == nil {
+				return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "Locate filter %s has no value", attr.AttributeName)
+			}
+			f.attrs = append(f.attrs, attr)
 		}
 	}
 	return f, nil
 }
 
-func (f *locateFilter) setName(name string) {
-	if f.name != "" && f.name != name {
+func (f *locateFilter) setOnce(field *string, value string) {
+	if *field != "" && *field != value {
 		f.empty = true
 	}
-	f.name = name
+	*field = value
 }
 
 // matches reports whether a key passes the filter. Keys with no KMIP
 // representation never match, since no other operation could use them.
-func (f *locateFilter) matches(info *keyInfo) bool {
+func (f *locateFilter) matches(uid string, info *keyInfo) bool {
 	alg, bitlen, objType, err := info.kmipAttrs()
 	switch {
 	case err != nil:
@@ -574,24 +556,77 @@ func (f *locateFilter) matches(info *keyInfo) bool {
 	case f.bitlen != 0 && bitlen != f.bitlen:
 		return false
 	}
+	if f.name != "" {
+		if name, ok := info.kmipName(uid); !ok || name != f.name {
+			return false
+		}
+	}
+	if len(f.attrs) == 0 {
+		return true
+	}
+
+	attrs, err := objectAttrs(uid, info)
+	if err != nil {
+		return false
+	}
+	for _, want := range f.attrs {
+		if !containsAttr(attrs, want) {
+			return false
+		}
+	}
 	return true
 }
 
-// matchReply applies the filter to a key read. A key the client may not
-// read, or that is gone, is no match; any other failure fails the Locate.
-func (f *locateFilter) matchReply(rep *reply) (bool, error) {
+// candidate decodes a Locate read. A key the client may not read, or that
+// is gone, is nil; any other failure fails the Locate.
+func candidate(rep *reply) (*keyInfo, error) {
 	switch {
 	case rep.status == http.StatusForbidden, rep.status == http.StatusNotFound:
-		return false, nil
+		return nil, nil
 	case !rep.ok():
-		return false, rep.failure()
+		return nil, rep.failure()
 	}
 
 	var info keyInfo
 	if err := rep.decode(&info); err != nil {
-		return false, err
+		return nil, err
 	}
-	return f.matches(&info), nil
+	return &info, nil
+}
+
+// locateOne reads the object an exact UID or Name selects. A Name is the
+// UID of its anchor, whose record names the current generation, so a Name
+// costs two reads at most however often it was rekeyed.
+func (c *call) locateOne(ctx context.Context, f *locateFilter) (string, *keyInfo, error) {
+	uid := f.uid
+	if uid == "" {
+		uid = f.name
+	}
+	if checkName(uid) != nil {
+		return "", nil, nil
+	}
+	rep, err := c.do(ctx, keyRead(uid))
+	if err != nil {
+		return "", nil, err
+	}
+	info, err := candidate(rep)
+	if err != nil || info == nil || f.uid != "" {
+		return uid, info, err
+	}
+
+	current := info.single(entryCurrent)
+	if current == "" || current == uid || checkName(current) != nil {
+		return uid, info, nil
+	}
+	// The first read succeeded with this token, so a 403 here is a denial,
+	// not an expired token: send once, as Locate's other reads do, rather
+	// than revoke the token and log in again.
+	rep, err = c.try(ctx, keyRead(current))
+	if err != nil {
+		return "", nil, err
+	}
+	info, err = candidate(rep)
+	return current, info, err
 }
 
 // locate returns every key matching attrs that the client may read.
@@ -601,21 +636,14 @@ func (c *call) locate(ctx context.Context, attrs []kmiplib.Attribute) ([]string,
 		return nil, err
 	}
 
-	// An exact Name or UID costs one read and no list, so a policy without
+	// An exact Name or UID reads and does not list, so a policy without
 	// list on keys still locates the keys it names.
-	if f.name != "" {
-		if checkName(f.name) != nil {
-			return nil, nil
-		}
-		rep, err := c.do(ctx, keyRead(f.name))
-		if err != nil {
+	if f.uid != "" || f.name != "" {
+		uid, info, err := c.locateOne(ctx, f)
+		if err != nil || info == nil || !f.matches(uid, info) {
 			return nil, err
 		}
-		ok, err := f.matchReply(rep)
-		if err != nil || !ok {
-			return nil, err
-		}
-		return []string{f.name}, nil
+		return []string{uid}, nil
 	}
 
 	rep, err := c.do(ctx, request{method: "LIST", path: "keys", capability: "list"})
@@ -645,11 +673,11 @@ func (c *call) locate(ctx context.Context, attrs []kmiplib.Attribute) ([]string,
 		if err != nil {
 			return nil, err
 		}
-		ok, err := f.matchReply(rep)
+		info, err := candidate(rep)
 		if err != nil {
 			return nil, err
 		}
-		if ok {
+		if info != nil && f.matches(name, info) {
 			ids = append(ids, name)
 		}
 	}
@@ -695,6 +723,42 @@ func (c *call) revoke(ctx context.Context, uid string) error {
 func (c *call) destroy(ctx context.Context, uid string) error {
 	if err := checkName(uid); err != nil {
 		return err
+	}
+
+	// After a ReKey, the first generation of a Name holds the record that
+	// resolves the Name to its current object. Deleting the key deletes that
+	// record: Locate by Name then finds nothing, the next ReKey cannot
+	// commit, and a Create may reuse the Name while a later generation still
+	// holds it. Refuse while a later generation is current. The check reads
+	// keys/<uid>; a role that may delete but not read skips it rather than
+	// meet a new requirement.
+	read, err := c.do(ctx, keyRead(uid))
+	if err != nil {
+		return err
+	}
+	if read.ok() {
+		var info keyInfo
+		if err := read.decode(&info); err != nil {
+			return err
+		}
+		if current := info.single(entryCurrent); current != "" && current != uid {
+			// Nothing clears current when the generation it names is
+			// destroyed. Refuse only while that generation still exists:
+			// with it gone the Name has no object left to lose, and refusing
+			// would keep the anchor forever. A read of it that is denied
+			// fails the Destroy rather than guess.
+			live, err := c.lookupKey(ctx, current)
+			if err != nil {
+				return err
+			}
+			if live != nil {
+				return kmipserver.Errorf(
+					kmiplib.ResultReasonPermissionDenied,
+					"wrong key lifecycle state: %q holds the Name that %q now carries; destroying it would lose that Name",
+					uid, current,
+				)
+			}
+		}
 	}
 
 	rep, err := c.do(ctx, request{method: http.MethodDelete, path: "keys/" + uid, capability: "delete"})

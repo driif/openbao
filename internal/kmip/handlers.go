@@ -14,19 +14,22 @@ import (
 
 func routes() map[kmiplib.Operation]kmipserver.OperationHandler {
 	return map[kmiplib.Operation]kmipserver.OperationHandler{
-		kmiplib.OperationRegister:        kmipserver.HandleFunc(handleRegister),
-		kmiplib.OperationCreate:          kmipserver.HandleFunc(handleCreate),
-		kmiplib.OperationGet:             kmipserver.HandleFunc(handleGet),
-		kmiplib.OperationGetAttributes:   kmipserver.HandleFunc(handleGetAttributes),
-		kmiplib.OperationLocate:          kmipserver.HandleFunc(handleLocate),
-		kmiplib.OperationActivate:        kmipserver.HandleFunc(handleActivate),
-		kmiplib.OperationRevoke:          kmipserver.HandleFunc(handleRevoke),
-		kmiplib.OperationDestroy:         kmipserver.HandleFunc(handleDestroy),
-		kmiplib.OperationQuery:           kmipserver.HandleFunc(handleQuery),
-		kmiplib.OperationEncrypt:         kmipserver.HandleFunc(handleEncrypt),
-		kmiplib.OperationDecrypt:         kmipserver.HandleFunc(handleDecrypt),
-		kmiplib.OperationSign:            kmipserver.HandleFunc(handleSign),
-		kmiplib.OperationSignatureVerify: kmipserver.HandleFunc(handleVerify),
+		kmiplib.OperationRegister:         kmipserver.HandleFunc(handleRegister),
+		kmiplib.OperationCreate:           kmipserver.HandleFunc(handleCreate),
+		kmiplib.OperationGet:              kmipserver.HandleFunc(handleGet),
+		kmiplib.OperationGetAttributes:    kmipserver.HandleFunc(handleGetAttributes),
+		kmiplib.OperationGetAttributeList: kmipserver.HandleFunc(handleGetAttributeList),
+		kmiplib.OperationAddAttribute:     kmipserver.HandleFunc(handleAddAttribute),
+		kmiplib.OperationReKey:            kmipserver.HandleFunc(handleRekey),
+		kmiplib.OperationLocate:           kmipserver.HandleFunc(handleLocate),
+		kmiplib.OperationActivate:         kmipserver.HandleFunc(handleActivate),
+		kmiplib.OperationRevoke:           kmipserver.HandleFunc(handleRevoke),
+		kmiplib.OperationDestroy:          kmipserver.HandleFunc(handleDestroy),
+		kmiplib.OperationQuery:            kmipserver.HandleFunc(handleQuery),
+		kmiplib.OperationEncrypt:          kmipserver.HandleFunc(handleEncrypt),
+		kmiplib.OperationDecrypt:          kmipserver.HandleFunc(handleDecrypt),
+		kmiplib.OperationSign:             kmipserver.HandleFunc(handleSign),
+		kmiplib.OperationSignatureVerify:  kmipserver.HandleFunc(handleVerify),
 	}
 }
 
@@ -244,6 +247,88 @@ func handleGetAttributes(ctx context.Context, req *payloads.GetAttributesRequest
 		UniqueIdentifier: uid,
 		Attribute:        attrs,
 	}, nil
+}
+
+// handleGetAttributeList returns the names of every attribute the object has.
+func handleGetAttributeList(ctx context.Context, req *payloads.GetAttributeListRequestPayload) (*payloads.GetAttributeListResponsePayload, error) {
+	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
+	if err != nil {
+		return nil, kmipserver.Errorf(
+			kmiplib.ResultReasonInvalidField,
+			"UniqueIdentifier omitted and ID Placeholder is empty",
+		)
+	}
+
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names, err := c.getAttributeList(ctx, uid)
+	if err != nil {
+		return nil, mapError(err)
+	}
+
+	return &payloads.GetAttributeListResponsePayload{
+		UniqueIdentifier: uid,
+		AttributeName:    names,
+	}, nil
+}
+
+// handleAddAttribute adds one attribute instance to an object. The attributes
+// derived from the transit key cannot be added, and Name only as the
+// object's Name already.
+func handleAddAttribute(ctx context.Context, req *payloads.AddAttributeRequestPayload) (*payloads.AddAttributeResponsePayload, error) {
+	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
+	if err != nil {
+		return nil, kmipserver.Errorf(
+			kmiplib.ResultReasonInvalidField,
+			"UniqueIdentifier omitted and ID Placeholder is empty",
+		)
+	}
+
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	attr := req.Attribute
+	attr.AttributeIndex = nil
+	idx, err := c.addAttributeAt(ctx, uid, attr)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	// KMIP lets a response omit the Attribute Index only when it is 0.
+	if idx > 0 {
+		attr.AttributeIndex = &idx
+	}
+
+	return &payloads.AddAttributeResponsePayload{
+		UniqueIdentifier: uid,
+		Attribute:        attr,
+	}, nil
+}
+
+// handleRekey replaces a symmetric key with a new object that takes over its
+// Name, and makes the replacement the ID Placeholder.
+func handleRekey(ctx context.Context, req *payloads.RekeyRequestPayload) (*payloads.RekeyResponsePayload, error) {
+	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
+	if err != nil {
+		return nil, kmipserver.Errorf(
+			kmiplib.ResultReasonInvalidField,
+			"UniqueIdentifier omitted and ID Placeholder is empty",
+		)
+	}
+
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id, err := c.rekey(ctx, uid, req.Offset, req.TemplateAttribute)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	kmipserver.SetIdPlaceholder(ctx, id)
+
+	return &payloads.RekeyResponsePayload{UniqueIdentifier: id}, nil
 }
 
 // handleActivate - This operation requests the server to activate a Managed Cryptographic Object.

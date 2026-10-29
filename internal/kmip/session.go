@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/x509"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,10 @@ const (
 
 	// revokeTimeout bounds the token revocation when a connection closes.
 	revokeTimeout = 5 * time.Second
+
+	// defaultRekeyRetain is the cert role's kmip_rekey_retain when unset:
+	// the current generation and one predecessor stay readable.
+	defaultRekeyRetain = 2
 )
 
 type sessionKey struct{}
@@ -44,6 +49,7 @@ type session struct {
 	refresh   time.Time // when to replace the token; zero with expiry
 	mount     string
 	keyPrefix string
+	retain    int
 	certRole  string
 }
 
@@ -91,6 +97,17 @@ func (s *session) prefix(ctx context.Context) (string, error) {
 	return s.keyPrefix, nil
 }
 
+// rekeyRetain returns the kmip_rekey_retain of the client's cert role.
+func (s *session) rekeyRetain(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.ensureLocked(ctx); err != nil {
+		return 0, err
+	}
+	return s.retain, nil
+}
+
 func (s *session) ensureLocked(ctx context.Context) error {
 	if s.token != "" && (s.refresh.IsZero() || time.Now().Before(s.refresh)) {
 		return nil
@@ -107,8 +124,9 @@ func (s *session) revocableLocked() bool {
 
 // loginLocked logs in through the listener's cert auth mount without a role
 // name, so cert auth picks the role whose constraints match the client
-// certificate. The role's kmip_transit_mount and kmip_key_prefix arrive in
-// the token's metadata. A token it replaces is revoked first.
+// certificate. The role's kmip_transit_mount, kmip_key_prefix and
+// kmip_rekey_retain arrive in the token's metadata. A token it replaces is
+// revoked first.
 func (s *session) loginLocked(ctx context.Context) error {
 	if s.revocableLocked() {
 		s.revoke(ctx, s.token)
@@ -145,6 +163,11 @@ func (s *session) loginLocked(ctx context.Context) error {
 	s.mount = strings.Trim(auth.Metadata["kmip_transit_mount"], "/")
 	if s.mount == "" {
 		s.mount = s.t.defaultMount
+	}
+	// Cert auth only sets kmip_rekey_retain to 1 or more.
+	s.retain = defaultRekeyRetain
+	if retain, err := strconv.Atoi(auth.Metadata["kmip_rekey_retain"]); err == nil && retain >= 1 {
+		s.retain = retain
 	}
 	return nil
 }

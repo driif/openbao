@@ -174,6 +174,70 @@ func TestCert_KMIPRoleFields(t *testing.T) {
 	})
 }
 
+func TestCert_KMIPRekeyRetain(t *testing.T) {
+	ca := &certyaml.Certificate{
+		Subject: "cn=ca",
+	}
+
+	cert := &certyaml.Certificate{
+		Subject:         "cn=example.com",
+		SubjectAltNames: []string{"DNS:example.com", "IP:127.0.0.1"},
+		Issuer:          ca,
+	}
+
+	connState, err := testConnState(cert, ca)
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
+
+	logicaltest.Test(t, logicaltest.TestCase{
+		CredentialBackend: testFactory(t),
+		Steps: []logicaltest.TestStep{
+			// Unset reads as the default and stays out of the token.
+			testAccStepCert(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 2}),
+			testAccStepLoginKMIPRekeyRetain(t, connState, ""),
+
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false, map[string]any{
+				"kmip_rekey_retain": 1,
+			}),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 1}),
+			testAccStepLoginKMIPRekeyRetain(t, connState, "1"),
+
+			// An update that leaves the field out keeps it.
+			testAccStepCert(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 1}),
+
+			// A value below 1 is rejected.
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, true, map[string]any{
+				"kmip_rekey_retain": 0,
+			}),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 1}),
+		},
+	})
+}
+
+// testAccStepLoginKMIPRekeyRetain logs in without a role name and checks
+// kmip_rekey_retain in the token metadata. An empty value must be absent.
+func testAccStepLoginKMIPRekeyRetain(t *testing.T, connState tls.ConnectionState, retain string) logicaltest.TestStep {
+	return logicaltest.TestStep{
+		Operation:       logical.UpdateOperation,
+		Path:            "login",
+		Unauthenticated: true,
+		ConnState:       &connState,
+		Check: func(resp *logical.Response) error {
+			got, ok := resp.Auth.Metadata["kmip_rekey_retain"]
+			if retain == "" && ok {
+				return fmt.Errorf("expected no kmip_rekey_retain in login metadata, got %q", got)
+			}
+			if got != retain {
+				return fmt.Errorf("expected kmip_rekey_retain %q in login metadata, got %q", retain, got)
+			}
+			return nil
+		},
+	}
+}
+
 // testAccStepLoginKMIPMetadata logs in without a role name, as a kmip
 // listener does, and checks the KMIP routing in the token metadata. An empty
 // value must be absent.

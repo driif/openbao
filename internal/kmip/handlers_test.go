@@ -11,8 +11,12 @@ import (
 )
 
 func TestRoutesMatchSupportedOps(t *testing.T) {
-	registered := map[kmiplib.Operation]bool{}
+	// kmip-go's router answers DiscoverVersions without a route.
+	registered := map[kmiplib.Operation]bool{kmiplib.OperationDiscoverVersions: true}
 	for op := range routes() {
+		if registered[op] {
+			t.Errorf("%s has a route, but the router answers it", ttlv.EnumStr(op))
+		}
 		registered[op] = true
 	}
 

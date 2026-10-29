@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 
 	"github.com/openbao/openbao/sdk/v2/framework"
@@ -176,6 +177,17 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, data *fra
 	// Add metadata from allowed_metadata_extensions when present,
 	// with sanitized oids (dash-separated instead of dot-separated) as keys.
 	maps.Copy(metadata, b.certificateExtensionsMetadata(clientCerts[0], matched))
+
+	// A kmip listener reads its routing for this client from the token.
+	if matched.Entry.KMIPTransitMount != "" {
+		metadata["kmip_transit_mount"] = matched.Entry.KMIPTransitMount
+	}
+	if matched.Entry.KMIPKeyPrefix != "" {
+		metadata["kmip_key_prefix"] = matched.Entry.KMIPKeyPrefix
+	}
+	if matched.Entry.KMIPRekeyRetain != 0 {
+		metadata["kmip_rekey_retain"] = strconv.Itoa(matched.Entry.KMIPRekeyRetain)
+	}
 
 	auth := &logical.Auth{
 		InternalData: map[string]any{

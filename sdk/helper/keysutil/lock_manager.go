@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"sync"
 	"time"
 
@@ -145,6 +146,11 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 		return err
 	}
 
+	// The metadata record describes the key it was backed up from, including
+	// its relations to other keys by name. Under a new name it would describe
+	// the wrong key, so a rename restores without it.
+	renamed := name != "" && name != keyData.Policy.Name
+
 	// Set a different name if desired
 	if name != "" {
 		keyData.Policy.Name = name
@@ -229,6 +235,21 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 	// Update the cache to contain the restored policy
 	if lm.useCache {
 		lm.cache.Store(name, keyData.Policy)
+	}
+
+	// Restore the metadata record last, once the policy is in place: a
+	// backup that Persist rejects then leaves the existing record alone. It
+	// follows the cache update on purpose: if this write fails, the cache and
+	// storage still agree on the key material, and only the record is
+	// missing. Do not wrap the restore in a transaction while the cache is
+	// updated here, before a commit: a rollback would leave the cache serving
+	// a key that storage no longer holds. A backup without a record leaves
+	// storage as it is, so a backup taken before metadata existed restores
+	// unchanged, and a restore under a new name writes nothing either.
+	if len(keyData.Metadata) > 0 && !renamed {
+		if err := keyData.Policy.StoreMetadata(ctx, storage, keyData.Metadata); err != nil {
+			return fmt.Errorf("failed to restore metadata for key %q: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -570,6 +591,11 @@ func (lm *LockManager) DeletePolicy(ctx context.Context, storage logical.Storage
 	err = storage.Delete(ctx, "archive/"+name)
 	if err != nil {
 		return fmt.Errorf("error deleting key %q archive: %w", name, err)
+	}
+
+	err = storage.Delete(ctx, path.Join(p.StoragePrefix, "metadata", name))
+	if err != nil {
+		return fmt.Errorf("error deleting key %q metadata: %w", name, err)
 	}
 
 	return nil

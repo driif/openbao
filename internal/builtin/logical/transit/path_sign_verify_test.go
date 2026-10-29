@@ -335,7 +335,7 @@ func testTransit_SignVerify_ECDSA(t *testing.T, bits int) {
 	verifyRequest(req, true, "", v1sig)
 }
 
-func validatePublicKey(t *testing.T, in string, sig string, pubKeyRaw []byte, expectValid bool, postpath string, b *backend) {
+func validatePublicKey(t *testing.T, in string, sig string, pubKeyRaw []byte, expectValid bool, postpath string, b *backend, storage logical.Storage) {
 	t.Helper()
 	input, _ := base64.StdEncoding.DecodeString(in)
 	splitSig := strings.Split(sig, ":")
@@ -351,6 +351,7 @@ func validatePublicKey(t *testing.T, in string, sig string, pubKeyRaw []byte, ex
 	keyReadReq := &logical.Request{
 		Operation: logical.ReadOperation,
 		Path:      "keys/" + postpath,
+		Storage:   storage,
 	}
 	keyReadResp, err := b.HandleRequest(t.Context(), keyReadReq)
 	if err != nil {
@@ -549,7 +550,7 @@ func TestTransit_SignVerify_ED25519(t *testing.T) {
 					continue
 				}
 				if pubKeyRaw, ok := req.Data["public_key"]; ok {
-					validatePublicKey(t, batchRequestItems[i]["input"], sig[i], pubKeyRaw.([]byte), outcome[i].keyValid, postpath, b)
+					validatePublicKey(t, batchRequestItems[i]["input"], sig[i], pubKeyRaw.([]byte), outcome[i].keyValid, postpath, b, storage)
 				}
 				if v.Reference != outcome[i].reference {
 					t.Fatalf("verification failed, mismatched references %s vs %s", v.Reference, outcome[i].reference)
@@ -572,7 +573,7 @@ func TestTransit_SignVerify_ED25519(t *testing.T) {
 		}
 
 		if pubKeyRaw, ok := req.Data["public_key"]; ok {
-			validatePublicKey(t, req.Data["input"].(string), sig[0], pubKeyRaw.([]byte), outcome[0].keyValid, postpath, b)
+			validatePublicKey(t, req.Data["input"].(string), sig[0], pubKeyRaw.([]byte), outcome[0].keyValid, postpath, b, storage)
 		}
 	}
 

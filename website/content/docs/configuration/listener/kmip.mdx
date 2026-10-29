@@ -1,0 +1,463 @@
+---
+sidebar_label: KMIP
+description: |-
+  The KMIP listener configures OpenBao to serve the KMIP protocol on the
+  specified TCP address and port, backed by a transit secrets engine.
+---
+
+# `kmip` listener
+
+The KMIP listener serves the OASIS Key Management Interoperability Protocol
+(KMIP 1.x) on a TCP address/port. KMIP clients authenticate with TLS client
+certificates through a [cert auth method][cert-auth] mount, and their
+operations act on keys in a [transit secrets engine][transit] mount.
+
+```hcl
+listener "kmip" {
+  address            = "127.0.0.1:5696"
+  tls_cert_file      = "/etc/openbao/kmip.crt"
+  tls_key_file       = "/etc/openbao/kmip.key"
+  tls_client_ca_file = "/etc/openbao/kmip-clients-ca.pem"
+  auth_mount         = "auth/cert"
+}
+```
+
+The listener does not serve the HTTP API. Each KMIP operation runs as one or
+more ordinary OpenBao requests against the transit mount, made with the
+client's token, certificate, and address. ACL policies, namespaces, audit
+devices, resource quotas, and request forwarding from standby nodes therefore
+apply to KMIP clients exactly as they do to HTTP clients.
+
+KMIP listeners are not started in [recovery mode][recovery-mode]. When OpenBao
+shuts down, it closes KMIP connections first so that their tokens are revoked.
+
+:::info
+
+This listener makes OpenBao a KMIP server. It is unrelated to the
+[KMIP seal][kmip-seal], where OpenBao is a client of an external KMIP server.
+
+:::
+
+## `kmip` listener parameters
+
+- `address` `(string: "127.0.0.1:5696")` – Specifies the address to bind to
+  for KMIP connections. Port 5696 is the registered KMIP port. Like the `tcp`
+  listener's `address`, this can be a
+  [go-sockaddr template](https://pkg.go.dev/github.com/hashicorp/go-sockaddr/template).
+
+- `auth_mount` `(string: <required>)` – The cert auth mount that clients log
+  in through, including its namespace: `auth/cert` in the root namespace, or
+  `ns1/auth/cert` for the mount `auth/cert` in the namespace `ns1`. Everything
+  before the first `auth` segment is taken as the namespace, so the namespace
+  path cannot contain a segment named `auth`. The transit mounts this listener
+  uses are in the same namespace.
+
+- `default_transit_mount` `(string: "")` – The transit mount, in the auth
+  mount's namespace, used by clients whose cert role sets no
+  `kmip_transit_mount`. If neither is set, the client's operations fail.
+
+- `tls_cert_file` `(string: <required>, reloads-on-SIGHUP)` – The PEM-encoded
+  server certificate. Behaves as on the [`tcp` listener][tcp-params].
+
+- `tls_key_file` `(string: <required>, reloads-on-SIGHUP)` – The PEM-encoded
+  private key for the certificate. Behaves as on the [`tcp` listener][tcp-params].
+
+- `tls_client_ca_file` `(string: <required>)` – PEM-encoded CA file used to
+  verify client certificates during the TLS handshake. The listener always
+  requires and verifies a client certificate, whatever
+  `tls_require_and_verify_client_cert` is set to. Cert auth checks the
+  certificate again against its roles when the client logs in.
+
+The following [`tcp` listener parameters][tcp-params] also apply, with the same
+meaning:
+
+- `tls_auto_reload` and `tls_auto_reload_interval`
+- `tls_min_version`, `tls_max_version`, `tls_cipher_suites`, and
+  `tls_key_exchange_preferences`
+- `proxy_protocol_behavior` and `proxy_protocol_authorized_addrs`
+- `max_request_duration`, which bounds each OpenBao request a KMIP operation
+  makes
+
+A `kmip` listener rejects `tls_disable`, `tls_disable_client_certs`,
+`cluster_address`, and every `tls_acme_*` parameter. Parameters that only
+concern HTTP, such as the `http_*` timeouts, `x_forwarded_for_*`,
+`custom_response_headers`, and the `telemetry` and `profiling` stanzas, have no
+use on a `kmip` listener; leave them unset. `auth_mount` and
+`default_transit_mount` are rejected on other listener types.
+
+## Authentication
+
+A KMIP client authenticates with its TLS client certificate:
+
+1. The TLS handshake verifies the certificate against `tls_client_ca_file`.
+
+1. On the connection's first operation that needs OpenBao, the listener logs in
+   through `<auth_mount>/login` without a role name, so cert auth uses the
+   first role whose constraints match the certificate. Constrain KMIP roles,
+   for example with `allowed_common_names`, so that each client certificate
+   matches exactly one role.
+
+1. The role's `kmip_transit_mount`, or else the listener's
+   `default_transit_mount`, names the transit mount the client works on. The
+   role's `kmip_key_prefix` names the keys the client creates or registers
+   without a name, and its `kmip_rekey_retain` bounds how many generations
+   ReKey keeps readable. See the [cert role parameters][cert-role].
+
+The token never leaves OpenBao and lives as long as the connection. When it is
+a few seconds from expiring, the next operation logs in again. When the
+connection closes, the listener revokes a service token; a batch token simply
+expires. Cert auth checks the certificate against the role, including CRLs and
+OCSP where configured, at every login, so the role's `token_ttl` bounds how
+long an open connection keeps working after its certificate is revoked or its
+role changes.
+
+OpenBao answers an expired token and a policy denial with the same error. When
+a request is denied, the listener therefore logs in again and retries the
+request once, so a denied operation is audited twice, with a new login in
+between.
+
+The listener answers Query and DiscoverVersions itself, without logging in.
+
+## Keys and operations
+
+A KMIP managed object is a transit key plus the `kmip` scope of the key's
+[metadata record][transit-key-metadata]. The transit key holds the material,
+type, versions, and lifecycle; the record holds what transit cannot: stored
+attributes, Link attributes, and the object's Name across ReKey.
+
+A key's KMIP Unique Identifier is its transit key name. Create and Register use
+the request's Name attribute as the key name. Without one, the key is named
+`<kmip_key_prefix><uuid>`. Key names may only contain letters, digits, `_`,
+`-`, and `.`. A Name that ends in `.` and digits, such as `app.2`, is refused:
+those names are reserved for the replacements ReKey creates.
+
+The listener supports Create, Register, Get, GetAttributes, GetAttributeList,
+AddAttribute, ReKey, Locate, Activate, Revoke, Destroy, Encrypt, Decrypt, Sign,
+SignatureVerify, Query, and DiscoverVersions, with these key types:
+
+| KMIP algorithm                | Length                         | Transit key type                         |
+| :---------------------------- | :----------------------------- | :--------------------------------------- |
+| AES                           | 128, 256                       | `aes128-gcm96`, `aes256-gcm96`           |
+| ChaCha20, ChaCha20Poly1305    | 256                            | `chacha20-poly1305`                      |
+| HMAC-SHA1 through HMAC-SHA512 | 256 to 4096, a multiple of 8   | `hmac`                                   |
+| RSA                           | 2048, 3072, 4096               | `rsa-2048`, `rsa-3072`, `rsa-4096`       |
+| ECDSA, EC                     | 256, 384, 521                  | `ecdsa-p256`, `ecdsa-p384`, `ecdsa-p521` |
+
+- Register takes a SymmetricKey in Raw format or a PrivateKey in PKCS#8 DER
+  format. The listener wraps the material with the mount's wrapping key and
+  imports it.
+- Get returns the material of the key's latest version: a Raw SymmetricKey for
+  AES, ChaCha20, and HMAC keys, and a PKCS#8 PrivateKey for RSA and ECDSA keys.
+- Transit keys are Active from creation, so Activate succeeds on any key that is
+  not revoked. Revoke soft-deletes the key, which KMIP reports as Deactivated;
+  Get and Activate then fail. Destroy deletes the key.
+- Encrypt, Decrypt, Sign, and SignatureVerify are single-part only and accept
+  no Cryptographic Parameters, IV, or additional authenticated data. Encrypt
+  returns transit's ciphertext string (`vault:v1:...`), which Decrypt takes
+  back. Sign signs the SHA-256 digest of the data with the key's default
+  transit signature algorithm and returns transit's signature string, which
+  SignatureVerify takes back.
+- Locate by exact Name or Unique Identifier reads the key and does not list.
+  Any other filter lists the mount and reads every key, one read per key, plus
+  the comparison of each filter attribute with the key's attributes. There is
+  no attribute index, so the cost grows with the number of keys in the mount.
+
+### Attributes
+
+Attributes fall in three classes:
+
+- **Derived** from the transit key: Unique Identifier, Object Type,
+  Cryptographic Algorithm, Cryptographic Length, State, and Initial Date.
+  AddAttribute refuses them with Permission Denied.
+- **Honoured**: Name. An object's Name is the Unique Identifier of its first
+  generation and moves to the replacement on ReKey. AddAttribute with the
+  object's current Name succeeds and changes nothing; any other Name fails with
+  Invalid Field, because renaming is not supported.
+- **Stored**: every other attribute, standard or custom (`x-` and `y-`). The
+  listener keeps each instance verbatim, returns it from GetAttributes and
+  GetAttributeList, and matches it in Locate. A stored attribute changes
+  nothing else. In particular, a stored Cryptographic Usage Mask does not
+  restrict Encrypt, Decrypt, Sign, or SignatureVerify, and a stored
+  Deactivation Date does not change State. Activation Date is the key's
+  creation time unless the client stored one.
+
+Single-instance attributes, such as Cryptographic Usage Mask and the dates,
+take one value: a second AddAttribute with a different value fails. The record
+is limited to 64 KiB, 128 entries, and 8 KiB per value; an AddAttribute over a
+limit fails with Invalid Field.
+
+### ReKey
+
+ReKey replaces a symmetric key with a new transit key, the next generation of
+its Name. The first generation of a Name is its anchor, with the Unique
+Identifier `<name>`; later generations are `<name>.2`, `<name>.3`, and so on.
+The anchor's record names the current generation, so Locate by exact Name
+costs two reads however often the Name was rekeyed.
+
+- The replacement gets the Name, the stored attributes, including Activation
+  Date and Deactivation Date, and a Link of type Replaced Object to the
+  predecessor. Template attributes in the request replace copied ones.
+- The predecessor gets a Link of type Replacement Object, loses its Name, and
+  reports State Deactivated. It is not soft-deleted, so Get still returns its
+  material until retention removes it.
+- ReKey sets the ID Placeholder to the replacement.
+- ReKey refuses an Offset, a key it already replaced, a soft-deleted key, and a
+  template that changes the Name, algorithm, length, or object type, or that
+  carries any other derived attribute, even one equal to the key's own.
+
+The cert role's `kmip_rekey_retain`, default `2`, is the number of generations
+that stay readable, the current one included: `2` keeps one predecessor, `1`
+keeps none. After the replacement holds the Name, ReKey soft-deletes older
+generations, oldest first. The anchor keeps its metadata record when its
+material goes, so the Name still resolves. This sweep is best effort: when a
+soft-delete fails, typically because the policy grants no `delete` on
+`<mount>/keys/<name>/soft-delete`, ReKey still succeeds, the server logs a
+warning that names the path and the capability, and the next ReKey of the Name
+tries again.
+
+ReKey commits when it claims the Name for the replacement in the anchor's
+record, expecting the predecessor. Two concurrent ReKeys of one Name therefore
+cannot both win, and the Name never moves back to an older generation. Every
+other step is safe to repeat, so a client that retries an interrupted ReKey
+completes it:
+
+- Before it creates the replacement, ReKey records it as `pending_successor`
+  in the predecessor's record, and clears the marker once the replacement's
+  record is written. A retry that finds the replacement without a record
+  adopts it only while the marker names it.
+- The replacement's record is written once. A retry or a concurrent ReKey
+  that finds it keeps it, so attributes added to the replacement since stay.
+- A retry that finds the Name already moved past the replacement links the
+  predecessor to the replacement and leaves the Name where it is.
+- A concurrent ReKey of the same key that finds the replacement before its
+  record is written reads both keys again, then adopts or resumes it.
+- Any other existing key with the replacement's name fails the ReKey, and the
+  error names that key. Retry the ReKey; if the error repeats, rename or
+  delete that key.
+- One race remains: an operator who creates exactly that key between the
+  marker write and the create gets it adopted as the replacement.
+
+## Permissions
+
+Permissions are plain transit ACL policies, attached to the client's cert role.
+With `<mount>` the transit mount, the operations need:
+
+| Operation               | Method   | Path                                     | Capability                                  |
+| :---------------------- | :------- | :--------------------------------------- | :------------------------------------------ |
+| Create                  | `POST`   | `<mount>/keys/<name>`                    | `update`                                    |
+| Register                | `GET`    | `<mount>/wrapping_key`                   | `read`                                      |
+|                         | `POST`   | `<mount>/keys/<name>/import`             | `update`                                    |
+| Get                     | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+|                         | `GET`    | `<mount>/export/<type>/<name>/<version>` | `read`                                      |
+| GetAttributes           | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+| GetAttributeList        | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+| AddAttribute            | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+|                         | `GET`    | `<mount>/keys/<predecessor>`             | `read` (a `<name>.<n>` without a record)    |
+|                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update`                                    |
+| ReKey                   | `GET`    | `<mount>/keys/<name>`                    | `read` (the key, replacement and anchor)    |
+|                         | `POST`   | `<mount>/keys/<name>`                    | `update` (the replacement)                  |
+|                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update` (key, replacement, and anchor)     |
+|                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (retention, best effort)           |
+| Activate                | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+| Locate                  | `GET`    | `<mount>/keys/<name>`                    | `read` (with an exact Name or UID)          |
+|                         | `GET`    | `<mount>/keys/<name>.<n>`                | `read` (exact Name, after a ReKey)          |
+|                         | `LIST`   | `<mount>/keys`                           | `list` (otherwise), then `read` on each key |
+| Revoke                  | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete`                                    |
+| Destroy                 | `GET`    | `<mount>/keys/<name>`                    | `read` (anchor check, skipped if denied)    |
+|                         | `GET`    | `<mount>/keys/<name>.<n>`                | `read` (anchor of a rekeyed Name only)      |
+|                         | `DELETE` | `<mount>/keys/<name>`                    | `delete`                                    |
+| Encrypt                 | `POST`   | `<mount>/encrypt/<name>`                 | `update`                                    |
+| Decrypt                 | `POST`   | `<mount>/decrypt/<name>`                 | `update`                                    |
+| Sign                    | `POST`   | `<mount>/sign/<name>`                    | `update`                                    |
+| SignatureVerify         | `POST`   | `<mount>/verify/<name>`                  | `update`                                    |
+| Query, DiscoverVersions | –        | answered by the listener                 | –                                           |
+
+Get exports through `encryption-key` for AES and ChaCha20 keys, `hmac-key` for
+HMAC keys, and `signing-key` for RSA and ECDSA keys.
+
+When writing a policy, keep in mind:
+
+- **Revoke and Destroy use different paths.** Revoke deletes
+  `<mount>/keys/<name>/soft-delete` and Destroy deletes `<mount>/keys/<name>`.
+  A client that may do both needs `delete` on both paths, or on a glob such as
+  `<mount>/keys/app-*` that covers both. Destroy also needs the key's
+  `deletion_allowed` set, which KMIP never sets; an operator sets it with
+  [`<mount>/keys/<name>/config`][transit-key-config].
+
+- **Grant `update`, not `create`, on `<mount>/encrypt/*`.** Transit's encrypt
+  endpoint creates a missing key for a caller that holds `create`, so that
+  grant would let Encrypt create keys outside Create.
+
+- **The export grant is the only guard on key material.** Create and Register
+  make keys with `exportable=true` so Get can return their material, and
+  transit cannot undo that. Leave out `read` on `<mount>/export/*` for clients
+  that only need cryptographic operations.
+
+- **ReKey needs a glob.** ReKey works on the key, its replacement
+  `<name>.<n>`, and the Name's anchor, including their `/metadata` and
+  `/soft-delete` paths. Grant them with a glob such as `<mount>/keys/app-*`;
+  an exact grant on `<mount>/keys/<name>` is not enough. Without `delete` on
+  `/soft-delete`, ReKey succeeds but old generations stay readable.
+
+- **Locate by Name needs the same glob once the Name was rekeyed.** It reads
+  the anchor `<name>`, then the current generation `<name>.<n>`. A role with
+  only an exact grant on `<mount>/keys/<name>` gets an empty result, not an
+  error, because a denied Locate read counts as no match.
+
+- **Destroy keeps a rekeyed Name.** Destroy refuses the first generation of
+  a Name while the generation the Name points at still exists, because that
+  key holds the record that resolves the Name. Destroy the later generations
+  first; the first generation can then be destroyed. The check reads the key
+  and, for a rekeyed Name, the generation it points at. A role that may
+  delete the key but not read it skips the check; one that may read the key
+  but not that generation fails the Destroy. Both reads use the usual retry,
+  so a denied read costs a login, which keeps an expired token from skipping
+  the check.
+
+- **Restoring an older backup rolls a rekeyed Name back.** A transit restore
+  under the key's own name brings back the key's metadata record as it was
+  when the backup was taken, including the anchor's `current` and the
+  Replaced and Replacement Object Links. If the Name was rekeyed after the
+  backup, Locate then returns a superseded generation and the next ReKey
+  fails. After such a restore, set the anchor's `current` back to the newest
+  generation with `<mount>/keys/<anchor>/metadata`. A restore under a new
+  name restores the key without its record and makes it an object of its own.
+
+- **Locate without an exact Name or UID reads every key.** It lists the mount
+  and reads each key, skipping those the client may not read. Each read is
+  audited and counts against quotas, so on large mounts prefer locating by
+  name.
+
+- **The policy applies beyond KMIP.** The same certificate can usually also log
+  in to the cert auth mount through an HTTP listener and receive a token with
+  the same policies, so grant only what the KMIP operations need. A glob such as
+  `<mount>/keys/app-*` also matches paths the listener never calls, such as
+  `<mount>/keys/app-1/config` and `<mount>/keys/app-1/rotate`.
+
+When a request is denied, the KMIP error names the path and the capability the
+policy is missing.
+
+## `kmip` listener examples
+
+### Serving KMIP from the root namespace
+
+This example serves KMIP on all IPv4 interfaces. Clients log in through
+`auth/cert`, and clients whose role names no transit mount use `transit`.
+
+```hcl
+listener "kmip" {
+  address               = "0.0.0.0:5696"
+  tls_cert_file         = "/etc/openbao/kmip.crt"
+  tls_key_file          = "/etc/openbao/kmip.key"
+  tls_client_ca_file    = "/etc/openbao/kmip-clients-ca.pem"
+  auth_mount            = "auth/cert"
+  default_transit_mount = "transit"
+}
+```
+
+The following policy, `kmip-app`, lets a client use every operation on keys
+named `app-*` in the `transit` mount:
+
+```hcl
+# Create, Get, GetAttributes, GetAttributeList, Activate, Locate with a name,
+# and Destroy use transit/keys/<name>; Register uses
+# transit/keys/<name>/import; AddAttribute and ReKey use
+# transit/keys/<name>/metadata; Revoke and ReKey's retention use
+# transit/keys/<name>/soft-delete. The glob covers all of them, and the
+# replacements ReKey names <name>.2, <name>.3, and so on.
+path "transit/keys/app-*" {
+  capabilities = ["read", "update", "delete"]
+}
+
+# Locate without a name.
+path "transit/keys" {
+  capabilities = ["list"]
+}
+
+# Register.
+path "transit/wrapping_key" {
+  capabilities = ["read"]
+}
+
+# Get. Leave this out to keep key material inside OpenBao.
+path "transit/export/+/app-*" {
+  capabilities = ["read"]
+}
+
+# Encrypt, Decrypt, Sign, and SignatureVerify. Grant update, not create.
+path "transit/encrypt/app-*" {
+  capabilities = ["update"]
+}
+
+path "transit/decrypt/app-*" {
+  capabilities = ["update"]
+}
+
+path "transit/sign/app-*" {
+  capabilities = ["update"]
+}
+
+path "transit/verify/app-*" {
+  capabilities = ["update"]
+}
+```
+
+Enable the mounts, write the policy, and create a cert role for the client.
+`kmip_key_prefix=app-` makes keys created without a name fall under the
+policy's `app-*` paths.
+
+```shell-session
+$ bao secrets enable transit
+$ bao auth enable cert
+$ bao policy write kmip-app kmip-app.hcl
+$ bao write auth/cert/certs/app \
+    certificate=@kmip-clients-ca.pem \
+    allowed_common_names=app.example.com \
+    token_policies=kmip-app \
+    token_ttl=1h \
+    kmip_transit_mount=transit \
+    kmip_key_prefix=app-
+```
+
+### Serving KMIP from a namespace
+
+To serve a namespace, include it in `auth_mount`. The transit mounts named by
+the cert roles and by `default_transit_mount` are in the same namespace.
+
+```hcl
+listener "kmip" {
+  address            = "0.0.0.0:5696"
+  tls_cert_file      = "/etc/openbao/kmip.crt"
+  tls_key_file       = "/etc/openbao/kmip.key"
+  tls_client_ca_file = "/etc/openbao/kmip-clients-ca.pem"
+  auth_mount         = "ns1/auth/cert"
+}
+```
+
+Create the mounts, policy, and role in `ns1`. Policy paths are relative to the
+namespace, so the `kmip-app` policy above works unchanged.
+
+```shell-session
+$ bao namespace create ns1
+$ bao secrets enable -namespace=ns1 transit
+$ bao auth enable -namespace=ns1 cert
+$ bao policy write -namespace=ns1 kmip-app kmip-app.hcl
+$ bao write -namespace=ns1 auth/cert/certs/app \
+    certificate=@kmip-clients-ca.pem \
+    allowed_common_names=app.example.com \
+    token_policies=kmip-app \
+    kmip_transit_mount=transit \
+    kmip_key_prefix=app-
+```
+
+A listener serves a single namespace. To serve several, configure one `kmip`
+listener per namespace, each on its own address.
+
+[cert-auth]: ../../auth/cert.mdx
+[cert-role]: ../../api/auth/cert.mdx#create-ca-certificate-role
+[transit]: ../../secrets/transit/index.mdx
+[transit-key-config]: ../../api/secret/transit.mdx#update-key-configuration
+[transit-key-metadata]: ../../api/secret/transit.mdx#read-key-metadata
+[recovery-mode]: ../../concepts/recovery-mode.mdx
+[kmip-seal]: ../seal/kmip.mdx
+[tcp-params]: tcp.mdx#tcp-listener-parameters

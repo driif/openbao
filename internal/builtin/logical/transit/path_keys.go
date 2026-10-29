@@ -382,7 +382,19 @@ func (b *backend) pathPolicyRead(ctx context.Context, req *logical.Request, d *f
 		}
 	}
 
-	return b.formatKeyPolicy(p, context)
+	resp, err := b.formatKeyPolicy(p, context)
+	if err != nil {
+		return nil, err
+	}
+
+	record, err := loadMetadataRecord(ctx, req.Storage, p)
+	if err != nil {
+		return nil, err
+	}
+	if len(record) > 0 {
+		resp.Data["metadata"] = record
+	}
+	return resp, nil
 }
 
 func (b *backend) formatKeyPolicy(p *keysutil.Policy, context []byte) (*logical.Response, error) {

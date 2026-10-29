@@ -122,6 +122,150 @@ func TestCert_RoleResolveWithoutProvidingCertName(t *testing.T) {
 	})
 }
 
+func TestCert_KMIPRoleFields(t *testing.T) {
+	ca := &certyaml.Certificate{
+		Subject: "cn=ca",
+	}
+
+	cert := &certyaml.Certificate{
+		Subject:         "cn=example.com",
+		SubjectAltNames: []string{"DNS:example.com", "IP:127.0.0.1"},
+		Issuer:          ca,
+	}
+
+	connState, err := testConnState(cert, ca)
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
+
+	unset := map[string]any{"kmip_transit_mount": "", "kmip_key_prefix": ""}
+	set := map[string]any{"kmip_transit_mount": "transit", "kmip_key_prefix": "app-"}
+
+	logicaltest.Test(t, logicaltest.TestCase{
+		CredentialBackend: testFactory(t),
+		Steps: []logicaltest.TestStep{
+			// A role written without the fields has none and logs in without them.
+			testAccStepCert(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false),
+			testAccStepReadCertPolicy(t, "web", false, unset),
+			testAccStepLoginKMIPMetadata(t, connState, "", ""),
+
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false, map[string]any{
+				"kmip_transit_mount": "/transit/",
+				"kmip_key_prefix":    "app-",
+			}),
+			testAccStepReadCertPolicy(t, "web", false, set),
+			testAccStepLoginKMIPMetadata(t, connState, "transit", "app-"),
+
+			// An update that leaves the fields out keeps them.
+			testAccStepCert(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false),
+			testAccStepReadCertPolicy(t, "web", false, set),
+
+			// Empty values clear them.
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false, unset),
+			testAccStepReadCertPolicy(t, "web", false, unset),
+			testAccStepLoginKMIPMetadata(t, connState, "", ""),
+
+			// A prefix that cannot start a transit key name is rejected.
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, true, map[string]any{
+				"kmip_key_prefix": "../",
+			}),
+			testAccStepReadCertPolicy(t, "web", false, unset),
+		},
+	})
+}
+
+func TestCert_KMIPRekeyRetain(t *testing.T) {
+	ca := &certyaml.Certificate{
+		Subject: "cn=ca",
+	}
+
+	cert := &certyaml.Certificate{
+		Subject:         "cn=example.com",
+		SubjectAltNames: []string{"DNS:example.com", "IP:127.0.0.1"},
+		Issuer:          ca,
+	}
+
+	connState, err := testConnState(cert, ca)
+	if err != nil {
+		t.Fatalf("error testing connection state: %v", err)
+	}
+
+	logicaltest.Test(t, logicaltest.TestCase{
+		CredentialBackend: testFactory(t),
+		Steps: []logicaltest.TestStep{
+			// Unset reads as the default and stays out of the token.
+			testAccStepCert(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 2}),
+			testAccStepLoginKMIPRekeyRetain(t, connState, ""),
+
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false, map[string]any{
+				"kmip_rekey_retain": 1,
+			}),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 1}),
+			testAccStepLoginKMIPRekeyRetain(t, connState, "1"),
+
+			// An update that leaves the field out keeps it.
+			testAccStepCert(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 1}),
+
+			// A value below 1 is rejected.
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, true, map[string]any{
+				"kmip_rekey_retain": 0,
+			}),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 1}),
+		},
+	})
+}
+
+// testAccStepLoginKMIPRekeyRetain logs in without a role name and checks
+// kmip_rekey_retain in the token metadata. An empty value must be absent.
+func testAccStepLoginKMIPRekeyRetain(t *testing.T, connState tls.ConnectionState, retain string) logicaltest.TestStep {
+	return logicaltest.TestStep{
+		Operation:       logical.UpdateOperation,
+		Path:            "login",
+		Unauthenticated: true,
+		ConnState:       &connState,
+		Check: func(resp *logical.Response) error {
+			got, ok := resp.Auth.Metadata["kmip_rekey_retain"]
+			if retain == "" && ok {
+				return fmt.Errorf("expected no kmip_rekey_retain in login metadata, got %q", got)
+			}
+			if got != retain {
+				return fmt.Errorf("expected kmip_rekey_retain %q in login metadata, got %q", retain, got)
+			}
+			return nil
+		},
+	}
+}
+
+// testAccStepLoginKMIPMetadata logs in without a role name, as a kmip
+// listener does, and checks the KMIP routing in the token metadata. An empty
+// value must be absent.
+func testAccStepLoginKMIPMetadata(t *testing.T, connState tls.ConnectionState, transitMount, keyPrefix string) logicaltest.TestStep {
+	return logicaltest.TestStep{
+		Operation:       logical.UpdateOperation,
+		Path:            "login",
+		Unauthenticated: true,
+		ConnState:       &connState,
+		Check: func(resp *logical.Response) error {
+			want := map[string]string{
+				"kmip_transit_mount": transitMount,
+				"kmip_key_prefix":    keyPrefix,
+			}
+			for key, value := range want {
+				got, ok := resp.Auth.Metadata[key]
+				if value == "" && ok {
+					return fmt.Errorf("expected no %s in login metadata, got %q", key, got)
+				}
+				if got != value {
+					return fmt.Errorf("expected %s %q in login metadata, got %q", key, value, got)
+				}
+			}
+			return nil
+		},
+	}
+}
+
 func testAccStepResolveRoleWithEmptyDataMap(t *testing.T, connState tls.ConnectionState, certName string) logicaltest.TestStep {
 	return logicaltest.TestStep{
 		Operation:       logical.UpdateOperation,

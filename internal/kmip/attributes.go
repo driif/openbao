@@ -6,11 +6,16 @@ package kmip
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/rand"
 	"net/http"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	kmiplib "github.com/ovh/kmip-go"
 	"github.com/ovh/kmip-go/kmipserver"
@@ -40,7 +45,7 @@ const (
 	entryLinkPrefix = "link/"
 )
 
-// metadataOp is one operation of a transit metadata write.
+// metadataOp is one change to the adapter's metadata record.
 type metadataOp struct {
 	Op       string `json:"op"`
 	Scope    string `json:"scope"`
@@ -84,28 +89,202 @@ func attrEntry(name kmiplib.AttributeName) string {
 	return entryAttrPrefix + string(name)
 }
 
-// writeMetadata applies ops to the metadata record of uid, all or none, and
-// returns the record afterwards.
-func (c *call) writeMetadata(ctx context.Context, uid string, ops ...metadataOp) (*reply, error) {
-	rep, err := c.do(ctx, request{
-		method:     http.MethodPost,
-		path:       "keys/" + uid + "/metadata",
-		capability: "update",
-		body:       map[string]any{"operations": ops},
-	})
-	if err != nil {
-		return nil, err
-	}
-	if !rep.ok() {
-		return rep, rep.failure()
-	}
-	return rep, nil
+// metadataRecord holds scopes, entries and their values inside the adapter.
+type metadataRecord map[string]map[string][]string
+
+var errClaimHeld = errors.New("metadata claim is held")
+
+func metadataRead(uid string) request {
+	return request{method: http.MethodGet, path: "keys/" + uid + "/metadata", capability: "read"}
 }
 
-// claimLost reports whether a metadata write failed because a claim found
-// its entry held by another value.
-func claimLost(rep *reply) bool {
-	return rep != nil && rep.status == http.StatusBadRequest && strings.Contains(rep.message(), "is held by")
+func decodeMetadata(data map[string]string) (metadataRecord, error) {
+	record := metadataRecord{}
+	for key, value := range data {
+		entry, ok := strings.CutPrefix(key, metadataScope+"/")
+		if !ok {
+			continue
+		}
+		var values []string
+		if err := json.Unmarshal([]byte(value), &values); err != nil || values == nil {
+			return nil, kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "metadata key %q must hold a JSON string array", key)
+		}
+		if record[metadataScope] == nil {
+			record[metadataScope] = map[string][]string{}
+		}
+		record[metadataScope][entry] = values
+	}
+	return record, nil
+}
+
+func (r metadataRecord) set(scope, entry string, values []string) {
+	if len(values) > 0 {
+		if r[scope] == nil {
+			r[scope] = map[string][]string{}
+		}
+		r[scope][entry] = values
+		return
+	}
+	delete(r[scope], entry)
+	if len(r[scope]) == 0 {
+		delete(r, scope)
+	}
+}
+
+func (r metadataRecord) apply(op metadataOp) error {
+	if op.Scope == "" || op.Entry == "" {
+		return fmt.Errorf("%q needs a scope and an entry", op.Op)
+	}
+	values := r[op.Scope][op.Entry]
+	switch op.Op {
+	case "add":
+		r.set(op.Scope, op.Entry, append(values, op.Value))
+	case "delete":
+		r.set(op.Scope, op.Entry, nil)
+	case "claim":
+		switch {
+		case len(values) == 0,
+			len(values) == 1 && values[0] == op.Value,
+			len(values) == 1 && op.Expected != "" && values[0] == op.Expected:
+			r.set(op.Scope, op.Entry, []string{op.Value})
+		default:
+			return fmt.Errorf("entry %q in scope %q is held by %q: %w", op.Entry, op.Scope, strings.Join(values, ","), errClaimHeld)
+		}
+	case "link":
+		if !keyNameRegex.MatchString(op.Value) {
+			return fmt.Errorf("link value %q is not a key name", op.Value)
+		}
+		r.set(op.Scope, op.Entry, []string{op.Value})
+	default:
+		return fmt.Errorf("unknown op %q: use add, delete, claim or link", op.Op)
+	}
+	return nil
+}
+
+func (c *call) loadMetadata(ctx context.Context, uid string, info *keyInfo, optional bool) (bool, error) {
+	var rep *reply
+	var err error
+	if optional {
+		rep, err = c.try(ctx, metadataRead(uid))
+	} else {
+		rep, err = c.do(ctx, metadataRead(uid))
+	}
+	if err != nil {
+		return false, err
+	}
+	if optional && (rep.status == http.StatusForbidden || rep.status == http.StatusNotFound) {
+		return false, nil
+	}
+	if !rep.ok() {
+		return false, rep.failure()
+	}
+	var stored struct {
+		Data map[string]string `json:"custom_metadata"`
+	}
+	if err := rep.decode(&stored); err != nil {
+		return false, err
+	}
+	info.Metadata, err = decodeMetadata(stored.Data)
+	if err != nil && optional {
+		// The map is plain strings that any client with update may write, so
+		// one malformed kmip/ value is possible. An optional read treats that
+		// key like one it may not see: a Locate scan skips it rather than fail
+		// for every key on the mount.
+		c.s.t.logger.Warn("KMIP skipped a key whose metadata does not decode", "key", uid, "error", err)
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// writeMetadata applies ops with a version check. A concurrent writer makes
+// the adapter read and apply again, preserving unrelated custom metadata.
+// Bounds on writeMetadata's retries after a lost check-and-set.
+const (
+	metadataWriteAttempts = 8
+	metadataBackoffBase   = 2 * time.Millisecond
+	metadataBackoffMax    = 100 * time.Millisecond
+)
+
+func (c *call) writeMetadata(ctx context.Context, uid string, ops ...metadataOp) (*reply, error) {
+	for attempt := range metadataWriteAttempts {
+		rep, err := c.do(ctx, metadataRead(uid))
+		if err != nil {
+			return nil, err
+		}
+		if !rep.ok() {
+			return rep, rep.failure()
+		}
+		var stored struct {
+			Version uint64            `json:"version"`
+			Data    map[string]string `json:"custom_metadata"`
+		}
+		if err := rep.decode(&stored); err != nil {
+			return nil, err
+		}
+		record, err := decodeMetadata(stored.Data)
+		if err != nil {
+			return nil, err
+		}
+		for _, op := range ops {
+			if err := record.apply(op); err != nil {
+				return nil, err
+			}
+		}
+		data := stored.Data
+		if data == nil {
+			data = map[string]string{}
+		}
+		for key := range data {
+			if strings.HasPrefix(key, metadataScope+"/") {
+				delete(data, key)
+			}
+		}
+		for entry, values := range record[metadataScope] {
+			encoded, err := json.Marshal(values)
+			if err != nil {
+				return nil, err
+			}
+			data[metadataScope+"/"+entry] = string(encoded)
+		}
+		rep, err = c.do(ctx, request{
+			method: http.MethodPost, path: "keys/" + uid + "/metadata", capability: "update",
+			body: map[string]any{"custom_metadata": data, "cas": stored.Version},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if rep.status == http.StatusBadRequest && strings.Contains(rep.message(), "check-and-set parameter did not match the current version") {
+			if attempt < metadataWriteAttempts-1 {
+				if err := metadataBackoff(ctx, attempt); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if !rep.ok() {
+			return rep, rep.failure()
+		}
+		// Keep the decoded record from this successful attempt for the
+		// assigned attribute index and retention sweep.
+		rep.metadata = record
+		return rep, nil
+	}
+	return nil, kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "metadata record kept changing; retry")
+}
+
+// metadataBackoff waits before writeMetadata retries a write that lost a
+// check-and-set race. Writers that collided and retry at once collide again,
+// so each waits a random time up to a cap that doubles per attempt.
+func metadataBackoff(ctx context.Context, attempt int) error {
+	ceiling := min(metadataBackoffBase<<attempt, metadataBackoffMax)
+	timer := time.NewTimer(time.Duration(rand.Int63n(int64(ceiling))) + 1)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // rekeyLinks are the Link types ReKey writes. GetAttributes reports them
@@ -304,7 +483,7 @@ func (k *keyInfo) storedEntries() map[string][]string {
 }
 
 func (c *call) getAttributes(ctx context.Context, uid string, names []kmiplib.AttributeName) ([]kmiplib.Attribute, error) {
-	info, err := c.readKey(ctx, uid)
+	info, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +510,7 @@ func (c *call) getAttributes(ctx context.Context, uid string, names []kmiplib.At
 }
 
 func (c *call) getAttributeList(ctx context.Context, uid string) ([]kmiplib.AttributeName, error) {
-	info, err := c.readKey(ctx, uid)
+	info, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +552,7 @@ func (c *call) addAttributeAt(ctx context.Context, uid string, attr kmiplib.Attr
 		)
 	}
 
-	info, err := c.readKey(ctx, uid)
+	info, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return 0, err
 	}
@@ -405,7 +584,7 @@ func (c *call) addAttributeAt(ctx context.Context, uid string, attr kmiplib.Attr
 		op = claimOp(entry, op.Value, "")
 	}
 	rep, err := c.writeMetadata(ctx, uid, op)
-	if claimLost(rep) {
+	if errors.Is(err, errClaimHeld) {
 		return 0, kmipserver.Errorf(
 			kmiplib.ResultReasonInvalidField,
 			"object %q already has a %s, which takes one value", uid, attr.AttributeName,
@@ -417,10 +596,7 @@ func (c *call) addAttributeAt(ctx context.Context, uid string, attr kmiplib.Attr
 
 	// The write returns the record it stored, so this is the index this
 	// write assigned, whatever other writers do after it.
-	var after keyInfo
-	if err := rep.decode(&after); err != nil {
-		return 0, err
-	}
+	after := keyInfo{Metadata: rep.metadata}
 	return after.lastIndex(attr.AttributeName), nil
 }
 
@@ -453,7 +629,8 @@ func (c *call) pendingSuccessor(ctx context.Context, uid string) (bool, error) {
 	if err != nil || info == nil {
 		return false, err
 	}
-	return info.single(entryPending) == uid, nil
+	visible, err := c.loadMetadata(ctx, pred, info, true)
+	return visible && info.single(entryPending) == uid, err
 }
 
 // lastIndex returns the Attribute Index that GetAttributes gives the newest

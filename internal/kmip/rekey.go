@@ -5,6 +5,7 @@ package kmip
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"net/http"
 	"slices"
@@ -51,7 +52,7 @@ func (c *call) rekey(ctx context.Context, uid string, offset *time.Duration, tem
 		return "", kmipserver.Errorf(kmiplib.ResultReasonFeatureNotSupported, "ReKey with an Offset is not supported")
 	}
 
-	pred, err := c.readKey(ctx, uid)
+	pred, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return "", err
 	}
@@ -89,7 +90,7 @@ func (c *call) rekey(ctx context.Context, uid string, offset *time.Duration, tem
 	}
 
 	marked := pred.single(entryPending) == succ
-	existing, err := c.lookupKey(ctx, succ)
+	existing, err := c.lookupKeyMetadata(ctx, succ)
 	if err != nil {
 		return "", err
 	}
@@ -98,12 +99,12 @@ func (c *call) rekey(ctx context.Context, uid string, offset *time.Duration, tem
 		// one read P. It writes the marker before the create and clears it
 		// only after S's record, so read P and then S again before calling
 		// S foreign: one of the two then shows S as that ReKey's.
-		fresh, err := c.readKey(ctx, uid)
+		fresh, err := c.readKeyMetadata(ctx, uid)
 		if err != nil {
 			return "", err
 		}
 		if marked = fresh.single(entryPending) == succ; !marked {
-			if existing, err = c.lookupKey(ctx, succ); err != nil {
+			if existing, err = c.lookupKeyMetadata(ctx, succ); err != nil {
 				return "", err
 			}
 		}
@@ -166,7 +167,7 @@ func (c *call) rekey(ctx context.Context, uid string, offset *time.Duration, tem
 	committed, err := c.writeMetadata(ctx, anchor, claimOp(entryCurrent, succ, uid))
 	switch {
 	case err == nil:
-	case claimLost(committed):
+	case errors.Is(err, errClaimHeld):
 		moved, readErr := c.movedPast(ctx, anchor, gen+1)
 		if readErr != nil {
 			return "", readErr
@@ -174,7 +175,7 @@ func (c *call) rekey(ctx context.Context, uid string, offset *time.Duration, tem
 		if !moved {
 			return "", kmipserver.Errorf(
 				kmiplib.ResultReasonPermissionDenied,
-				"wrong key lifecycle state: object %q is no longer the current object of the Name %q: %s", uid, anchor, committed.message(),
+				"wrong key lifecycle state: object %q is no longer the current object of the Name %q: %s", uid, anchor, err,
 			)
 		}
 		// An earlier attempt committed and stopped before the link, and a
@@ -231,7 +232,7 @@ func (c *call) repairSweptLink(ctx context.Context, uid string, pred *keyInfo) (
 	if err != nil {
 		return "", err
 	}
-	existing, err := c.lookupKey(ctx, succ)
+	existing, err := c.lookupKeyMetadata(ctx, succ)
 	if err != nil {
 		return "", err
 	}
@@ -261,12 +262,12 @@ func (c *call) writeSuccessorRecord(ctx context.Context, uid, succ string, recor
 	for _, entry := range slices.Sorted(maps.Keys(record)) {
 		ops = append(ops, replaceOps(entry, record[entry]...)...)
 	}
-	rep, err := c.writeMetadata(ctx, succ, ops...)
-	if !claimLost(rep) {
+	_, err := c.writeMetadata(ctx, succ, ops...)
+	if !errors.Is(err, errClaimHeld) {
 		return err
 	}
 
-	existing, err := c.readKey(ctx, succ)
+	existing, err := c.readKeyMetadata(ctx, succ)
 	if err != nil {
 		return err
 	}
@@ -280,7 +281,7 @@ func (c *call) writeSuccessorRecord(ctx context.Context, uid, succ string, recor
 // than gen. The Name moves only to the next generation, expecting the one
 // before it, so it then held every generation up to gen.
 func (c *call) movedPast(ctx context.Context, anchor string, gen int) (bool, error) {
-	info, err := c.readKey(ctx, anchor)
+	info, err := c.readKeyMetadata(ctx, anchor)
 	if err != nil {
 		return false, err
 	}
@@ -316,15 +317,12 @@ func (c *call) sweep(ctx context.Context, anchor string, newest int, anchorRep *
 		return
 	}
 
-	var record struct {
-		Metadata map[string]map[string][]string `json:"metadata"`
-	}
-	if err := anchorRep.decode(&record); err != nil {
-		logger.Warn("KMIP ReKey skipped its retention sweep", "anchor", anchor, "error", err)
+	if retain == 0 {
 		return
 	}
+
 	swept := 0
-	if values := record.Metadata[metadataScope][entrySwept]; len(values) == 1 {
+	if values := anchorRep.metadata[metadataScope][entrySwept]; len(values) == 1 {
 		swept, _ = strconv.Atoi(values[0])
 	}
 

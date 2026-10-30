@@ -195,7 +195,7 @@ func TestCert_KMIPRekeyRetain(t *testing.T) {
 		Steps: []logicaltest.TestStep{
 			// Unset reads as the default and stays out of the token.
 			testAccStepCert(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false),
-			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 2}),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 0}),
 			testAccStepLoginKMIPRekeyRetain(t, connState, ""),
 
 			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false, map[string]any{
@@ -208,11 +208,15 @@ func TestCert_KMIPRekeyRetain(t *testing.T) {
 			testAccStepCert(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false),
 			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 1}),
 
-			// A value below 1 is rejected.
+			// A negative value is rejected.
 			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, true, map[string]any{
-				"kmip_rekey_retain": 0,
+				"kmip_rekey_retain": -1,
 			}),
 			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 1}),
+			// Explicit zero clears the earlier retention value.
+			testAccStepCertWithExtraParams(t, "web", ca.CertPEM(), "foo", allowed{dns: "example.com"}, false, map[string]any{"kmip_rekey_retain": 0}),
+			testAccStepReadCertPolicy(t, "web", false, map[string]any{"kmip_rekey_retain": 0}),
+			testAccStepLoginKMIPRekeyRetain(t, connState, ""),
 		},
 	})
 }

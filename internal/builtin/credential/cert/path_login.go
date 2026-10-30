@@ -185,8 +185,8 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, data *fra
 	if matched.Entry.KMIPKeyPrefix != "" {
 		metadata["kmip_key_prefix"] = matched.Entry.KMIPKeyPrefix
 	}
-	if matched.Entry.KMIPRekeyRetain != 0 {
-		metadata["kmip_rekey_retain"] = strconv.Itoa(matched.Entry.KMIPRekeyRetain)
+	if matched.Entry.kmipRekeyRetain() != 0 {
+		metadata["kmip_rekey_retain"] = strconv.Itoa(matched.Entry.kmipRekeyRetain())
 	}
 
 	auth := &logical.Auth{

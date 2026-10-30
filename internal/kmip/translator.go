@@ -95,6 +95,7 @@ type reply struct {
 	path       string // namespace-qualified, as a policy would name it
 	capability string
 	status     int
+	metadata   metadataRecord
 
 	Data     json.RawMessage `json:"data"`
 	Auth     *replyAuth      `json:"auth"`
@@ -295,6 +296,23 @@ func (c *call) lookupKey(ctx context.Context, uid string) (*keyInfo, error) {
 		return nil, err
 	}
 	return &info, nil
+}
+
+func (c *call) readKeyMetadata(ctx context.Context, uid string) (*keyInfo, error) {
+	info, err := c.lookupKeyMetadata(ctx, uid)
+	if err == nil && info == nil {
+		return nil, errNotFound(uid)
+	}
+	return info, err
+}
+
+func (c *call) lookupKeyMetadata(ctx context.Context, uid string) (*keyInfo, error) {
+	info, err := c.lookupKey(ctx, uid)
+	if err != nil || info == nil {
+		return info, err
+	}
+	_, err = c.loadMetadata(ctx, uid, info, false)
+	return info, err
 }
 
 func (c *call) create(ctx context.Context, name string, alg kmiplib.CryptographicAlgorithm, bitlen int32) (string, error) {
@@ -533,6 +551,10 @@ func parseLocateFilter(attrs []kmiplib.Attribute) (*locateFilter, error) {
 	return f, nil
 }
 
+func (f *locateFilter) needsMetadata() bool {
+	return f.name != "" || f.state != 0 || len(f.attrs) > 0
+}
+
 func (f *locateFilter) setOnce(field *string, value string) {
 	if *field != "" && *field != value {
 		f.empty = true
@@ -610,8 +632,17 @@ func (c *call) locateOne(ctx context.Context, f *locateFilter) (string, *keyInfo
 		return "", nil, err
 	}
 	info, err := candidate(rep)
-	if err != nil || info == nil || f.uid != "" {
+	if err != nil || info == nil {
 		return uid, info, err
+	}
+	if f.needsMetadata() {
+		visible, err := c.loadMetadata(ctx, uid, info, true)
+		if err != nil || !visible {
+			return uid, nil, err
+		}
+	}
+	if f.uid != "" {
+		return uid, info, nil
 	}
 
 	current := info.single(entryCurrent)
@@ -626,6 +657,12 @@ func (c *call) locateOne(ctx context.Context, f *locateFilter) (string, *keyInfo
 		return "", nil, err
 	}
 	info, err = candidate(rep)
+	if err == nil && info != nil {
+		visible, readErr := c.loadMetadata(ctx, current, info, true)
+		if readErr != nil || !visible {
+			return current, nil, readErr
+		}
+	}
 	return current, info, err
 }
 
@@ -676,6 +713,15 @@ func (c *call) locate(ctx context.Context, attrs []kmiplib.Attribute) ([]string,
 		info, err := candidate(rep)
 		if err != nil {
 			return nil, err
+		}
+		if info != nil && f.needsMetadata() {
+			visible, err := c.loadMetadata(ctx, name, info, true)
+			if err != nil {
+				return nil, err
+			}
+			if !visible {
+				continue
+			}
 		}
 		if info != nil && f.matches(name, info) {
 			ids = append(ids, name)
@@ -739,6 +785,9 @@ func (c *call) destroy(ctx context.Context, uid string) error {
 	if read.ok() {
 		var info keyInfo
 		if err := read.decode(&info); err != nil {
+			return err
+		}
+		if _, err := c.loadMetadata(ctx, uid, &info, false); err != nil {
 			return err
 		}
 		if current := info.single(entryCurrent); current != "" && current != uid {

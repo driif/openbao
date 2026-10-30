@@ -120,7 +120,7 @@ The listener answers Query and DiscoverVersions itself, without logging in.
 
 ## Keys and operations
 
-A KMIP managed object is a transit key plus the `kmip` scope of the key's
+A KMIP managed object is a transit key plus the `kmip/` entries of the key's
 [metadata record][transit-key-metadata]. The transit key holds the material,
 type, versions, and lifecycle; the record holds what transit cannot: stored
 attributes, Link attributes, and the object's Name across ReKey.
@@ -183,8 +183,13 @@ Attributes fall in three classes:
 
 Single-instance attributes, such as Cryptographic Usage Mask and the dates,
 take one value: a second AddAttribute with a different value fails. The record
-is limited to 64 KiB, 128 entries, and 8 KiB per value; an AddAttribute over a
-limit fails with Invalid Field.
+is limited to 64 KiB serialized, 1024 keys, 512 bytes per non-empty key,
+and 8 KiB per value. Each `kmip/<entry>` value is a JSON array, so the 8 KiB
+limit applies to the whole attribute entry, including all its instances.
+An AddAttribute over a limit fails with Invalid Field. The adapter reads the
+record and replaces it with POST and `cas`, preserving unrelated entries.
+It retries a CAS mismatch up to eight attempts, then returns General Failure
+with a request to retry. It never sends PATCH.
 
 ### ReKey
 
@@ -192,7 +197,7 @@ ReKey replaces a symmetric key with a new transit key, the next generation of
 its Name. The first generation of a Name is its anchor, with the Unique
 Identifier `<name>`; later generations are `<name>.2`, `<name>.3`, and so on.
 The anchor's record names the current generation, so Locate by exact Name
-costs two reads however often the Name was rekeyed.
+reads at most two keys and their metadata, however often the Name was rekeyed.
 
 - The replacement gets the Name, the stored attributes, including Activation
   Date and Deactivation Date, and a Link of type Replaced Object to the
@@ -205,10 +210,11 @@ costs two reads however often the Name was rekeyed.
   template that changes the Name, algorithm, length, or object type, or that
   carries any other derived attribute, even one equal to the key's own.
 
-The cert role's `kmip_rekey_retain`, default `2`, is the number of generations
-that stay readable, the current one included: `2` keeps one predecessor, `1`
-keeps none. After the replacement holds the Name, ReKey soft-deletes older
-generations, oldest first. The anchor keeps its metadata record when its
+The cert role's `kmip_rekey_retain` defaults to `0`, which keeps every
+generation and sends no retention soft-delete. A positive value opts into the
+sweep and sets how many generations stay readable, the current one included:
+`2` keeps one predecessor and `1` keeps none. After the replacement holds the
+Name, an enabled sweep soft-deletes older generations, oldest first. The anchor keeps its metadata record when its
 material goes, so the Name still resolves. This sweep is best effort: when a
 soft-delete fails, typically because the policy grants no `delete` on
 `<mount>/keys/<name>/soft-delete`, ReKey still succeeds, the server logs a
@@ -250,20 +256,27 @@ With `<mount>` the transit mount, the operations need:
 | Get                     | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
 |                         | `GET`    | `<mount>/export/<type>/<name>/<version>` | `read`                                      |
 | GetAttributes           | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read`                                      |
 | GetAttributeList        | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read`                                      |
 | AddAttribute            | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (initial read and before the metadata write) |
 |                         | `GET`    | `<mount>/keys/<predecessor>`             | `read` (a `<name>.<n>` without a record)    |
+|                         | `GET`    | `<mount>/keys/<predecessor>/metadata`    | `read` (same optional predecessor check)     |
 |                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update`                                    |
 | ReKey                   | `GET`    | `<mount>/keys/<name>`                    | `read` (the key, replacement and anchor)    |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (key, replacement, and anchor; before each metadata write) |
 |                         | `POST`   | `<mount>/keys/<name>`                    | `update` (the replacement)                  |
 |                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update` (key, replacement, and anchor)     |
 |                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (retention, best effort)           |
 | Activate                | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
 | Locate                  | `GET`    | `<mount>/keys/<name>`                    | `read` (with an exact Name or UID)          |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (Name, State, or stored-attribute filters; anchor and current for Name) |
 |                         | `GET`    | `<mount>/keys/<name>.<n>`                | `read` (exact Name, after a ReKey)          |
 |                         | `LIST`   | `<mount>/keys`                           | `list` (otherwise), then `read` on each key |
 | Revoke                  | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete`                                    |
 | Destroy                 | `GET`    | `<mount>/keys/<name>`                    | `read` (anchor check, skipped if denied)    |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (anchor check after a successful key read) |
 |                         | `GET`    | `<mount>/keys/<name>.<n>`                | `read` (anchor of a rekeyed Name only)      |
 |                         | `DELETE` | `<mount>/keys/<name>`                    | `delete`                                    |
 | Encrypt                 | `POST`   | `<mount>/encrypt/<name>`                 | `update`                                    |
@@ -307,10 +320,11 @@ When writing a policy, keep in mind:
 - **Destroy keeps a rekeyed Name.** Destroy refuses the first generation of
   a Name while the generation the Name points at still exists, because that
   key holds the record that resolves the Name. Destroy the later generations
-  first; the first generation can then be destroyed. The check reads the key
-  and, for a rekeyed Name, the generation it points at. A role that may
-  delete the key but not read it skips the check; one that may read the key
-  but not that generation fails the Destroy. Both reads use the usual retry,
+  first; the first generation can then be destroyed. The check reads the key,
+  its metadata, and, for a rekeyed Name, the generation it points at. A role
+  that may delete the key but not read it skips the check; one that may read
+  the key but not its metadata or that generation fails the Destroy. These
+  reads use the usual retry,
   so a denied read costs a login, which keeps an expired token from skipping
   the check.
 
@@ -320,11 +334,24 @@ When writing a policy, keep in mind:
   Replaced and Replacement Object Links. If the Name was rekeyed after the
   backup, Locate then returns a superseded generation and the next ReKey
   fails. After such a restore, set the anchor's `current` back to the newest
-  generation with `<mount>/keys/<anchor>/metadata`. A restore under a new
-  name restores the key without its record and makes it an object of its own.
+  generation. KMIP stores each entry as a JSON array of strings, written as one
+  string value, so the request is:
+
+  ```json
+  PATCH <mount>/keys/<anchor>/metadata
+  {"custom_metadata": {"kmip/current": "[\"<anchor>.<n>\"]"}}
+  ```
+
+  `PATCH` needs the `patch` capability. A `kmip/` value in any other form makes
+  that key invisible to KMIP Locate and fails its other KMIP operations. A
+  restore under a new
+  name writes no metadata. A same-name restore advances the metadata version
+  above both the backup and existing record, including a cleared record.
+  Deleting and creating a key again resets its version to 0.
 
 - **Locate without an exact Name or UID reads every key.** It lists the mount
-  and reads each key, skipping those the client may not read. Each read is
+  and reads each key. Name, State, and stored-attribute filters also read
+  metadata. Denied key or metadata reads skip that candidate. Each read is
   audited and counts against quotas, so on large mounts prefer locating by
   name.
 

@@ -26,8 +26,8 @@ const (
 	revokeTimeout = 5 * time.Second
 
 	// defaultRekeyRetain is the cert role's kmip_rekey_retain when unset:
-	// the current generation and one predecessor stay readable.
-	defaultRekeyRetain = 2
+	// every generation stays readable.
+	defaultRekeyRetain = 0
 )
 
 type sessionKey struct{}
@@ -164,9 +164,9 @@ func (s *session) loginLocked(ctx context.Context) error {
 	if s.mount == "" {
 		s.mount = s.t.defaultMount
 	}
-	// Cert auth only sets kmip_rekey_retain to 1 or more.
+	// Missing or invalid retention metadata keeps every generation.
 	s.retain = defaultRekeyRetain
-	if retain, err := strconv.Atoi(auth.Metadata["kmip_rekey_retain"]); err == nil && retain >= 1 {
+	if retain, err := strconv.Atoi(auth.Metadata["kmip_rekey_retain"]); err == nil && retain >= 0 {
 		s.retain = retain
 	}
 	return nil

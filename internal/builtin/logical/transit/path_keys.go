@@ -387,13 +387,6 @@ func (b *backend) pathPolicyRead(ctx context.Context, req *logical.Request, d *f
 		return nil, err
 	}
 
-	record, err := loadMetadataRecord(ctx, req.Storage, p)
-	if err != nil {
-		return nil, err
-	}
-	if len(record) > 0 {
-		resp.Data["metadata"] = record
-	}
 	return resp, nil
 }
 

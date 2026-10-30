@@ -83,9 +83,8 @@ type keyInfo struct {
 	KeySize              int                        `json:"key_size"`
 	Keys                 map[string]json.RawMessage `json:"keys"`
 
-	// Metadata is the key's metadata record, which transit includes in the
-	// read when it is not empty: scope, then entry, then values.
-	Metadata map[string]map[string][]string `json:"metadata"`
+	// Metadata is loaded separately from keys/<name>/metadata when needed.
+	Metadata map[string]map[string][]string `json:"-"`
 }
 
 // entry returns the values of an entry in the kmip scope. ReKey's markers

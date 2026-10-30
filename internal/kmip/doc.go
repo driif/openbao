@@ -20,7 +20,7 @@
 // HTTP client. The auth mount's namespace is the part of auth_mount before
 // its first "auth" segment; the transit mount is in that namespace too.
 //
-// A KMIP managed object is a transit key plus the kmip scope of the key's
+// A KMIP managed object is a transit key plus the kmip/ entries of the key's
 // metadata record, <mount>/keys/<name>/metadata. The transit key holds the
 // material, type, versions and lifecycle; the record holds only what
 // transit cannot: stored attributes, Link attributes, and the Name of the
@@ -35,20 +35,27 @@
 //	Get              GET     <mount>/keys/<name>                     read
 //	                 GET     <mount>/export/<type>/<name>/<version>  read
 //	GetAttributes    GET     <mount>/keys/<name>                     read
+//	                 GET     <mount>/keys/<name>/metadata            read
 //	GetAttributeList GET     <mount>/keys/<name>                     read
+//	                 GET     <mount>/keys/<name>/metadata            read
 //	AddAttribute     GET     <mount>/keys/<name>                     read
+//	                 GET     <mount>/keys/<name>/metadata            read  (initial read and before the metadata write)
 //	                 GET     <mount>/keys/<predecessor>              read  (a <name>.<n> with no ReKey record only)
+//	                 GET     <mount>/keys/<predecessor>/metadata     read  (same optional predecessor check)
 //	                 POST    <mount>/keys/<name>/metadata            update
 //	ReKey            GET     <mount>/keys/<name>                     read  (the key, its successor and the anchor)
+//	                 GET     <mount>/keys/<name>/metadata            read  (key, successor and anchor; before each metadata write)
 //	                 POST    <mount>/keys/<name>                     update (the successor)
 //	                 POST    <mount>/keys/<name>/metadata            update (key, successor and anchor)
 //	                 DELETE  <mount>/keys/<name>/soft-delete         delete (retention, best effort)
 //	Activate         GET     <mount>/keys/<name>                     read
 //	Locate           GET     <mount>/keys/<name>                     read  (with an exact Name or UID)
+//	                 GET     <mount>/keys/<name>/metadata            read  (Name, State or stored-attribute filters; anchor and current for Name)
 //	                 GET     <mount>/keys/<name>.<n>                 read  (exact Name, after a ReKey)
 //	                 LIST    <mount>/keys                            list  (otherwise, then a read per key)
 //	Revoke           DELETE  <mount>/keys/<name>/soft-delete         delete
 //	Destroy          GET     <mount>/keys/<name>                     read  (anchor check, skipped if denied)
+//	                 GET     <mount>/keys/<name>/metadata            read  (anchor check after a successful key read)
 //	                 GET     <mount>/keys/<name>.<n>                 read  (anchor of a rekeyed Name only)
 //	                 DELETE  <mount>/keys/<name>                     delete
 //	Encrypt          POST    <mount>/encrypt/<name>                  update
@@ -79,15 +86,20 @@
 // Decrypt, Sign or SignatureVerify, which read neither the key nor its
 // record, and a stored Deactivation Date does not change State. Activation
 // Date is the key's creation time unless the client stored one. Transit
-// bounds the record: 64 KiB in total, 128 entries per scope, 8 KiB per
-// value. A write over a bound fails with Invalid Field.
+// bounds the record: 64 KiB serialized, 1024 keys, 512 bytes per non-empty
+// key, and 8 KiB per value. Each kmip/<entry> is a JSON array, so the 8 KiB
+// limit applies to all instances of an attribute entry together. A write
+// over a bound fails with Invalid Field. The adapter reads and replaces the
+// record with POST and cas, preserving unrelated entries. It retries a CAS
+// mismatch up to eight attempts, then returns General Failure asking for a
+// retry. It never sends PATCH.
 //
 // ReKey replaces a symmetric key with a new transit key. The first
 // generation of a Name is the anchor, with UID <name>; later generations
 // are <name>.2, <name>.3 and so on, so Create and Register refuse a Name
 // that ends in '.' and digits. The anchor's record names the current
-// generation, so Locate by exact Name costs two reads however often the
-// Name was rekeyed. The replacement gets the Name, the stored attributes,
+// generation, so Locate by exact Name reads at most two keys and their
+// metadata however often the Name was rekeyed. The replacement gets the Name, the stored attributes,
 // including Activation Date and Deactivation Date, and a Replaced Object
 // Link; the predecessor gets a Replacement Object Link, loses its Name,
 // and reports State Deactivated. It is not soft-deleted, so Get still
@@ -119,10 +131,12 @@
 // ReKey never relies on the "already existed" warning of a transit create,
 // which transit does not send today.
 //
-// The cert role's kmip_rekey_retain, default 2, is how many generations
-// stay readable, the current one included. After the commit, ReKey
-// soft-deletes older generations, oldest first. The anchor keeps its
-// record when its material goes, so the Name still resolves. The sweep is
+// The cert role's kmip_rekey_retain defaults to 0, which keeps every
+// generation and sends no retention soft-delete. A positive value opts into
+// the sweep and sets how many generations stay readable, the current one
+// included. After the commit, an enabled sweep soft-deletes older
+// generations, oldest first. The anchor keeps its record when its material
+// goes, so the Name still resolves. The sweep is
 // best effort: if a soft-delete fails, typically because the policy grants
 // no delete on <mount>/keys/<name>/soft-delete, ReKey still succeeds, logs
 // a warning naming the path and capability, and the next ReKey of the Name
@@ -142,10 +156,10 @@
 // generation the Name points at still exists: that key holds the record that
 // resolves the Name, and deleting it would lose the Name. Destroy the later
 // generations first; the first generation can then be destroyed. The check
-// reads the key and, for a rekeyed Name, the generation it points at. A role
-// that may delete the key but not read it skips the check; one that may read
-// the key but not that generation fails the Destroy. Both reads go through
-// the usual retry, so a denied read costs a login, which keeps an expired
+// reads the key, its metadata and, for a rekeyed Name, the generation it
+// points at. A role that may delete the key but not read it skips the check; one that may read
+// the key but not its metadata or that generation fails the Destroy. The
+// reads go through the usual retry, so a denied read costs a login, which keeps an expired
 // token from skipping the check.
 //
 // Grant update, not create, on <mount>/encrypt/*. Transit's encrypt endpoint
@@ -157,8 +171,9 @@
 // <mount>/export/* as the only guard on key material.
 //
 // Locate without an exact Name or UID lists the mount and reads every key,
-// skipping those the client may not read: it costs O(n) reads in the keys
-// of the mount, and there is no attribute index. Each of those reads is
+// reading metadata for Name, State or stored-attribute filters, and skipping
+// candidates whose key or metadata read is denied. It costs O(n) reads in
+// the keys of the mount, and there is no attribute index. Each of those reads is
 // audited and counts against quotas. A Locate read that is denied is not
 // retried; any other request that gets a 403 logs in again and is retried
 // once, because OpenBao answers an expired token and an ACL denial alike.

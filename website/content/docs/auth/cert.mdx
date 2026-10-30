@@ -162,7 +162,9 @@ the login token's metadata:
   registers without a name. Such a key is named the prefix followed by a UUID.
 
 - `kmip_rekey_retain` – How many generations of a key KMIP ReKey keeps
-  readable, the current one included. Defaults to `2`.
+  readable, the current one included. Defaults to `0`, which keeps every
+  generation. A positive value opts into the sweep. Set `0` to clear an
+  earlier value; negative values are rejected.
 
 ```shell-session
 $ bao write auth/cert/certs/app \

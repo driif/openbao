@@ -215,7 +215,7 @@ the prefix followed by a UUID.`,
 				Type: framework.TypeInt,
 				Description: `How many generations of a key KMIP ReKey keeps
 readable, the current one included. Older generations are soft-deleted.
-Must be at least 1. Defaults to 2.`,
+Defaults to 0, which keeps every generation. Must be non-negative.`,
 			},
 
 			"policies": {
@@ -454,8 +454,8 @@ func (b *backend) pathCertWrite(ctx context.Context, req *logical.Request, d *fr
 	}
 	if kmipRekeyRetainRaw, ok := d.GetOk("kmip_rekey_retain"); ok {
 		cert.KMIPRekeyRetain = kmipRekeyRetainRaw.(int)
-		if cert.KMIPRekeyRetain < 1 {
-			return logical.ErrorResponse("kmip_rekey_retain must be at least 1"), nil
+		if cert.KMIPRekeyRetain < 0 {
+			return logical.ErrorResponse("kmip_rekey_retain must be non-negative"), nil
 		}
 	}
 
@@ -584,18 +584,12 @@ type CertEntry struct {
 
 	KMIPTransitMount string
 	KMIPKeyPrefix    string
-	// KMIPRekeyRetain is zero until set, which means the default.
+	// KMIPRekeyRetain is zero to keep every generation.
 	KMIPRekeyRetain int
 }
 
-// defaultKMIPRekeyRetain keeps the current generation and one predecessor.
-const defaultKMIPRekeyRetain = 2
-
 func (cert *CertEntry) kmipRekeyRetain() int {
-	if cert.KMIPRekeyRetain == 0 {
-		return defaultKMIPRekeyRetain
-	}
-	return cert.KMIPRekeyRetain
+	return max(0, cert.KMIPRekeyRetain)
 }
 
 // kmipKeyPrefixRegex keeps prefix plus UUID a valid transit key name.

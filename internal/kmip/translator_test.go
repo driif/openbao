@@ -606,6 +606,7 @@ func TestTranslator_GetPublicKeyOfNonExportableKey(t *testing.T) {
 func TestTranslator_LocateByExactName(t *testing.T) {
 	bao := newFakeBao(t)
 	bao.route(http.MethodGet, "transit/keys/app-a", keyRoute("aes256-gcm96", nil))
+	bao.route(http.MethodGet, "transit/keys/app-a/metadata", respond(http.StatusOK, withData(map[string]any{"custom_metadata": map[string]string{}, "version": 0})))
 	ctx, _ := newTestSession(t, bao, Config{})
 
 	byName := kmiplib.Attribute{
@@ -713,6 +714,7 @@ func TestHandleLocate_Pages(t *testing.T) {
 func TestTranslator_Lifecycle(t *testing.T) {
 	bao := newFakeBao(t)
 	bao.route(http.MethodGet, "transit/keys/active", keyRoute("aes256-gcm96", nil))
+	bao.route(http.MethodGet, "transit/keys/active/metadata", respond(http.StatusOK, withData(map[string]any{"custom_metadata": map[string]string{}, "version": 0})))
 	bao.route(http.MethodGet, "transit/keys/revoked", keyRoute("aes256-gcm96", map[string]any{"soft_deleted": true}))
 	bao.route(http.MethodDelete, "transit/keys/active/soft-delete",
 		keyRoute("aes256-gcm96", map[string]any{"soft_deleted": true}))
@@ -932,6 +934,7 @@ func (m *transitMount) handle(r fakeRequest) (int, any) {
 	operation := map[string]logical.Operation{
 		http.MethodGet:    logical.ReadOperation,
 		http.MethodPost:   logical.UpdateOperation,
+		http.MethodPatch:  logical.PatchOperation,
 		http.MethodDelete: logical.DeleteOperation,
 		"LIST":            logical.ListOperation,
 	}[r.method]
@@ -967,12 +970,33 @@ func (m *transitMount) createKey(name string) {
 
 func (m *transitMount) write(name string, ops ...metadataOp) {
 	m.t.Helper()
-	raw, err := json.Marshal(map[string]any{"operations": ops})
+	status, raw := m.do(http.MethodGet, "keys/"+name+"/metadata", nil)
+	require.Equal(m.t, http.StatusOK, status, string(raw))
+	var out struct {
+		Data struct {
+			Data    map[string]string `json:"custom_metadata"`
+			Version uint64            `json:"version"`
+		} `json:"data"`
+	}
+	require.NoError(m.t, json.Unmarshal(raw, &out))
+	record, err := decodeMetadata(out.Data.Data)
 	require.NoError(m.t, err)
-	var body map[string]any
-	require.NoError(m.t, json.Unmarshal(raw, &body))
-	status, out := m.do(http.MethodPost, "keys/"+name+"/metadata", body)
-	require.Equal(m.t, http.StatusOK, status, string(out))
+	for _, op := range ops {
+		require.NoError(m.t, record.apply(op))
+	}
+	data := out.Data.Data
+	for key := range data {
+		if strings.HasPrefix(key, "kmip/") {
+			delete(data, key)
+		}
+	}
+	for entry, values := range record[metadataScope] {
+		encoded, err := json.Marshal(values)
+		require.NoError(m.t, err)
+		data[metadataScope+"/"+entry] = string(encoded)
+	}
+	status, raw = m.do(http.MethodPost, "keys/"+name+"/metadata", map[string]any{"custom_metadata": data, "cas": out.Data.Version})
+	require.Equal(m.t, http.StatusOK, status, string(raw))
 }
 
 // key reads a key as KMIP does, or returns nil when it is missing.
@@ -987,6 +1011,17 @@ func (m *transitMount) key(name string) *keyInfo {
 		Data keyInfo `json:"data"`
 	}
 	require.NoError(m.t, json.Unmarshal(raw, &out))
+	status, raw = m.do(http.MethodGet, "keys/"+name+"/metadata", nil)
+	require.Equal(m.t, http.StatusOK, status, string(raw))
+	var stored struct {
+		Data struct {
+			Data map[string]string `json:"custom_metadata"`
+		} `json:"data"`
+	}
+	require.NoError(m.t, json.Unmarshal(raw, &stored))
+	metadata, err := decodeMetadata(stored.Data.Data)
+	require.NoError(m.t, err)
+	out.Data.Metadata = metadata
 	return &out.Data
 }
 
@@ -1056,24 +1091,42 @@ func (m *transitMount) pauseAt(token string, match func(fakeRequest) bool) (reac
 	return reached, release
 }
 
-// firstOp returns the op and entry of a metadata write's first operation.
-func firstOp(r fakeRequest) (op, entry string) {
-	ops, _ := r.body["operations"].([]any)
-	if len(ops) == 0 {
-		return "", ""
+// metadataWriteRecord decodes the whole custom map sent by the adapter.
+func metadataWriteRecord(r fakeRequest) metadataRecord {
+	raw, err := json.Marshal(r.body["custom_metadata"])
+	if err != nil {
+		return nil
 	}
-	first, _ := ops[0].(map[string]any)
-	op, _ = first["op"].(string)
-	entry, _ = first["entry"].(string)
-	return op, entry
+	var data map[string]string
+	if json.Unmarshal(raw, &data) != nil || data == nil {
+		return nil
+	}
+	record, err := decodeMetadata(data)
+	if err != nil {
+		return nil
+	}
+	return record
 }
 
+// Match the state a ReKey step writes, rather than an operation envelope.
 func isMetadataWrite(r fakeRequest, key, op, entry string) bool {
 	if r.method != http.MethodPost || r.path != "transit/keys/"+key+"/metadata" {
 		return false
 	}
-	gotOp, gotEntry := firstOp(r)
-	return gotOp == op && gotEntry == entry
+	record := metadataWriteRecord(r)
+	if record == nil {
+		return false
+	}
+	values := record[metadataScope][entry]
+	switch op {
+	case "delete":
+		return len(values) == 0 && len(record[metadataScope][entryCurrent]) == 0 && len(record[metadataScope][linkEntry(kmiplib.LinkTypeReplacementObjectLink)]) == 0
+	case "claim":
+		return len(values) == 1 && values[0] == key+".2" && len(record[metadataScope][linkEntry(kmiplib.LinkTypeReplacementObjectLink)]) == 0
+	case "link":
+		return len(values) == 1 && values[0] == key+".2"
+	}
+	return false
 }
 
 // since returns the requests after the first n, as "METHOD path", and
@@ -1168,16 +1221,16 @@ func TestTranslator_AddAttribute(t *testing.T) {
 	require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", tag))
 	writes := bao.sent(http.MethodPost, "transit/keys/app-a/metadata")
 	require.Len(t, writes, 1)
-	require.Equal(t, map[string]any{"operations": []any{map[string]any{
-		"op": "add", "scope": "kmip", "entry": "attr/x-tag", "value": encodeAttr(tag),
-	}}}, writes[0].body)
-	require.Equal(t, []string{"GET transit/keys/app-a", "POST transit/keys/app-a/metadata"}, since(bao, start))
+	encoded, err := json.Marshal([]string{encodeAttr(tag)})
+	require.NoError(t, err)
+	require.Equal(t, map[string]any{"custom_metadata": map[string]any{"kmip/attr/x-tag": string(encoded)}, "cas": float64(0)}, writes[0].body)
+	require.Equal(t, []string{"GET transit/keys/app-a", "GET transit/keys/app-a/metadata", "GET transit/keys/app-a/metadata", "POST transit/keys/app-a/metadata"}, since(bao, start))
 
-	// GetAttributes returns it beside the derived attributes, from one read.
+	// GetAttributes reads both the key and its metadata.
 	start = len(bao.all())
 	attrs, err := op(t, ctx).getAttributes(ctx, "app-a", nil)
 	require.NoError(t, err)
-	require.Equal(t, []string{"GET transit/keys/app-a"}, since(bao, start))
+	require.Equal(t, []string{"GET transit/keys/app-a", "GET transit/keys/app-a/metadata"}, since(bao, start))
 	requireAttr(t, attrs, "x-tag", "blue")
 	requireAttr(t, attrs, kmiplib.AttributeNameName, kmiplib.Name{NameValue: "app-a", NameType: kmiplib.NameTypeUninterpretedTextString})
 	requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StateActive)
@@ -1264,6 +1317,7 @@ func requireReason(t *testing.T, err error, reason kmiplib.ResultReason, msg str
 func TestTranslator_MetadataWriteDenied(t *testing.T) {
 	bao := newFakeBao(t)
 	bao.route(http.MethodGet, "transit/keys/k", keyRoute("aes256-gcm96", nil))
+	bao.route(http.MethodGet, "transit/keys/k/metadata", respond(http.StatusOK, withData(map[string]any{"custom_metadata": map[string]string{}, "version": 0})))
 	bao.route(http.MethodPost, "transit/keys/k/metadata", respond(http.StatusForbidden, withErrors("permission denied")))
 	ctx, _ := newTestSession(t, bao, Config{})
 
@@ -1351,12 +1405,18 @@ func TestTranslator_Rekey(t *testing.T) {
 	// after its record is written; the Name moves before the link.
 	require.Equal(t, []string{
 		"GET transit/keys/app-r",
+		"GET transit/keys/app-r/metadata",
 		"GET transit/keys/app-r.2",
+		"GET transit/keys/app-r/metadata",
 		"POST transit/keys/app-r/metadata",
 		"POST transit/keys/app-r.2",
+		"GET transit/keys/app-r.2/metadata",
 		"POST transit/keys/app-r.2/metadata",
+		"GET transit/keys/app-r/metadata",
 		"POST transit/keys/app-r/metadata",
+		"GET transit/keys/app-r/metadata",
 		"POST transit/keys/app-r/metadata",
+		"GET transit/keys/app-r/metadata",
 		"POST transit/keys/app-r/metadata",
 	}, since(bao, start))
 	writes := bao.sent(http.MethodPost, "transit/keys/app-r/metadata")
@@ -1367,8 +1427,7 @@ func TestTranslator_Rekey(t *testing.T) {
 		{"claim", entryCurrent},
 		{"link", linkEntry(kmiplib.LinkTypeReplacementObjectLink)},
 	} {
-		op, entry := firstOp(writes[i])
-		require.Equal(t, want, [2]string{op, entry})
+		require.True(t, isMetadataWrite(writes[i], "app-r", want[0], want[1]), "%v", writes[i].body)
 	}
 	requireRekeyed(t, m, "app-r", "app-r", "app-r.2", 2)
 	require.Equal(t, []string{"app-r", "app-r.2"}, m.keys())
@@ -1401,8 +1460,8 @@ func TestTranslator_Rekey(t *testing.T) {
 		require.NotContains(t, string(name), "pending")
 	}
 
-	// Locate by Name follows the anchor to the replacement: two reads,
-	// no list.
+	// Locate by Name reads the anchor and replacement with their metadata,
+	// without a list.
 	start = len(bao.all())
 	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
 		AttributeName:  kmiplib.AttributeNameName,
@@ -1410,7 +1469,7 @@ func TestTranslator_Rekey(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	require.Equal(t, []string{"app-r.2"}, ids)
-	require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r.2"}, since(bao, start))
+	require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r/metadata", "GET transit/keys/app-r.2", "GET transit/keys/app-r.2/metadata"}, since(bao, start))
 
 	// The predecessor cannot be rekeyed again, and its Name is gone.
 	_, err = op(t, ctx).rekey(ctx, "app-r", nil, nil)
@@ -1537,6 +1596,7 @@ func TestHandleAddAttribute_ReturnsIndex(t *testing.T) {
 func TestTranslator_RekeyRetention(t *testing.T) {
 	t.Run("retain 2", func(t *testing.T) {
 		bao, m := transitBao(t)
+		bao.metadata["kmip_rekey_retain"] = "2"
 		ctx, _ := newTestSession(t, bao, Config{})
 		newRekeyKey(t, ctx)
 
@@ -1622,8 +1682,8 @@ func TestTranslator_RekeySuccessorExists(t *testing.T) {
 		// A recordless S with no marker is read again, with P, before it is
 		// called foreign: a concurrent ReKey may have made it.
 		require.Equal(t, []string{
-			"GET transit/keys/app-r", "GET transit/keys/app-r.2",
-			"GET transit/keys/app-r", "GET transit/keys/app-r.2",
+			"GET transit/keys/app-r", "GET transit/keys/app-r/metadata", "GET transit/keys/app-r.2", "GET transit/keys/app-r.2/metadata",
+			"GET transit/keys/app-r", "GET transit/keys/app-r/metadata", "GET transit/keys/app-r.2", "GET transit/keys/app-r.2/metadata",
 		}, since(bao, start))
 	})
 
@@ -1638,7 +1698,7 @@ func TestTranslator_RekeySuccessorExists(t *testing.T) {
 		start := len(bao.all())
 		_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
 		require.ErrorContains(t, err, `"app-r.2", which already exists`)
-		require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r.2"}, since(bao, start))
+		require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r/metadata", "GET transit/keys/app-r.2", "GET transit/keys/app-r.2/metadata"}, since(bao, start))
 	})
 
 	t.Run("recordless with marker is adopted", func(t *testing.T) {
@@ -1986,12 +2046,12 @@ func TestTranslator_RekeyRaceFindsUnrecordedSuccessor(t *testing.T) {
 			m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
 				status, out := serve()
 				switch {
-				case r.method == http.MethodGet && r.path == "transit/keys/app-r":
+				case r.method == http.MethodGet && r.path == "transit/keys/app-r/metadata":
 					readP.Do(func() {
 						m.write("app-r", claimOp(entryPending, "app-r.2", ""))
 						m.createKey("app-r.2")
 					})
-				case tc.recorded && r.method == http.MethodGet && r.path == "transit/keys/app-r.2":
+				case tc.recorded && r.method == http.MethodGet && r.path == "transit/keys/app-r.2/metadata":
 					readS.Do(func() { recordS(m) })
 				}
 				return status, out
@@ -2035,7 +2095,7 @@ func TestTranslator_LocateDeniedSuccessorReadDoesNotLogIn(t *testing.T) {
 	for _, r := range since(bao, start) {
 		require.NotContains(t, r, "login")
 	}
-	require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r.2"}, since(bao, start))
+	require.Equal(t, []string{"GET transit/keys/app-r", "GET transit/keys/app-r/metadata", "GET transit/keys/app-r.2"}, since(bao, start))
 }
 
 // Between creating its replacement and writing the replacement's record,
@@ -2113,6 +2173,60 @@ func TestTranslator_RestoreUnderNewNameIsItsOwnObject(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	require.Equal(t, []string{"app-b"}, ids)
+}
+
+// One malformed kmip/ value, which any client with update on a key's metadata
+// may write, must not fail a Locate scan for the whole mount: the scan skips
+// that key, as it skips a key it may not read.
+func TestTranslator_LocateSkipsUndecodableMetadata(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	for _, name := range []string{"app-a", "app-b"} {
+		_, err := op(t, ctx).create(ctx, name, kmiplib.CryptographicAlgorithmAES, 256)
+		require.NoError(t, err)
+		_, err = op(t, ctx).addAttributeAt(ctx, name, customAttr("x-tag", "blue"))
+		require.NoError(t, err)
+	}
+
+	// An operator writes app-b's current as a plain string, not a JSON array.
+	status, raw := m.do(http.MethodGet, "keys/app-b/metadata", nil)
+	require.Equal(t, http.StatusOK, status, string(raw))
+	var stored struct {
+		Data struct {
+			Version uint64            `json:"version"`
+			Map     map[string]string `json:"custom_metadata"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &stored))
+	data := map[string]any{"kmip/current": "app-b.3"}
+	for k, v := range stored.Data.Map {
+		if k != "kmip/current" {
+			data[k] = v
+		}
+	}
+	status, raw = m.do(http.MethodPost, "keys/app-b/metadata", map[string]any{"custom_metadata": data, "cas": stored.Data.Version})
+	require.Equal(t, http.StatusOK, status, string(raw))
+
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{customAttr("x-tag", "blue")})
+	require.NoError(t, err)
+	require.Equal(t, []string{"app-a"}, ids)
+}
+
+// A key whose metadata was stored in the unreleased draft shape takes new
+// attributes over KMIP: the draft record reads as absent, instead of failing
+// every check-and-set and telling the client to retry forever.
+func TestTranslator_AddAttributeOverDraftRecord(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	m.createKey("draft")
+	require.NoError(t, m.storage.Put(t.Context(), &logical.StorageEntry{
+		Key:   "metadata/draft",
+		Value: []byte(`{"kmip":{"attr:x-tag":["old"]}}`),
+	}))
+
+	_, err := op(t, ctx).addAttributeAt(ctx, "draft", customAttr("x-color", "blue"))
+	require.NoError(t, err)
+	require.NotEmpty(t, m.record("draft")[attrEntry("x-color")])
 }
 
 // A ReKey whose Name holds an object that is not a later generation fails
@@ -2271,8 +2385,14 @@ func TestTranslator_RekeyConcurrentChain(t *testing.T) {
 		if entry.Key != "metadata/app-r" {
 			return
 		}
-		var record map[string]map[string][]string
-		if err := json.Unmarshal(entry.Value, &record); err != nil {
+		var stored struct {
+			Data map[string]string `json:"data"`
+		}
+		if err := json.Unmarshal(entry.Value, &stored); err != nil {
+			return
+		}
+		record, err := decodeMetadata(stored.Data)
+		if err != nil {
 			return
 		}
 		if current := record[metadataScope][entryCurrent]; len(current) == 1 {
@@ -2349,4 +2469,113 @@ func TestTranslator_LocateByStoredAttribute(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []string{"app-b"}, ids)
+}
+
+// The adapter replays its operation against the newer record after a CAS
+// mismatch. The failed POST must not append the attribute twice.
+func TestTranslator_MetadataCASRetry(t *testing.T) {
+	bao, m := transitBao(t)
+	m.createKey("k")
+	status, raw := m.do(http.MethodPost, "keys/k/metadata", map[string]any{"custom_metadata": map[string]string{"other/owner": "keep"}})
+	require.Equal(t, http.StatusOK, status, string(raw))
+	ctx, _ := newTestSession(t, bao, Config{})
+	var once sync.Once
+	m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+		if r.method == http.MethodPost && r.path == "transit/keys/k/metadata" {
+			once.Do(func() { m.write("k", addOp("attr/x-tag", encodeAttr(customAttr("x-tag", "concurrent")))) })
+		}
+		return serve()
+	}
+	index, err := op(t, ctx).addAttributeAt(ctx, "k", customAttr("x-tag", "mine"))
+	require.NoError(t, err)
+	require.Equal(t, int32(1), index)
+	require.Len(t, bao.sent(http.MethodPost, "transit/keys/k/metadata"), 2)
+	require.Equal(t, []string{encodeAttr(customAttr("x-tag", "concurrent")), encodeAttr(customAttr("x-tag", "mine"))}, m.record("k")["attr/x-tag"])
+	status, raw = m.do(http.MethodGet, "keys/k/metadata", nil)
+	require.Equal(t, http.StatusOK, status)
+	require.Contains(t, string(raw), `"other/owner":"keep"`)
+}
+
+func TestTranslator_MetadataCASRetryLimit(t *testing.T) {
+	bao, m := transitBao(t)
+	m.createKey("k")
+	ctx, _ := newTestSession(t, bao, Config{})
+	m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+		if r.method == http.MethodPost && r.path == "transit/keys/k/metadata" {
+			m.write("k", addOp("other", "concurrent"))
+		}
+		return serve()
+	}
+	_, err := op(t, ctx).writeMetadata(ctx, "k", addOp("mine", "once"))
+	requireReason(t, err, kmiplib.ResultReasonGeneralFailure, "record kept changing; retry")
+	require.Len(t, bao.sent(http.MethodGet, "transit/keys/k/metadata"), 8)
+	require.Len(t, bao.sent(http.MethodPost, "transit/keys/k/metadata"), 8)
+	require.NotContains(t, m.record("k"), "mine")
+	require.Len(t, m.record("k")["other"], 8)
+}
+
+func TestTranslator_MetadataReadDenied(t *testing.T) {
+	bao, m := transitBao(t)
+	m.createKey("k")
+	bao.route(http.MethodGet, "transit/keys/k/metadata", respond(http.StatusForbidden, withErrors("permission denied")))
+	ctx, _ := newTestSession(t, bao, Config{})
+	_, err := op(t, ctx).getAttributes(ctx, "k", nil)
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `GET transit/keys/k/metadata requires the "read" capability`)
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{customAttr("x-tag", "blue")})
+	require.NoError(t, err)
+	require.Empty(t, ids)
+	m.createKey("k.2")
+	pending, err := op(t, ctx).pendingSuccessor(ctx, "k.2")
+	require.NoError(t, err)
+	require.False(t, pending)
+}
+
+func TestTranslator_MetadataRecord(t *testing.T) {
+	for _, raw := range []string{`{}`, `null`, `"x"`, `1`, `[1]`} {
+		_, err := decodeMetadata(map[string]string{"kmip/bad": raw, "owner": "keep"})
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `metadata key "kmip/bad"`)
+	}
+	record, err := decodeMetadata(map[string]string{"kmip/a": `["1","2"]`, "owner": "keep"})
+	require.NoError(t, err)
+	require.Equal(t, metadataRecord{metadataScope: {"a": {"1", "2"}}}, record)
+	require.ErrorContains(t, record.apply(linkOp("link", "../bad")), "not a key name")
+	require.NoError(t, record.apply(claimOp("owner", "one", "")))
+	err = record.apply(claimOp("owner", "two", ""))
+	require.ErrorIs(t, err, errClaimHeld)
+	require.ErrorContains(t, err, `is held by "one"`)
+	require.NoError(t, record.apply(claimOp("owner", "two", "one")))
+	require.Equal(t, []string{"two"}, record[metadataScope]["owner"])
+}
+
+func TestTranslator_RekeyRetainAll(t *testing.T) {
+	for _, retain := range []string{"", "0", "invalid", "-1"} {
+		t.Run("retain="+retain, func(t *testing.T) {
+			bao, m := transitBao(t)
+			if retain != "" {
+				bao.metadata["kmip_rekey_retain"] = retain
+			}
+			ctx, s := newTestSession(t, bao, Config{})
+			newRekeyKey(t, ctx)
+			value, err := s.rekeyRetain(ctx)
+			require.NoError(t, err)
+			require.Zero(t, value)
+			uid := "app-r"
+			for range 3 {
+				uid, err = op(t, ctx).rekey(ctx, uid, nil, nil)
+				require.NoError(t, err)
+			}
+			for _, uid := range []string{"app-r", "app-r.2", "app-r.3", "app-r.4"} {
+				require.False(t, m.key(uid).SoftDeleted)
+				obj, err := op(t, ctx).get(ctx, uid)
+				require.NoError(t, err)
+				key, ok := obj.(*kmiplib.SymmetricKey)
+				require.True(t, ok)
+				require.NotNil(t, key.KeyBlock.KeyValue)
+				require.NotNil(t, key.KeyBlock.KeyValue.Plain)
+				require.NotNil(t, key.KeyBlock.KeyValue.Plain.KeyMaterial.Bytes)
+				require.Len(t, *key.KeyBlock.KeyValue.Plain.KeyMaterial.Bytes, 32)
+				require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/"+uid+"/soft-delete"))
+			}
+		})
+	}
 }

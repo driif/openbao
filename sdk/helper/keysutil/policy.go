@@ -229,7 +229,7 @@ type KeyData struct {
 	ArchivedKeys *archivedKeys `json:"archived_keys"`
 	// Metadata is the key's metadata record, absent when the key has none
 	// and in backups taken before metadata existed.
-	Metadata json.RawMessage `json:"metadata,omitempty"`
+	Metadata *MetadataRecord `json:"metadata,omitempty"`
 }
 
 // KeyEntry stores the key and metadata
@@ -530,37 +530,59 @@ func (p *Policy) storeArchive(ctx context.Context, storage logical.Storage, arch
 	return nil
 }
 
-// LoadMetadata returns the key's metadata record, stored beside the policy
-// and the archive, or nil when the key has none. The record is opaque to
-// this package; it is never cached and never loaded with the policy.
-func (p *Policy) LoadMetadata(ctx context.Context, storage logical.Storage) (json.RawMessage, error) {
-	raw, err := storage.Get(ctx, path.Join(p.StoragePrefix, "metadata", p.Name))
-	if err != nil {
-		return nil, err
-	}
-	if raw == nil {
-		return nil, nil
-	}
-	return json.RawMessage(raw.Value), nil
+// MetadataRecord holds a key's custom metadata and its write version.
+// An absent record differs from a present record with empty Data.
+type MetadataRecord struct {
+	Version uint64            `json:"version"`
+	Data    map[string]string `json:"data"`
 }
 
-// StoreMetadata writes the key's metadata record. An empty record deletes
-// it. The caller must hold the policy's exclusive lock.
-func (p *Policy) StoreMetadata(ctx context.Context, storage logical.Storage, record json.RawMessage) error {
+// LoadMetadata returns the record stored beside the policy and archive,
+// or nil when absent. It is never cached or loaded with the policy.
+func (p *Policy) LoadMetadata(ctx context.Context, storage logical.Storage) (*MetadataRecord, error) {
+	raw, err := storage.Get(ctx, path.Join(p.StoragePrefix, "metadata", p.Name))
+	if err != nil || raw == nil {
+		return nil, err
+	}
+	var record MetadataRecord
+	if err := raw.DecodeJSON(&record); err != nil {
+		return nil, err
+	}
+	// Every record this code stores has version 1 or more. A record with
+	// version 0 was written in an earlier, never released shape and holds
+	// nothing this code reads, so it counts as absent: a cas of 0 can then
+	// replace it, instead of every check-and-set failing against it.
+	if record.Version == 0 {
+		return nil, nil
+	}
+	if record.Data == nil {
+		record.Data = map[string]string{}
+	}
+	return &record, nil
+}
+
+// StoreMetadata writes the record, including empty Data and its version.
+// The caller must hold the policy's exclusive lock. Deleting a key and
+// creating it again with the same name starts its metadata version at 0.
+func (p *Policy) StoreMetadata(ctx context.Context, storage logical.Storage, record *MetadataRecord) error {
 	// A caller can hold a policy that a delete finished with while it waited
 	// for the lock. A key created since under the same name has its own
 	// record, which this write would replace.
 	if p.deleted.Load() {
 		return errors.New("key has been deleted, not storing metadata")
 	}
-	key := path.Join(p.StoragePrefix, "metadata", p.Name)
-	if len(record) == 0 {
-		return storage.Delete(ctx, key)
+	if record == nil {
+		return errors.New("metadata record must not be nil")
 	}
-	return storage.Put(ctx, &logical.StorageEntry{
-		Key:   key,
-		Value: record,
-	})
+	stored := *record
+	if stored.Data == nil {
+		stored.Data = map[string]string{}
+	}
+	entry, err := logical.StorageEntryJSON(path.Join(p.StoragePrefix, "metadata", p.Name), &stored)
+	if err != nil {
+		return err
+	}
+	return storage.Put(ctx, entry)
 }
 
 // handleArchiving manages the movement of keys to and from the policy archive.

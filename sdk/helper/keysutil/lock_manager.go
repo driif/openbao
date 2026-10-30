@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"path"
 	"sync"
 	"time"
@@ -210,6 +211,21 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 		defer p.l.Unlock()
 	}
 
+	if keyData.Metadata != nil && !renamed {
+		existing, err := keyData.Policy.LoadMetadata(ctx, storage)
+		if err != nil {
+			return err
+		}
+		version := keyData.Metadata.Version
+		if existing != nil {
+			version = max(version, existing.Version)
+		}
+		if version == math.MaxUint64 {
+			return errors.New("metadata version overflow")
+		}
+		keyData.Metadata.Version = version + 1
+	}
+
 	// Restore the archived keys
 	if keyData.ArchivedKeys != nil {
 		err = keyData.Policy.storeArchive(ctx, storage, keyData.ArchivedKeys)
@@ -230,7 +246,18 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 		return fmt.Errorf("failed to restore the policy %q: %w", name, err)
 	}
 
-	keyData.Policy.l = new(sync.RWMutex)
+	if p != nil {
+		// Keep the replaced policy's mutex. A writer can still hold the old
+		// policy object from the cache; with a fresh mutex it and a writer on
+		// the restored object would run at once, and two metadata writes
+		// could both pass the same check-and-set. The mutex is already held
+		// above, and the deferred unlock there releases it.
+		keyData.Policy.l = p.l
+	} else {
+		keyData.Policy.l = new(sync.RWMutex)
+		keyData.Policy.l.Lock()
+		defer keyData.Policy.l.Unlock()
+	}
 
 	// Update the cache to contain the restored policy
 	if lm.useCache {
@@ -246,7 +273,7 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 	// a key that storage no longer holds. A backup without a record leaves
 	// storage as it is, so a backup taken before metadata existed restores
 	// unchanged, and a restore under a new name writes nothing either.
-	if len(keyData.Metadata) > 0 && !renamed {
+	if keyData.Metadata != nil && !renamed {
 		if err := keyData.Policy.StoreMetadata(ctx, storage, keyData.Metadata); err != nil {
 			return fmt.Errorf("failed to restore metadata for key %q: %w", name, err)
 		}

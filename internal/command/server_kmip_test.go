@@ -169,8 +169,23 @@ listener "kmip" {
 	for _, addr := range kmipAddrs {
 		require.Equal(t, "foo.example.com", servedName(addr), addr)
 	}
+	// Without max_request_size, a kmip listener starts with the KMIP frame
+	// limit, not the HTTP body limit.
+	kmipLines := 0
+	for line := range strings.SplitSeq(ui.OutputWriter.String(), "\n") {
+		if strings.Contains(line, ": kmip (") {
+			kmipLines++
+			require.Contains(t, line, `max_request_size: "1048576"`, line)
+		}
+	}
+	require.Equal(t, len(kmipAddrs), kmipLines)
 
 	writeServerCert("bar.example.com")
+	reloadedConfig := strings.ReplaceAll(config.String(), `auth_mount         = "auth/cert"`, `auth_mount         = "auth/cert"
+  max_connections = 1
+  idle_timeout = "20s"
+  max_request_size = 2048`)
+	require.NoError(t, os.WriteFile(configFile, []byte(reloadedConfig), 0o600))
 	cmd.SighupCh <- struct{}{}
 	select {
 	case <-cmd.reloadedCh:
@@ -181,6 +196,22 @@ listener "kmip" {
 		require.Equal(t, "bar.example.com", servedName(addr), addr)
 	}
 
+	// Every address receives the new connection limit as well as its cert.
+	for _, addr := range kmipAddrs {
+		tlsConfig := &tls.Config{RootCAs: roots, Certificates: []tls.Certificate{client.TLSCert}, MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12}
+		var first *tls.Conn
+		require.Eventually(t, func() bool {
+			var dialErr error
+			first, dialErr = tls.Dial("tcp", addr, tlsConfig)
+			return dialErr == nil
+		}, 5*time.Second, 10*time.Millisecond)
+		second, dialErr := tls.Dial("tcp", addr, tlsConfig)
+		if second != nil {
+			_ = second.Close()
+		}
+		_ = first.Close()
+		require.Error(t, dialErr, addr)
+	}
 	cmd.ShutdownCh <- struct{}{}
 	select {
 	case code := <-exited:

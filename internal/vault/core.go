@@ -68,6 +68,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 	"zgo.at/zcache/v2"
 )
 
@@ -3970,8 +3971,12 @@ func (c *Core) ForwardRequest(req *http.Request) (int, http.Header, []byte, erro
 		c.logger.Error("got nil forwarding RPC request")
 		return 0, nil, nil, errors.New("got nil forwarding RPC request")
 	}
+	var trailer metadata.MD
 
-	resp, err := client.ForwardRequest(req.Context(), freq)
+	resp, err := client.ForwardRequest(req.Context(), freq, grpc.Trailer(&trailer))
+	for _, id := range trailer.Get(fwd.RequestIDMetadata) {
+		fwd.RecordRequestID(req.Context(), id)
+	}
 	if err != nil {
 		metrics.IncrCounter([]string{"ha", "rpc", "client", "forward", "errors"}, 1)
 		c.logger.Error("error during forwarded RPC request", "error", err)

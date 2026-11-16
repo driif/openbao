@@ -16,6 +16,8 @@ var SupportedOperations = []kmiplib.Operation{
 	kmiplib.OperationGetAttributes,
 	kmiplib.OperationGetAttributeList,
 	kmiplib.OperationAddAttribute,
+	kmiplib.OperationModifyAttribute,
+	kmiplib.OperationDeleteAttribute,
 	kmiplib.OperationReKey,
 	kmiplib.OperationLocate,
 	kmiplib.OperationActivate,

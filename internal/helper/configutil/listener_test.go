@@ -6,6 +6,7 @@ package configutil
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -172,5 +173,33 @@ listener "tcp" {
 			_, err := ParseConfig(tc.config)
 			require.ErrorContains(t, err, tc.err)
 		})
+	}
+}
+
+func TestParseListeners_KMIPLimits(t *testing.T) {
+	base := `listener "kmip" {
+ tls_cert_file="server.pem"
+ tls_key_file="server.key"
+ tls_client_ca_file="ca.pem"
+ auth_mount="auth/cert"
+ %s
+ }`
+	cfg, err := ParseConfig(fmt.Sprintf(base, ""))
+	require.NoError(t, err)
+	require.Equal(t, 1024, cfg.Listeners[0].MaxConnections)
+	require.Equal(t, 10*time.Minute, cfg.Listeners[0].IdleTimeout)
+	require.Zero(t, cfg.Listeners[0].MaxRequestSize)
+	cfg, err = ParseConfig(fmt.Sprintf(base, "max_connections=7\nidle_timeout=\"12s\"\nmax_request_size=2048"))
+	require.NoError(t, err)
+	require.Equal(t, 7, cfg.Listeners[0].MaxConnections)
+	require.Equal(t, 12*time.Second, cfg.Listeners[0].IdleTimeout)
+	require.Equal(t, int64(2048), cfg.Listeners[0].MaxRequestSize)
+	for _, setting := range []string{"max_connections=-1", "idle_timeout=\"-1s\"", "max_request_size=-1", "max_connections=\"bad\"", "idle_timeout=\"bad\""} {
+		_, err := ParseConfig(fmt.Sprintf(base, setting))
+		require.Error(t, err, setting)
+	}
+	for _, setting := range []string{"max_connections=1", "idle_timeout=\"1s\""} {
+		_, err := ParseConfig("listener \"tcp\" {\n" + setting + "\n}")
+		require.ErrorContains(t, err, "only valid on kmip", setting)
 	}
 }

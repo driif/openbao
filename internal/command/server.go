@@ -5,6 +5,8 @@ package command
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -109,6 +111,7 @@ type ServerCommand struct {
 	reloadFuncs     *map[string][]reloadutil.ReloadFunc
 	startedCh       chan (struct{}) // for tests
 	reloadedCh      chan (struct{}) // for tests
+	kmipServers     map[string]*kmip.Server
 
 	allLoggers []hclog.Logger
 
@@ -819,6 +822,11 @@ func (c *ServerCommand) InitListeners(logger hclog.Logger, config *server.Config
 
 		if lnConfig.MaxRequestSize == 0 {
 			lnConfig.MaxRequestSize = vaulthttp.DefaultMaxRequestSize
+			// On a kmip listener the setting bounds KMIP frames, and reload
+			// applies the same default.
+			if lnConfig.Type == "kmip" {
+				lnConfig.MaxRequestSize = kmip.DefaultMaxMessageSize
+			}
 		}
 		props["max_request_size"] = fmt.Sprintf("%d", lnConfig.MaxRequestSize)
 
@@ -2377,6 +2385,10 @@ func (c *ServerCommand) Reload(lock *sync.RWMutex, reloadFuncs *map[string][]rel
 		}
 	}
 
+	if err := c.reloadKMIPServers(configPath); err != nil {
+		reloadErrors = multierror.Append(reloadErrors, err)
+	}
+
 	// Set Introspection Endpoint to enabled with new value in the config after reload
 	core.ReloadIntrospectionEndpointEnabled()
 
@@ -3126,14 +3138,24 @@ func (r *runningServers) close() error {
 func startKMIPServers(c *ServerCommand, core *vault.Core, lns []listenerutil.Listener) ([]*kmip.Server, error) {
 	servers := make([]*kmip.Server, 0, len(lns))
 	for _, ln := range lns {
+		handlerConfig := *ln.Config
+		// The wire adapter bounds the frame before decoding. JSON expansion
+		// must not impose a second, smaller limit on synthetic requests.
+		handlerConfig.MaxRequestSize = -1
 		handler := vaulthttp.Handler.Handler(&vault.HandlerProperties{
 			Core:           core,
-			ListenerConfig: ln.Config,
+			ListenerConfig: &handlerConfig,
 		})
 		srv, err := kmip.NewServer(ln.Listener, handler, kmip.Config{
 			AuthMount:           ln.Config.AuthMount,
 			DefaultTransitMount: ln.Config.DefaultTransitMount,
 			Logger:              c.logger.Named("kmip"),
+			Auditor:             core,
+			Metrics:             core.MetricSink(),
+			MaxConnections:      ln.Config.MaxConnections,
+			IdleTimeout:         ln.Config.IdleTimeout,
+			MaxMessageSize:      ln.Config.MaxRequestSize,
+			ServerCertificate:   kmipCertificate(ln.Config),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("error initializing kmip listener on %s: %w", ln.Addr(), err)
@@ -3141,7 +3163,11 @@ func startKMIPServers(c *ServerCommand, core *vault.Core, lns []listenerutil.Lis
 		servers = append(servers, srv)
 	}
 
-	for _, srv := range servers {
+	if c.kmipServers == nil {
+		c.kmipServers = make(map[string]*kmip.Server)
+	}
+	for i, srv := range servers {
+		c.kmipServers[lns[i].Config.Address] = srv
 		go func() {
 			if err := srv.Serve(); err != nil {
 				c.UI.Error(fmt.Sprintf("KMIP server (listening on %s) exited with error: %v", srv.Addr(), err))
@@ -3305,4 +3331,59 @@ func (g *grpclogFaker) Fatalln(args ...any) {
 func (g *grpclogFaker) V(l int) bool {
 	currentLevel := int(g.logger.GetLevel())
 	return l >= currentLevel
+}
+
+// kmipCertificate reads the certificate served by the listener's reloadable
+// getter, including certificates refreshed by tls_auto_reload.
+func kmipCertificate(cfg *configutil.Listener) func() *x509.Certificate {
+	getter, ok := cfg.TLSCertGetter.(listenerutil.ReloadableCertGetter)
+	if !ok {
+		return nil
+	}
+	return func() *x509.Certificate {
+		cert, err := getter.GetCertificate(&tls.ClientHelloInfo{})
+		if err != nil || cert == nil || len(cert.Certificate) == 0 {
+			return nil
+		}
+		if cert.Leaf != nil {
+			return cert.Leaf
+		}
+		leaf, _ := x509.ParseCertificate(cert.Certificate[0])
+		return leaf
+	}
+}
+
+func (c *ServerCommand) reloadKMIPServers(paths []string) error {
+	if len(c.kmipServers) == 0 {
+		return nil
+	}
+	var config *server.Config
+	for _, path := range paths {
+		current, err := server.LoadConfig(path, paths)
+		if err != nil {
+			return fmt.Errorf("error reloading KMIP limits: %w", err)
+		}
+		if current == nil {
+			continue
+		}
+		if config == nil {
+			config = current
+		} else {
+			config = config.Merge(current)
+		}
+	}
+	if config == nil {
+		return nil
+	}
+	for _, ln := range config.Listeners {
+		if ln.Type != "kmip" {
+			continue
+		}
+		if srv := c.kmipServers[ln.Address]; srv != nil {
+			if err := srv.Reload(kmip.Config{MaxConnections: ln.MaxConnections, IdleTimeout: ln.IdleTimeout, MaxMessageSize: ln.MaxRequestSize}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

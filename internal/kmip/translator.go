@@ -21,11 +21,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-uuid"
 	kmiplib "github.com/ovh/kmip-go"
-	"github.com/ovh/kmip-go/kmipserver"
 
 	"github.com/openbao/openbao/sdk/v2/framework"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
@@ -104,10 +104,15 @@ type reply struct {
 }
 
 type replyAuth struct {
-	ClientToken   string            `json:"client_token"`
-	TokenType     string            `json:"token_type"`
-	LeaseDuration int               `json:"lease_duration"`
-	Metadata      map[string]string `json:"metadata"`
+	ClientToken      string            `json:"client_token"`
+	TokenType        string            `json:"token_type"`
+	LeaseDuration    int               `json:"lease_duration"`
+	Metadata         map[string]string `json:"metadata"`
+	Accessor         string            `json:"accessor"`
+	EntityID         string            `json:"entity_id"`
+	Policies         []string          `json:"policies"`
+	TokenPolicies    []string          `json:"token_policies"`
+	IdentityPolicies []string          `json:"identity_policies"`
 }
 
 func (r *reply) ok() bool {
@@ -123,10 +128,10 @@ func (r *reply) message() string {
 
 func (r *reply) decode(v any) error {
 	if len(r.Data) == 0 {
-		return kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "%s %s: response has no data", r.method, r.path)
+		return operationErrorf(kmiplib.ResultReasonGeneralFailure, "%s %s: response has no data", r.method, r.path)
 	}
 	if err := json.Unmarshal(r.Data, v); err != nil {
-		return kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "%s %s: decoding response: %v", r.method, r.path, err)
+		return operationErrorf(kmiplib.ResultReasonGeneralFailure, "%s %s: decoding response failed", r.method, r.path)
 	}
 	return nil
 }
@@ -158,9 +163,9 @@ func (t *translator) roundTrip(ctx context.Context, s *session, token string, r 
 		req.Header.Set(consts.NamespaceHeaderName, t.namespace)
 	}
 	req.RemoteAddr = s.remoteAddr
-	req.TLS = &tls.ConnectionState{
-		HandshakeComplete: true,
-		PeerCertificates:  s.peerCerts,
+	req.TLS = s.connectionState
+	if req.TLS == nil {
+		req.TLS = &tls.ConnectionState{HandshakeComplete: true, PeerCertificates: s.peerCerts}
 	}
 
 	w := forwarding.NewRPCResponseWriter()
@@ -201,7 +206,7 @@ type call struct {
 func begin(ctx context.Context) (*call, error) {
 	s, ok := ctx.Value(sessionKey{}).(*session)
 	if !ok {
-		return nil, kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "no session for this KMIP connection")
+		return nil, operationErrorf(kmiplib.ResultReasonGeneralFailure, "no session for this KMIP connection")
 	}
 	return &call{s: s}, nil
 }
@@ -232,7 +237,7 @@ var generationSuffix = regexp.MustCompile(`\.[0-9]+$`)
 // kmip_key_prefix followed by a UUID.
 func (c *call) keyName(ctx context.Context, name string) (string, error) {
 	if generationSuffix.MatchString(name) {
-		return "", kmipserver.Errorf(
+		return "", operationErrorf(
 			kmiplib.ResultReasonInvalidField,
 			"invalid Name %q: a Name ending in '.' and digits is reserved for the replacements ReKey creates", name,
 		)
@@ -253,7 +258,7 @@ func (c *call) keyName(ctx context.Context, name string) (string, error) {
 
 func checkName(name string) error {
 	if !keyNameRegex.MatchString(name) {
-		return kmipserver.Errorf(
+		return operationErrorf(
 			kmiplib.ResultReasonInvalidField,
 			"invalid key name %q: transit key names use letters, digits, '_', '-' and '.'", name,
 		)
@@ -315,13 +320,34 @@ func (c *call) lookupKeyMetadata(ctx context.Context, uid string) (*keyInfo, err
 	return info, err
 }
 
-func (c *call) create(ctx context.Context, name string, alg kmiplib.CryptographicAlgorithm, bitlen int32) (string, error) {
+// create makes a transit key and stores the stored attributes of template
+// in its record, as storeTemplate describes.
+func (c *call) create(ctx context.Context, name string, alg kmiplib.CryptographicAlgorithm, bitlen int32, template *kmiplib.TemplateAttribute) (string, error) {
 	keyType, keySize, err := transitKeyType(alg, bitlen)
 	if err != nil {
 		return "", err
 	}
+	entries, err := newObjectEntries("Create", name, alg, bitlen, keyType, keySize, template)
+	if err != nil {
+		return "", err
+	}
+	// A Name the server generates is a fresh UUID, so no other client can
+	// hold the key; a client's Name may be shared, as storeTemplate explains.
+	owned := name == ""
 	if name, err = c.keyName(ctx, name); err != nil {
 		return "", err
+	}
+	// Transit answers a create of an existing key with that key. A read
+	// before the create refuses a key that exists already. A denied read
+	// fails the Create before transit makes a key.
+	if len(entries) > 0 {
+		existing, err := c.lookupKey(ctx, name)
+		if err != nil {
+			return "", err
+		}
+		if existing != nil {
+			return "", errKeyExists(name)
+		}
 	}
 
 	rep, err := c.createKey(ctx, name, keyType, keySize)
@@ -333,10 +359,110 @@ func (c *call) create(ctx context.Context, name string, alg kmiplib.Cryptographi
 	// warning, but KMIP Create must make a new object.
 	for _, warning := range rep.Warnings {
 		if strings.Contains(warning, "already existed") {
-			return "", kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "key %q already exists", name)
+			return "", errKeyExists(name)
 		}
 	}
+	// Transit sends no such warning today. A soft-deleted key in the reply
+	// still shows an existing one: a revoked or destroyed object, or a key
+	// an earlier Create soft-deleted after its template write failed.
+	if len(rep.Data) > 0 {
+		var created keyInfo
+		if err := rep.decode(&created); err != nil {
+			return "", err
+		}
+		if created.SoftDeleted {
+			return "", errKeyExists(name)
+		}
+	}
+	if err := c.storeTemplate(ctx, "Create", name, entries, owned); err != nil {
+		return "", err
+	}
 	return name, nil
+}
+
+func errKeyExists(name string) error {
+	return operationErrorf(kmiplib.ResultReasonGeneralFailure, "key %q already exists", name)
+}
+
+// errRecordExists ends storeTemplate's write when the key already has KMIP
+// entries: another client made or used the key after this operation found
+// it missing.
+var errRecordExists = errors.New("the key already has a KMIP record")
+
+// storeTemplate writes the stored attributes of a new object's template to
+// its record. Without any, it sends nothing, so a plain Create or Register
+// needs no metadata grant.
+//
+// A Create or Register must not report success for an object that lacks
+// its attributes, so a failed write fails the operation with General
+// Failure naming the key. Transit has already made the key by then.
+//
+// owned says that no other client can hold the key: transit's import
+// refuses an existing key, and a Name the server generates is a fresh
+// UUID. Only then does storeTemplate soft-delete the key, best effort, so
+// that it reports Deactivated and no cryptographic operation uses it. A
+// client's Name proves nothing: another client can create the same Name
+// between Create's read and its create, and transit hands both the one
+// key. That key is left as it is. Either way a retry with the same Name
+// fails because the key exists, and an operator restores, purges or keeps
+// it. A record that already holds KMIP entries shows a key another KMIP
+// client made: the operation fails and leaves it alone.
+func (c *call) storeTemplate(ctx context.Context, op, uid string, entries map[string][]string, owned bool) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	_, err := c.writeMetadataFunc(ctx, uid, func(record metadataRecord) error {
+		if len(record[metadataScope]) > 0 {
+			return errRecordExists
+		}
+		for entry, values := range entries {
+			record.set(metadataScope, entry, slices.Clone(values))
+		}
+		return nil
+	})
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errRecordExists):
+		return errKeyExists(uid)
+	case !owned:
+		return operationErrorf(
+			kmiplib.ResultReasonGeneralFailure,
+			"%s made the key %q but could not store its template attributes; the key was left in place because another client may hold the same Name: %v",
+			op, uid, clientErrorText(err),
+		)
+	}
+
+	if cleanupErr := c.softDelete(ctx, uid); cleanupErr != nil {
+		return operationErrorf(
+			kmiplib.ResultReasonGeneralFailure,
+			"%s made the key %q but could not store its template attributes: %v; soft-deleting the key also failed, so it stays Active without them: %v",
+			op, uid, clientErrorText(err), clientErrorText(cleanupErr),
+		)
+	}
+	return operationErrorf(
+		kmiplib.ResultReasonGeneralFailure,
+		"%s made the key %q but could not store its template attributes, so the key was soft-deleted: %v",
+		op, uid, clientErrorText(err),
+	)
+}
+
+// softDelete soft-deletes the key, which KMIP reports as Deactivated.
+// Transit registers soft-delete as a delete operation on
+// keys/<uid>/soft-delete.
+func (c *call) softDelete(ctx context.Context, uid string) error {
+	rep, err := c.do(ctx, request{method: http.MethodDelete, path: "keys/" + uid + "/soft-delete", capability: "delete"})
+	if err != nil {
+		return err
+	}
+	switch {
+	case rep.status == http.StatusNoContent:
+		// Soft-deleting a key returns the key; a missing key returns nothing.
+		return errNotFound(uid)
+	case !rep.ok():
+		return rep.failure()
+	}
+	return nil
 }
 
 // createKey posts keys/<name>. Get hands out key material, which transit
@@ -360,9 +486,14 @@ func (c *call) createKey(ctx context.Context, name, keyType string, keySize int)
 
 // register imports key material: raw bytes for symmetric keys, PKCS#8 DER
 // for private keys. The material is wrapped for transit's import endpoint
-// here, so it only travels wrapped.
-func (c *call) register(ctx context.Context, name string, alg kmiplib.CryptographicAlgorithm, bitlen int32, material []byte) (string, error) {
-	keyType, _, err := transitKeyType(alg, bitlen)
+// here, so it only travels wrapped. The stored attributes of template go to
+// the key's record, as storeTemplate describes.
+func (c *call) register(ctx context.Context, name string, alg kmiplib.CryptographicAlgorithm, bitlen int32, material []byte, template *kmiplib.TemplateAttribute) (string, error) {
+	keyType, keySize, err := transitKeyType(alg, bitlen)
+	if err != nil {
+		return "", err
+	}
+	entries, err := newObjectEntries("Register", name, alg, bitlen, keyType, keySize, template)
 	if err != nil {
 		return "", err
 	}
@@ -408,7 +539,12 @@ func (c *call) register(ctx context.Context, name string, alg kmiplib.Cryptograp
 		return "", err
 	}
 	if !rep.ok() {
+		// Transit's import refuses an existing key, so a key it imports is
+		// new, as storeTemplate requires.
 		return "", rep.failure()
+	}
+	if err := c.storeTemplate(ctx, "Register", name, entries, true); err != nil {
+		return "", err
 	}
 	return name, nil
 }
@@ -478,7 +614,7 @@ func (c *call) get(ctx context.Context, uid string) (kmiplib.Object, error) {
 	}
 	material, err := base64.StdEncoding.DecodeString(export.Keys[version])
 	if err != nil || len(material) == 0 {
-		return nil, kmipserver.Errorf(
+		return nil, operationErrorf(
 			kmiplib.ResultReasonGeneralFailure,
 			"transit returned no key material for version %s of %q", version, uid,
 		)
@@ -487,7 +623,7 @@ func (c *call) get(ctx context.Context, uid string) (kmiplib.Object, error) {
 }
 
 func errNotExportable(uid string) error {
-	return kmipserver.Errorf(
+	return operationErrorf(
 		kmiplib.ResultReasonPermissionDenied,
 		"key material of %q is not exportable: transit only exports keys created with exportable=true", uid,
 	)
@@ -516,20 +652,20 @@ func parseLocateFilter(attrs []kmiplib.Attribute) (*locateFilter, error) {
 		case kmiplib.AttributeNameName:
 			n, ok := attr.AttributeValue.(kmiplib.Name)
 			if !ok || n.NameValue == "" {
-				return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "Name attribute is empty or invalid")
+				return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Name attribute is empty or invalid")
 			}
 			f.setOnce(&f.name, n.NameValue)
 		case kmiplib.AttributeNameUniqueIdentifier:
 			// UniqueIdentifier is the key name in transit.
 			id, ok := attr.AttributeValue.(string)
 			if !ok || id == "" {
-				return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "UniqueIdentifier attribute is empty or invalid")
+				return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "UniqueIdentifier attribute is empty or invalid")
 			}
 			f.setOnce(&f.uid, id)
 		case kmiplib.AttributeNameObjectType:
 			ot, ok := attr.AttributeValue.(kmiplib.ObjectType)
 			if !ok {
-				return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "ObjectType attribute has invalid value")
+				return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "ObjectType attribute has invalid value")
 			}
 			if f.objType != 0 && f.objType != ot {
 				f.empty = true
@@ -543,7 +679,7 @@ func parseLocateFilter(attrs []kmiplib.Attribute) (*locateFilter, error) {
 			f.state, _ = attr.AttributeValue.(kmiplib.State)
 		default:
 			if attr.AttributeValue == nil {
-				return nil, kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "Locate filter %s has no value", attr.AttributeName)
+				return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Locate filter %s has no value", attr.AttributeName)
 			}
 			f.attrs = append(f.attrs, attr)
 		}
@@ -618,7 +754,7 @@ func candidate(rep *reply) (*keyInfo, error) {
 
 // locateOne reads the object an exact UID or Name selects. A Name is the
 // UID of its anchor, whose record names the current generation, so a Name
-// costs two reads at most however often it was rekeyed.
+// costs two reads at most when no ReKey moves it during the lookup.
 func (c *call) locateOne(ctx context.Context, f *locateFilter) (string, *keyInfo, error) {
 	uid := f.uid
 	if uid == "" {
@@ -676,11 +812,28 @@ func (c *call) locate(ctx context.Context, attrs []kmiplib.Attribute) ([]string,
 	// An exact Name or UID reads and does not list, so a policy without
 	// list on keys still locates the keys it names.
 	if f.uid != "" || f.name != "" {
-		uid, info, err := c.locateOne(ctx, f)
-		if err != nil || info == nil || !f.matches(uid, info) {
-			return nil, err
+		moved := make(map[string]bool)
+		for {
+			uid, info, err := c.locateOne(ctx, f)
+			if err != nil || info == nil {
+				return nil, err
+			}
+			// ReKey commits the anchor before removing the predecessor's
+			// Name. If that happened between these reads, resolve the new
+			// current generation instead of reporting that the Name is gone.
+			// A repeated UID means the anchor did not advance; do not loop on
+			// an inconsistent record or a cycle in manually edited metadata.
+			if f.uid == "" && info.replacement() != "" && !moved[uid] {
+				if name, ok := info.kmipName(uid); !ok || name != f.name {
+					moved[uid] = true
+					continue
+				}
+			}
+			if !f.matches(uid, info) {
+				return nil, nil
+			}
+			return []string{uid}, nil
 		}
-		return []string{uid}, nil
 	}
 
 	rep, err := c.do(ctx, request{method: "LIST", path: "keys", capability: "list"})
@@ -730,103 +883,164 @@ func (c *call) locate(ctx context.Context, attrs []kmiplib.Attribute) ([]string,
 	return ids, nil
 }
 
-// activate succeeds on an active key: transit keys are Active from creation
-// and no transit state stands for Pre-Active.
+// activate makes a Pre-Active object Active by storing now as its
+// Activation Date. An Active object succeeds with no write; any other State
+// is refused. The metadata read is required: the marks and the dates that
+// decide the State are only there. A stored date that does not decode fails
+// Activate, on the first read and on each write attempt.
 func (c *call) activate(ctx context.Context, uid string) error {
-	info, err := c.readKey(ctx, uid)
+	info, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return err
 	}
-	if info.SoftDeleted {
-		return errSoftDeleted(uid)
+	check := func(info *keyInfo) error {
+		state, err := info.checkedState()
+		if err != nil {
+			return err
+		}
+		switch state {
+		case kmiplib.StatePreActive:
+			return nil
+		case kmiplib.StateActive:
+			return errNoChange
+		default:
+			return errWrongState(uid, state)
+		}
 	}
-	return nil
-}
-
-// revoke soft-deletes the key, which KMIP reports as Deactivated. Transit
-// registers soft-delete as a delete operation on keys/<uid>/soft-delete.
-func (c *call) revoke(ctx context.Context, uid string) error {
-	if err := checkName(uid); err != nil {
+	if err := check(info); err != nil {
+		if errors.Is(err, errNoChange) {
+			return nil
+		}
 		return err
 	}
 
-	rep, err := c.do(ctx, request{method: http.MethodDelete, path: "keys/" + uid + "/soft-delete", capability: "delete"})
+	now := time.Now()
+	_, err = c.writeMetadataFunc(ctx, uid, func(record metadataRecord) error {
+		if err := check(info.withRecord(record)); err != nil {
+			return err
+		}
+		setAttr(record, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameActivationDate, AttributeValue: now})
+		return nil
+	})
+	return err
+}
+
+// isCompromise reports whether reason places the object in the Compromised
+// state.
+func isCompromise(reason kmiplib.RevocationReason) bool {
+	return reason.RevocationReasonCode == kmiplib.RevocationReasonCodeKeyCompromise ||
+		reason.RevocationReasonCode == kmiplib.RevocationReasonCodeCACompromise
+}
+
+// revoke records the revocation in the object's record, then soft-deletes
+// the key. Key Compromise and CA Compromise set the compromise mark, the
+// Compromise Date and the Compromise Occurrence Date: occurrence, or else
+// the Initial Date. A repeated compromise Revoke keeps the first dates. Any
+// other reason sets the Deactivation Date to now, unless one at or before
+// now is stored. Both store the Revocation Reason.
+//
+// KMIP 1.4 has no transition out of Destroyed, and none from Pre-Active or
+// Compromised to Deactivated, so Revoke refuses a Destroyed object, and a
+// Revoke with any other reason refuses a Pre-Active or Compromised one.
+//
+// The record goes first. If the soft-delete then fails, the object already
+// reports Compromised, or Deactivated by its date, never a State less
+// restrictive than before, and a retry of the Revoke finishes it.
+func (c *call) revoke(ctx context.Context, uid string, reason kmiplib.RevocationReason, occurrence *time.Time) error {
+	info, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return err
 	}
-	switch {
-	case rep.status == http.StatusNoContent:
-		// Soft-deleting a key returns the key; a missing key returns nothing.
-		return errNotFound(uid)
-	case !rep.ok():
-		return rep.failure()
+	compromise := isCompromise(reason)
+	check := func(info *keyInfo) error {
+		switch state := info.state(); state {
+		case kmiplib.StateDestroyed, kmiplib.StateDestroyedCompromised:
+			return errWrongState(uid, state)
+		case kmiplib.StatePreActive, kmiplib.StateCompromised:
+			if !compromise {
+				return errWrongState(uid, state)
+			}
+		}
+		return nil
 	}
-	return nil
+	if err := check(info); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	_, err = c.writeMetadataFunc(ctx, uid, func(record metadataRecord) error {
+		current := info.withRecord(record)
+		if err := check(current); err != nil {
+			return err
+		}
+		switch {
+		case compromise && current.single(entryCompromised) == "":
+			record.set(metadataScope, entryCompromised, []string{markSet})
+			setAttr(record, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCompromiseDate, AttributeValue: now})
+			// An HMAC key lists no versions and so has no Initial Date:
+			// without a date in the request, none is stored.
+			occurred, ok := current.initialDate()
+			if occurrence != nil {
+				occurred, ok = *occurrence, true
+			}
+			if ok {
+				setAttr(record, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCompromiseOccurrenceDate, AttributeValue: occurred})
+			}
+		case !compromise:
+			// A stored Deactivation Date that does not decode is replaced.
+			if at, ok, err := current.storedDate(kmiplib.AttributeNameDeactivationDate); err != nil || !ok || at.After(now) {
+				setAttr(record, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameDeactivationDate, AttributeValue: now})
+			}
+		}
+		setAttr(record, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameRevocationReason, AttributeValue: reason})
+		return nil
+	})
+	if err != nil || info.SoftDeleted {
+		return err
+	}
+	return c.softDelete(ctx, uid)
 }
 
-// destroy deletes the key. Transit refuses unless the key's deletion_allowed
-// is set, and KMIP does not set it.
+// destroy places a Pre-Active, Deactivated or Compromised object in the
+// Destroyed state, or Destroyed Compromised for a compromised one. It never
+// deletes the key: purging it is an operator action outside KMIP. It
+// soft-deletes the key unless it is soft-deleted already, then sets the
+// destroy mark and the Destroy Date. Destroy of an Active object is refused;
+// of a Destroyed one, it succeeds with no write.
+//
+// The soft-delete goes first, so Get never returns material of an object
+// that reports Destroyed. If the record write then fails, the object reports
+// Deactivated, which a retry of the Destroy accepts.
 func (c *call) destroy(ctx context.Context, uid string) error {
-	if err := checkName(uid); err != nil {
-		return err
-	}
-
-	// After a ReKey, the first generation of a Name holds the record that
-	// resolves the Name to its current object. Deleting the key deletes that
-	// record: Locate by Name then finds nothing, the next ReKey cannot
-	// commit, and a Create may reuse the Name while a later generation still
-	// holds it. Refuse while a later generation is current. The check reads
-	// keys/<uid>; a role that may delete but not read skips it rather than
-	// meet a new requirement.
-	read, err := c.do(ctx, keyRead(uid))
+	info, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return err
 	}
-	if read.ok() {
-		var info keyInfo
-		if err := read.decode(&info); err != nil {
-			return err
-		}
-		if _, err := c.loadMetadata(ctx, uid, &info, false); err != nil {
-			return err
-		}
-		if current := info.single(entryCurrent); current != "" && current != uid {
-			// Nothing clears current when the generation it names is
-			// destroyed. Refuse only while that generation still exists:
-			// with it gone the Name has no object left to lose, and refusing
-			// would keep the anchor forever. A read of it that is denied
-			// fails the Destroy rather than guess.
-			live, err := c.lookupKey(ctx, current)
-			if err != nil {
-				return err
-			}
-			if live != nil {
-				return kmipserver.Errorf(
-					kmiplib.ResultReasonPermissionDenied,
-					"wrong key lifecycle state: %q holds the Name that %q now carries; destroying it would lose that Name",
-					uid, current,
-				)
-			}
-		}
+	switch state := info.state(); state {
+	case kmiplib.StateDestroyed, kmiplib.StateDestroyedCompromised:
+		return nil
+	case kmiplib.StateActive:
+		return errWrongState(uid, state)
 	}
 
-	rep, err := c.do(ctx, request{method: http.MethodDelete, path: "keys/" + uid, capability: "delete"})
-	if err != nil || rep.ok() {
-		return err
+	if !info.SoftDeleted {
+		if err := c.softDelete(ctx, uid); err != nil {
+			return err
+		}
+		info.SoftDeleted = true
 	}
 
-	msg := rep.message()
-	switch {
-	case rep.status == http.StatusForbidden:
-	case strings.Contains(msg, "deletion is not allowed"):
-		return kmipserver.Errorf(
-			kmiplib.ResultReasonPermissionDenied,
-			"transit will not delete %q until deletion_allowed is set with keys/%s/config", uid, uid,
-		)
-	case strings.Contains(msg, "not found"):
-		return errNotFound(uid)
-	}
-	return rep.failure()
+	now := time.Now()
+	_, err = c.writeMetadataFunc(ctx, uid, func(record metadataRecord) error {
+		if info.withRecord(record).single(entryDestroyed) != "" {
+			// A concurrent Destroy got there first; keep its Destroy Date.
+			return errNoChange
+		}
+		record.set(metadataScope, entryDestroyed, []string{markSet})
+		setAttr(record, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameDestroyDate, AttributeValue: now})
+		return nil
+	})
+	return err
 }
 
 // cryptoOp posts body to <op>/<uid> and decodes the reply's data into out.
@@ -872,7 +1086,7 @@ func (c *call) decrypt(ctx context.Context, uid string, ciphertext []byte) ([]by
 	// transit returns base64-encoded plaintext → decode back to raw bytes.
 	plaintext, err := base64.StdEncoding.DecodeString(out.Plaintext)
 	if err != nil {
-		return nil, kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "decoding plaintext from transit: %v", err)
+		return nil, operationErrorf(kmiplib.ResultReasonGeneralFailure, "decoding plaintext from transit failed")
 	}
 	return plaintext, nil
 }

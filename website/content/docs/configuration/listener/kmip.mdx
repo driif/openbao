@@ -26,7 +26,8 @@ The listener does not serve the HTTP API. Each KMIP operation runs as one or
 more ordinary OpenBao requests against the transit mount, made with the
 client's token, certificate, and address. ACL policies, namespaces, audit
 devices, resource quotas, and request forwarding from standby nodes therefore
-apply to KMIP clients exactly as they do to HTTP clients.
+apply to KMIP clients. A standby without an audit broker refuses operations
+except Query and DiscoverVersions. Connect other clients to the active node.
 
 KMIP listeners are not started in [recovery mode][recovery-mode]. When OpenBao
 shuts down, it closes KMIP connections first so that their tokens are revoked.
@@ -122,8 +123,9 @@ The listener answers Query and DiscoverVersions itself, without logging in.
 
 A KMIP managed object is a transit key plus the `kmip/` entries of the key's
 [metadata record][transit-key-metadata]. The transit key holds the material,
-type, versions, and lifecycle; the record holds what transit cannot: stored
-attributes, Link attributes, and the object's Name across ReKey.
+type, versions, and soft-delete; the record holds what transit cannot: stored
+attributes, Link attributes, the object's Name across ReKey, and the
+compromise and destroy marks.
 
 A key's KMIP Unique Identifier is its transit key name. Create and Register use
 the request's Name attribute as the key name. Without one, the key is named
@@ -132,8 +134,9 @@ the request's Name attribute as the key name. Without one, the key is named
 those names are reserved for the replacements ReKey creates.
 
 The listener supports Create, Register, Get, GetAttributes, GetAttributeList,
-AddAttribute, ReKey, Locate, Activate, Revoke, Destroy, Encrypt, Decrypt, Sign,
-SignatureVerify, Query, and DiscoverVersions, with these key types:
+AddAttribute, ModifyAttribute, DeleteAttribute, ReKey, Locate, Activate,
+Revoke, Destroy, Encrypt, Decrypt, Sign, SignatureVerify, Query, and
+DiscoverVersions, with these key types:
 
 | KMIP algorithm                | Length                         | Transit key type                         |
 | :---------------------------- | :----------------------------- | :--------------------------------------- |
@@ -148,9 +151,8 @@ SignatureVerify, Query, and DiscoverVersions, with these key types:
   imports it.
 - Get returns the material of the key's latest version: a Raw SymmetricKey for
   AES, ChaCha20, and HMAC keys, and a PKCS#8 PrivateKey for RSA and ECDSA keys.
-- Transit keys are Active from creation, so Activate succeeds on any key that is
-  not revoked. Revoke soft-deletes the key, which KMIP reports as Deactivated;
-  Get and Activate then fail. Destroy deletes the key.
+- Activate, Revoke, and Destroy follow the KMIP lifecycle; see
+  [Lifecycle](#lifecycle). Destroy never deletes the transit key.
 - Encrypt, Decrypt, Sign, and SignatureVerify are single-part only and accept
   no Cryptographic Parameters, IV, or additional authenticated data. Encrypt
   returns transit's ciphertext string (`vault:v1:...`), which Decrypt takes
@@ -164,32 +166,122 @@ SignatureVerify, Query, and DiscoverVersions, with these key types:
 
 ### Attributes
 
-Attributes fall in three classes:
+Attributes fall in four classes:
 
-- **Derived** from the transit key: Unique Identifier, Object Type,
-  Cryptographic Algorithm, Cryptographic Length, State, and Initial Date.
-  AddAttribute refuses them with Permission Denied.
+- **Derived** from the transit key and the record: Unique Identifier, Object
+  Type, Cryptographic Algorithm, Cryptographic Length, State, and Initial Date.
+- **Server-set** by Revoke and Destroy only: Compromise Date, Compromise
+  Occurrence Date, Destroy Date, and Revocation Reason.
 - **Honoured**: Name. An object's Name is the Unique Identifier of its first
   generation and moves to the replacement on ReKey. AddAttribute with the
   object's current Name succeeds and changes nothing; any other Name fails with
-  Invalid Field, because renaming is not supported.
+  Invalid Field, because renaming is not supported. ModifyAttribute and
+  DeleteAttribute of Name fail with Invalid Field.
 - **Stored**: every other attribute, standard or custom (`x-` and `y-`). The
   listener keeps each instance verbatim, returns it from GetAttributes and
-  GetAttributeList, and matches it in Locate. A stored attribute changes
-  nothing else. In particular, a stored Cryptographic Usage Mask does not
-  restrict Encrypt, Decrypt, Sign, or SignatureVerify, and a stored
-  Deactivation Date does not change State. Activation Date is the key's
-  creation time unless the client stored one.
+  GetAttributeList, and matches it in Locate. A stored Cryptographic Usage Mask
+  does not restrict Encrypt, Decrypt, Sign, or SignatureVerify. A stored
+  Activation Date or Deactivation Date changes the reported State, as
+  [Lifecycle](#lifecycle) describes, and nothing else. Activation Date is the
+  key's creation time unless the client stored one.
+
+AddAttribute, ModifyAttribute, and DeleteAttribute refuse derived and
+server-set attributes with Permission Denied, and so does a Create, Register,
+or ReKey template.
+
+ModifyAttribute replaces one instance and DeleteAttribute removes one. Both
+select it by Attribute Index, 0 when the request has none, numbered as
+GetAttributes numbers them, and both return the instance with its index. The
+Links ReKey wrote come first among the Link instances and cannot be changed.
+ModifyAttribute of the Activation Date that no client stored stores the new
+value; DeleteAttribute of it finds nothing. An index without an instance fails
+with Item Not Found, since KMIP 1.x has no Attribute Not Found. Both refuse a
+ReKey replacement that is still being created, as AddAttribute does.
+
+Create and Register store the stored attributes of their template, by the
+rules a ReKey template follows. A template with none, such as only
+Cryptographic Algorithm, Cryptographic Length, and Name, sends no metadata
+request. If that write fails, transit has already made the key, and the
+operation fails with General Failure, naming the key. Transit answers a create
+of an existing key with that key, so the listener soft-deletes the key, best
+effort, only when no other client can hold it: after a Register, since
+transit's import refuses an existing key, and after a Create without a Name,
+whose generated name is a fresh UUID. A Create with a Name leaves the key
+Active without its attributes, because another client can create the same
+Name between the listener's read and its create, and both then hold the one
+key. If the soft-delete fails, the key also stays Active, and the error says
+so. Create with stored attributes reads the key first and refuses one that
+exists, including a soft-deleted one, and a template write refuses a record
+that already holds KMIP entries. A retry with the same Name therefore fails
+until an operator restores, purges, or keeps the key.
 
 Single-instance attributes, such as Cryptographic Usage Mask and the dates,
 take one value: a second AddAttribute with a different value fails. The record
 is limited to 64 KiB serialized, 1024 keys, 512 bytes per non-empty key,
 and 8 KiB per value. Each `kmip/<entry>` value is a JSON array, so the 8 KiB
 limit applies to the whole attribute entry, including all its instances.
-An AddAttribute over a limit fails with Invalid Field. The adapter reads the
+A write over a limit fails with Invalid Field. The adapter reads the
 record and replaces it with POST and `cas`, preserving unrelated entries.
 It retries a CAS mismatch up to eight attempts, then returns General Failure
-with a request to retry. It never sends PATCH.
+with a request to retry. Every check of an operation that writes the record
+runs again on the record of each attempt. It never sends PATCH.
+
+### Lifecycle
+
+The listener derives an object's State, in this order:
+
+1. **Destroyed**, or **Destroyed Compromised**: the record holds the destroy
+   mark, and for Destroyed Compromised the compromise mark too.
+2. **Compromised**: the record holds the compromise mark.
+3. **Deactivated**: the key is soft-deleted, ReKey replaced it, or its
+   Deactivation Date is at or before now.
+4. **Pre-Active**: its Activation Date is after now.
+5. **Active**: otherwise.
+
+The marks are the `kmip/compromised` and `kmip/destroyed` entries of the
+record. They are not attributes, and only Revoke and Destroy set them. The
+dates change only the reported State: Encrypt, Decrypt, Sign, and
+SignatureVerify read neither, and a key past its Deactivation Date still
+works until it is soft-deleted. A refusal for the wrong State fails with
+Permission Denied and a message that names the State, since KMIP 1.x has no
+Wrong Key Lifecycle State reason.
+
+- **Create and Register** make an Active object, unless the template holds an
+  Activation Date in the future: the object is then Pre-Active until that date
+  or until Activate.
+- **Activate** of a Pre-Active object stores now as its Activation Date, which
+  makes it Active. Activate of an Active object succeeds and writes nothing.
+  Any other State is refused. A stored Activation Date or Deactivation Date
+  that does not decode fails Activate with General Failure.
+- **Revoke** with reason Key Compromise or CA Compromise sets the compromise
+  mark, the Compromise Date (now), and the Compromise Occurrence Date: the
+  request's, or else the Initial Date. A second compromise Revoke keeps the
+  first dates. Any other reason sets the Deactivation Date to now, unless one
+  at or before now is stored. Both store the Revocation Reason, then
+  soft-delete the key, so transit refuses it for every cryptographic
+  operation. Revoke refuses a Destroyed object; a Revoke with a reason other
+  than a compromise also refuses a Pre-Active or Compromised object, as KMIP
+  1.4 has no such transition. Revoke writes the record first: if the
+  soft-delete then fails, the object already reports Compromised or
+  Deactivated, and a retry soft-deletes the key and keeps the first dates.
+- **Destroy** is soft. It refuses an Active object and succeeds without a
+  write on a Destroyed one. On a Pre-Active, Deactivated, or Compromised object
+  it soft-deletes the key unless it is soft-deleted already, then sets the
+  destroy mark and the Destroy Date. It never deletes the key, so
+  `deletion_allowed` has no effect on it. The soft-delete goes first, so Get
+  never returns material of an object that reports Destroyed; an interrupted
+  Destroy leaves the object Deactivated, and a retry finishes it. Get of a
+  Destroyed object fails as for any soft-deleted key; GetAttributes still
+  reports its State and dates.
+- **ReKey** refuses a Compromised or Destroyed object. A replacement copies the
+  stored dates, so a copied Deactivation Date in the past makes it report
+  Deactivated.
+
+Purging a destroyed key is an operator action outside KMIP: set
+`deletion_allowed` with [`<mount>/keys/<name>/config`][transit-key-config],
+then delete the key through transit. To undo a Destroy, restore the key with
+transit's `soft-delete-restore`, then remove `kmip/destroyed` and
+`kmip/attr/Destroy Date` from its metadata.
 
 ### ReKey
 
@@ -197,7 +289,8 @@ ReKey replaces a symmetric key with a new transit key, the next generation of
 its Name. The first generation of a Name is its anchor, with the Unique
 Identifier `<name>`; later generations are `<name>.2`, `<name>.3`, and so on.
 The anchor's record names the current generation, so Locate by exact Name
-reads at most two keys and their metadata, however often the Name was rekeyed.
+reads at most two keys and their metadata when no ReKey moves the Name during
+the lookup. If a concurrent ReKey moves it, Locate resolves the anchor again.
 
 - The replacement gets the Name, the stored attributes, including Activation
   Date and Deactivation Date, and a Link of type Replaced Object to the
@@ -206,9 +299,10 @@ reads at most two keys and their metadata, however often the Name was rekeyed.
   reports State Deactivated. It is not soft-deleted, so Get still returns its
   material until retention removes it.
 - ReKey sets the ID Placeholder to the replacement.
-- ReKey refuses an Offset, a key it already replaced, a soft-deleted key, and a
-  template that changes the Name, algorithm, length, or object type, or that
-  carries any other derived attribute, even one equal to the key's own.
+- ReKey refuses an Offset, a Compromised or Destroyed object, a key it already
+  replaced, a soft-deleted key, and a template that changes the Name,
+  algorithm, length, or object type, or that carries any other derived or
+  server-set attribute, even one equal to the key's own.
 
 The cert role's `kmip_rekey_retain` defaults to `0`, which keeps every
 generation and sends no retention soft-delete. A positive value opts into the
@@ -250,9 +344,16 @@ With `<mount>` the transit mount, the operations need:
 
 | Operation               | Method   | Path                                     | Capability                                  |
 | :---------------------- | :------- | :--------------------------------------- | :------------------------------------------ |
-| Create                  | `POST`   | `<mount>/keys/<name>`                    | `update`                                    |
+| Create                  | `GET`    | `<mount>/keys/<name>`                    | `read` (a template with stored attributes)  |
+|                         | `POST`   | `<mount>/keys/<name>`                    | `update`                                    |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (a template with stored attributes)  |
+|                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update` (a template with stored attributes) |
+|                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (that write failed, no Name given) |
 | Register                | `GET`    | `<mount>/wrapping_key`                   | `read`                                      |
 |                         | `POST`   | `<mount>/keys/<name>/import`             | `update`                                    |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (a template with stored attributes)  |
+|                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update` (a template with stored attributes) |
+|                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (only when that write fails)       |
 | Get                     | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
 |                         | `GET`    | `<mount>/export/<type>/<name>/<version>` | `read`                                      |
 | GetAttributes           | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
@@ -264,21 +365,31 @@ With `<mount>` the transit mount, the operations need:
 |                         | `GET`    | `<mount>/keys/<predecessor>`             | `read` (a `<name>.<n>` without a record)    |
 |                         | `GET`    | `<mount>/keys/<predecessor>/metadata`    | `read` (same optional predecessor check)     |
 |                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update`                                    |
+| ModifyAttribute, DeleteAttribute | `GET` | `<mount>/keys/<name>`             | `read`                                      |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (initial read and before the metadata write) |
+|                         | `GET`    | `<mount>/keys/<predecessor>`             | `read` (a `<name>.<n>` without a record)    |
+|                         | `GET`    | `<mount>/keys/<predecessor>/metadata`    | `read` (same optional predecessor check)     |
+|                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update`                                    |
 | ReKey                   | `GET`    | `<mount>/keys/<name>`                    | `read` (the key, replacement and anchor)    |
 |                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (key, replacement, and anchor; before each metadata write) |
 |                         | `POST`   | `<mount>/keys/<name>`                    | `update` (the replacement)                  |
 |                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update` (key, replacement, and anchor)     |
 |                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (retention, best effort)           |
 | Activate                | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (initial read, and before the write) |
+|                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update` (Pre-Active objects only)          |
 | Locate                  | `GET`    | `<mount>/keys/<name>`                    | `read` (with an exact Name or UID)          |
 |                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (Name, State, or stored-attribute filters; anchor and current for Name) |
 |                         | `GET`    | `<mount>/keys/<name>.<n>`                | `read` (exact Name, after a ReKey)          |
 |                         | `LIST`   | `<mount>/keys`                           | `list` (otherwise), then `read` on each key |
-| Revoke                  | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete`                                    |
-| Destroy                 | `GET`    | `<mount>/keys/<name>`                    | `read` (anchor check, skipped if denied)    |
-|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (anchor check after a successful key read) |
-|                         | `GET`    | `<mount>/keys/<name>.<n>`                | `read` (anchor of a rekeyed Name only)      |
-|                         | `DELETE` | `<mount>/keys/<name>`                    | `delete`                                    |
+| Revoke                  | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (initial read and before the metadata write) |
+|                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update`                                    |
+|                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (a key not soft-deleted yet)       |
+| Destroy                 | `GET`    | `<mount>/keys/<name>`                    | `read`                                      |
+|                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (initial read and before the metadata write) |
+|                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (a key not soft-deleted yet)       |
+|                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update` (not for a Destroyed object)       |
 | Encrypt                 | `POST`   | `<mount>/encrypt/<name>`                 | `update`                                    |
 | Decrypt                 | `POST`   | `<mount>/decrypt/<name>`                 | `update`                                    |
 | Sign                    | `POST`   | `<mount>/sign/<name>`                    | `update`                                    |
@@ -290,12 +401,16 @@ HMAC keys, and `signing-key` for RSA and ECDSA keys.
 
 When writing a policy, keep in mind:
 
-- **Revoke and Destroy use different paths.** Revoke deletes
-  `<mount>/keys/<name>/soft-delete` and Destroy deletes `<mount>/keys/<name>`.
-  A client that may do both needs `delete` on both paths, or on a glob such as
-  `<mount>/keys/app-*` that covers both. Destroy also needs the key's
-  `deletion_allowed` set, which KMIP never sets; an operator sets it with
-  [`<mount>/keys/<name>/config`][transit-key-config].
+- **Revoke and Destroy need the soft-delete path and the metadata.** Both
+  read `<mount>/keys/<name>`, read and update its metadata, and delete
+  `<mount>/keys/<name>/soft-delete`. Neither sends a `DELETE` to
+  `<mount>/keys/<name>`, so `delete` on that path is no longer needed. Denying
+  `delete` on `<mount>/keys/<name>/soft-delete` denies Revoke and Destroy: each
+  fails at the soft-delete, which Destroy skips only for a key soft-deleted
+  already. Revoke has written the record by then, so the object reports
+  Compromised or Deactivated while transit still serves the key. Activate
+  reads the metadata, and updates it for a Pre-Active object. Policies with
+  exact grants for these operations need the new paths.
 
 - **Grant `update`, not `create`, on `<mount>/encrypt/*`.** Transit's encrypt
   endpoint creates a missing key for a caller that holds `create`, so that
@@ -317,16 +432,10 @@ When writing a policy, keep in mind:
   only an exact grant on `<mount>/keys/<name>` gets an empty result, not an
   error, because a denied Locate read counts as no match.
 
-- **Destroy keeps a rekeyed Name.** Destroy refuses the first generation of
-  a Name while the generation the Name points at still exists, because that
-  key holds the record that resolves the Name. Destroy the later generations
-  first; the first generation can then be destroyed. The check reads the key,
-  its metadata, and, for a rekeyed Name, the generation it points at. A role
-  that may delete the key but not read it skips the check; one that may read
-  the key but not its metadata or that generation fails the Destroy. These
-  reads use the usual retry,
-  so a denied read costs a login, which keeps an expired token from skipping
-  the check.
+- **Destroy keeps a rekeyed Name.** The first generation of a rekeyed Name
+  holds the record that resolves the Name. Destroy keeps the key and its
+  record, so any generation can be destroyed and Locate by Name still finds
+  the current one.
 
 - **Restoring an older backup rolls a rekeyed Name back.** A transit restore
   under the key's own name brings back the key's metadata record as it was
@@ -364,6 +473,128 @@ When writing a policy, keep in mind:
 When a request is denied, the KMIP error names the path and the capability the
 policy is missing.
 
+## Limits and reload
+
+- `max_connections` `(integer: 1024)` limits accepted connections, including TLS
+  handshakes. Connections above the limit close without a KMIP reply.
+- `idle_timeout` `(duration: "10m")` closes a connection if it sends no complete
+  request within this time. Partial frames do not extend the deadline. Closing
+  a connection revokes its live service token.
+- `max_request_size` `(integer: 1048576)` limits the complete TTLV frame in bytes,
+  including its header and padding. This limit is separate from the HTTP JSON
+  request size. A larger limit permits larger allocations per connection.
+
+Negative values are invalid. Zero selects the default. `max_connections` and
+`idle_timeout` are valid only on KMIP listeners. SIGHUP reloads these three
+limits by listener address; existing connections keep their idle and frame
+limits. The connection count limit applies to the next accepted connection.
+TLS certificate reload also refreshes the listener certificate expiry metric.
+
+## Audit records
+
+Each KMIP batch item produces one request record and one response record through
+OpenBao's audit devices. This includes discovery, login failures, malformed
+frames, header refusals, and items cancelled after a batch error. Malformed
+frames with no decoded operation use `Unknown`. Normal transit audit records
+remain enabled.
+
+The records use the standard audit format:
+
+- `type` is `request` or `response`. Both records use the same `request.id`,
+  generated by the server for this item.
+- `request.operation` is `read` for Get, GetAttributes, GetAttributeList, Locate,
+  Query, and DiscoverVersions; it is `update` for other operations.
+- `request.path` is `<mount>/kmip/<Operation>`, or `kmip/<Operation>` before
+  login identifies the mount. `mount_point` is `<mount>/` when known and
+  `mount_type` is `transit`. `request.namespace` identifies the auth mount's namespace.
+- The standard connection fields contain `remote_address`, `remote_port`, and
+  `client_certificate_serial_number`.
+- `auth` contains the accessor, entity ID, policies, token policies, identity
+  policies, and metadata after login. The first request has an empty `auth`
+  object because login occurs during the operation. The session token is never
+  put in the KMIP record.
+- `request.data` contains `kmip_operation`, `client_certificate_subject`,
+  `unique_identifier` or `unique_identifiers` when present, and `transit_mount`
+  when known. The response contains the same metadata plus `outcome`,
+  `result_reason`, `result_message`, and `transit_request_ids`. The IDs link to
+  all HTTP requests caused by the operation, including denials and forwarding.
+- A failure sets the top-level `error`. Audit result messages use fixed text;
+  client replies can have more specific diagnostics authored by the listener.
+
+These metadata keys are excluded from HMAC, so paths, subjects, identifiers,
+and results are visible to audit consumers. Other standard fields retain the
+audit device's HMAC rules. KMIP records contain no bodies, Names, key bytes,
+plaintext, ciphertext, signatures, wrapped keys, or tokens.
+
+This abbreviated example pair shows a Get after login. Standard fields such as
+`time`, `namespace`, and the HMAC-protected identity fields are omitted here:
+
+```json
+{"type":"request","request":{"id":"f59fa12e-7062-42ad-9787-b539a14de564","operation":"read","path":"transit/kmip/Get","mount_point":"transit/","mount_type":"transit","data":{"kmip_operation":"Get","client_certificate_subject":"CN=app.example.com","unique_identifier":"app-key","transit_mount":"transit"}}}
+{"type":"response","request":{"id":"f59fa12e-7062-42ad-9787-b539a14de564","operation":"read","path":"transit/kmip/Get","mount_point":"transit/","mount_type":"transit","data":{"kmip_operation":"Get","client_certificate_subject":"CN=app.example.com","unique_identifier":"app-key","transit_mount":"transit"}},"response":{"data":{"kmip_operation":"Get","client_certificate_subject":"CN=app.example.com","unique_identifier":"app-key","transit_mount":"transit","outcome":"success","result_reason":"","result_message":"","transit_request_ids":["5cbda157-5ce1-47d1-9713-bbbe14c7f39d"]}}}
+```
+
+If request auditing fails, no item executes. If response auditing fails, the
+client receives General Failure and the operation may already have completed.
+Inspect transit records before retrying a write. A sealed store refuses every
+operation with a sealed message. Unsealing restores service on the same listener.
+
+## Metrics and alerts
+
+The listener emits these metrics through OpenBao telemetry. All have `listener`
+(the listening address) and the standard `cluster` label:
+
+| Metric | Kind | Additional labels |
+| :-- | :-- | :-- |
+| `kmip.connections_open` | Gauge | None |
+| `kmip.connections_accepted` | Counter | None |
+| `kmip.connections_refused` | Counter | `reason`: `limit` or `handshake` |
+| `kmip.operations` | Counter | `operation`, `outcome`: `success` or the KMIP Result Reason |
+| `kmip.operation_duration` | Summary, milliseconds | `operation` |
+| `kmip.errors` | Counter | `reason`: KMIP Result Reason, or `sealed` |
+| `kmip.server_certificate_expiry_seconds` | Gauge | None |
+| `kmip.client_certificate_expiry_seconds` | Gauge | `subject` |
+
+Operation and reason labels use known names or a fixed fallback. Identifiers
+and key names never become metric labels. Certificate subjects have unbounded
+cardinality: use a controlled set of subjects. With several active connections
+for one subject, the gauge uses their earliest certificate expiry. Certificate
+gauges refresh every 30 seconds and on connection or certificate changes.
+
+Closed subjects stop being emitted. Their last values can remain visible until
+`prometheus_retention_time` expires (default `24h`); set a suitable retention
+window and allow for stale samples in alerts. Prometheus replaces dots with
+underscores and normally prefixes metric names with `vault_`. The examples
+below assume `disable_hostname = true` and the default telemetry prefix:
+
+```yaml
+groups:
+  - name: kmip
+    rules:
+      - alert: KMIPListenerCertificateExpiry
+        expr: vault_kmip_server_certificate_expiry_seconds < 7 * 24 * 3600
+        for: 5m
+      - alert: OpenBaoSealed
+        expr: vault_core_unsealed == 0
+        for: 1m
+      - alert: OpenBaoMetricsAbsent
+        expr: absent(vault_core_unsealed)
+        for: 5m
+      - alert: KMIPSealedRefusals
+        expr: sum by (listener) (increase(vault_kmip_errors{reason="sealed"}[5m])) > 0
+      - alert: KMIPClientCertificateExpiry
+        expr: vault_kmip_client_certificate_expiry_seconds > 0 and vault_kmip_client_certificate_expiry_seconds < 7 * 24 * 3600
+        for: 5m
+```
+
+`OpenBaoSealed` uses the core `vault.core.unsealed` gauge, so it detects a
+sealed node with no KMIP traffic. `KMIPSealedRefusals` fires only when clients
+are refused. If a sealed node does not serve metrics to your scraper,
+`OpenBaoMetricsAbsent` fires instead.
+Scrape `/v1/sys/metrics` with a monitoring credential held outside this store,
+so a sealed store cannot prevent access to the credential. Configure metrics
+access on the HTTP listener for the node states that monitoring must cover.
+
 ## `kmip` listener examples
 
 ### Serving KMIP from the root namespace
@@ -387,10 +618,11 @@ named `app-*` in the `transit` mount:
 
 ```hcl
 # Create, Get, GetAttributes, GetAttributeList, Activate, Locate with a name,
-# and Destroy use transit/keys/<name>; Register uses
-# transit/keys/<name>/import; AddAttribute and ReKey use
-# transit/keys/<name>/metadata; Revoke and ReKey's retention use
-# transit/keys/<name>/soft-delete. The glob covers all of them, and the
+# Revoke, and Destroy use transit/keys/<name>; Register uses
+# transit/keys/<name>/import; Create and Register with stored template
+# attributes, the attribute operations, Activate, ReKey, Revoke, and Destroy
+# use transit/keys/<name>/metadata; Revoke, Destroy, and ReKey's retention
+# use transit/keys/<name>/soft-delete. The glob covers all of them, and the
 # replacements ReKey names <name>.2, <name>.3, and so on.
 path "transit/keys/app-*" {
   capabilities = ["read", "update", "delete"]

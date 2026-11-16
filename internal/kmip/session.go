@@ -5,6 +5,7 @@ package kmip
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"net/http"
 	"strconv"
@@ -12,8 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openbao/openbao/sdk/v2/logical"
 	kmiplib "github.com/ovh/kmip-go"
-	"github.com/ovh/kmip-go/kmipserver"
 )
 
 const (
@@ -38,9 +39,10 @@ type sessionKey struct{}
 // kmip-go serves a connection's messages one at a time; the lock only
 // matters when the connection closes during an operation.
 type session struct {
-	t          *translator
-	peerCerts  []*x509.Certificate
-	remoteAddr string
+	t               *translator
+	peerCerts       []*x509.Certificate
+	connectionState *tls.ConnectionState
+	remoteAddr      string
 
 	mu        sync.Mutex
 	token     string
@@ -51,6 +53,7 @@ type session struct {
 	keyPrefix string
 	retain    int
 	certRole  string
+	auth      *logical.Auth
 }
 
 func (t *translator) newSession(peerCerts []*x509.Certificate, remoteAddr string) *session {
@@ -77,7 +80,7 @@ func (s *session) credentials(ctx context.Context) (token, mount string, err err
 		return "", "", err
 	}
 	if s.mount == "" {
-		return "", "", kmipserver.Errorf(
+		return "", "", operationErrorf(
 			kmiplib.ResultReasonGeneralFailure,
 			"no transit mount for this client: set kmip_transit_mount on cert role %q or default_transit_mount on the kmip listener",
 			s.certRole,
@@ -132,6 +135,7 @@ func (s *session) loginLocked(ctx context.Context) error {
 		s.revoke(ctx, s.token)
 	}
 	s.token = ""
+	s.auth = nil
 
 	rep, err := s.t.roundTrip(ctx, s, "", request{
 		method: http.MethodPost,
@@ -146,10 +150,15 @@ func (s *session) loginLocked(ctx context.Context) error {
 		if rep.status >= http.StatusInternalServerError {
 			reason = kmiplib.ResultReasonGeneralFailure
 		}
-		return kmipserver.Errorf(reason, "login through %s failed: %s", rep.path, rep.message())
+		return operationErrorf(reason, "login through %s failed", rep.path)
 	}
 
 	auth := rep.Auth
+	s.auth = &logical.Auth{
+		Accessor: auth.Accessor, EntityID: auth.EntityID,
+		Policies: auth.Policies, TokenPolicies: auth.TokenPolicies,
+		IdentityPolicies: auth.IdentityPolicies, Metadata: auth.Metadata,
+	}
 	s.token = auth.ClientToken
 	s.batch = auth.TokenType == "batch"
 	s.expiry, s.refresh = time.Time{}, time.Time{}

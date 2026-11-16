@@ -22,6 +22,7 @@ import (
 	"github.com/hashicorp/go-uuid"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/sdk/v2/logical"
+	"github.com/openbao/openbao/v2/internal/helper/forwarding"
 	"github.com/openbao/openbao/v2/internal/vault"
 )
 
@@ -160,6 +161,7 @@ func buildLogicalRequestNoAuth(w http.ResponseWriter, r *http.Request) (*logical
 	if err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("failed to generate identifier for the request: %w", err)
 	}
+	forwarding.RecordRequestID(r.Context(), requestId)
 
 	// The http package removes the Host header when deserializing
 	// the http request.  This adds it back in so it is available

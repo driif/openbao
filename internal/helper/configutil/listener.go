@@ -149,8 +149,12 @@ type Listener struct {
 	// AuthMount and DefaultTransitMount configure a kmip listener: the
 	// namespace-qualified cert auth mount KMIP clients log in through, and
 	// the transit mount for clients whose cert role names none.
-	AuthMount           string `hcl:"auth_mount"`
-	DefaultTransitMount string `hcl:"default_transit_mount"`
+	AuthMount           string        `hcl:"auth_mount"`
+	DefaultTransitMount string        `hcl:"default_transit_mount"`
+	MaxConnections      int           `hcl:"-"`
+	MaxConnectionsRaw   any           `hcl:"max_connections"`
+	IdleTimeout         time.Duration `hcl:"-"`
+	IdleTimeoutRaw      any           `hcl:"idle_timeout"`
 
 	AgentAPI *AgentAPI `hcl:"agent_api"`
 
@@ -693,12 +697,37 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 // none of the HTTP listener's clustering or ACME.
 func validateKMIPListener(l *Listener) error {
 	if l.Type != "kmip" {
-		if l.AuthMount != "" || l.DefaultTransitMount != "" {
-			return errors.New("auth_mount and default_transit_mount are only valid on kmip listeners")
+		if l.AuthMount != "" || l.DefaultTransitMount != "" || l.MaxConnectionsRaw != nil || l.IdleTimeoutRaw != nil || l.MaxConnections != 0 || l.IdleTimeout != 0 {
+			return errors.New("auth_mount, default_transit_mount, max_connections and idle_timeout are only valid on kmip listeners")
 		}
 		return nil
 	}
 
+	if l.MaxConnectionsRaw != nil {
+		n, err := parseutil.ParseInt(l.MaxConnectionsRaw)
+		if err != nil {
+			return fmt.Errorf("error parsing max_connections: %w", err)
+		}
+		l.MaxConnections = int(n)
+		l.MaxConnectionsRaw = nil
+	}
+	if l.IdleTimeoutRaw != nil {
+		d, err := parseutil.ParseDurationSecond(l.IdleTimeoutRaw)
+		if err != nil {
+			return fmt.Errorf("error parsing idle_timeout: %w", err)
+		}
+		l.IdleTimeout = d
+		l.IdleTimeoutRaw = nil
+	}
+	if l.MaxConnections < 0 || l.IdleTimeout < 0 || l.MaxRequestSize < 0 {
+		return errors.New("kmip max_connections, idle_timeout and max_request_size cannot be negative")
+	}
+	if l.MaxConnections == 0 {
+		l.MaxConnections = 1024
+	}
+	if l.IdleTimeout == 0 {
+		l.IdleTimeout = 10 * time.Minute
+	}
 	l.AuthMount = strings.Trim(l.AuthMount, "/")
 	l.DefaultTransitMount = strings.Trim(l.DefaultTransitMount, "/")
 	segments := strings.Split(l.AuthMount, "/")

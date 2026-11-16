@@ -10,7 +10,6 @@ import (
 	"time"
 
 	kmiplib "github.com/ovh/kmip-go"
-	"github.com/ovh/kmip-go/kmipserver"
 	"github.com/ovh/kmip-go/ttlv"
 )
 
@@ -66,7 +65,7 @@ func transitKeyType(alg kmiplib.CryptographicAlgorithm, bitlen int32) (keyType s
 		}
 	}
 
-	return "", 0, kmipserver.Errorf(
+	return "", 0, operationErrorf(
 		kmiplib.ResultReasonFeatureNotSupported,
 		"unsupported algorithm %s with length %d", ttlv.EnumStr(alg), bitlen,
 	)
@@ -147,20 +146,98 @@ func (k *keyInfo) kmipAttrs() (kmiplib.CryptographicAlgorithm, int32, kmiplib.Ob
 		return kmiplib.CryptographicAlgorithmECDSA, 521, kmiplib.ObjectTypePrivateKey, nil
 	}
 	// ed25519 has no algorithm in kmip-go, and KMIP defines no XChaCha20.
-	return 0, 0, 0, kmipserver.Errorf(
+	return 0, 0, 0, operationErrorf(
 		kmiplib.ResultReasonFeatureNotSupported,
 		"transit key type %q has no KMIP representation", k.Type,
 	)
 }
 
-// state reports a soft-deleted key, and a key ReKey replaced, as
-// Deactivated; every other key is Active from the moment transit creates
-// it. A replaced key keeps its material until retention soft-deletes it.
+// state derives the object's State, in this order: the destroy mark gives
+// Destroyed, or Destroyed Compromised with the compromise mark too; the
+// compromise mark gives Compromised; a key that is soft-deleted, replaced by
+// ReKey, or past a stored Deactivation Date is Deactivated; a key before a
+// stored Activation Date is Pre-Active; any other key is Active. A key is
+// Active from the moment transit creates it unless the client stored a
+// later Activation Date. A replaced key keeps its material until retention
+// soft-deletes it. The dates change only the reported State: no
+// cryptographic operation reads them. A stored date that does not decode
+// counts as absent; checkedState reports it.
 func (k *keyInfo) state() kmiplib.State {
-	if k.SoftDeleted || k.replacement() != "" {
-		return kmiplib.StateDeactivated
+	state, _ := k.checkedState()
+	return state
+}
+
+// checkedState is state that also returns an error for a stored Activation
+// Date or Deactivation Date that is not one date. An operation that makes
+// an object less restricted, such as Activate, must not act on a State that
+// such a date could change.
+func (k *keyInfo) checkedState() (kmiplib.State, error) {
+	compromised := k.single(entryCompromised) != ""
+	switch {
+	case k.single(entryDestroyed) != "" && compromised:
+		return kmiplib.StateDestroyedCompromised, nil
+	case k.single(entryDestroyed) != "":
+		return kmiplib.StateDestroyed, nil
+	case compromised:
+		return kmiplib.StateCompromised, nil
+	case k.SoftDeleted || k.replacement() != "":
+		return kmiplib.StateDeactivated, nil
 	}
-	return kmiplib.StateActive
+	deactivation, deactivated, deactivationErr := k.storedDate(kmiplib.AttributeNameDeactivationDate)
+	activation, activates, activationErr := k.storedDate(kmiplib.AttributeNameActivationDate)
+	err := deactivationErr
+	if err == nil {
+		err = activationErr
+	}
+	now := time.Now()
+	switch {
+	case deactivated && !deactivation.After(now):
+		return kmiplib.StateDeactivated, err
+	case activates && activation.After(now):
+		return kmiplib.StatePreActive, err
+	}
+	return kmiplib.StateActive, err
+}
+
+// storedDate returns the stored date attribute name, and false when the
+// record holds none. An entry that is not one instance of a date returns an
+// error.
+func (k *keyInfo) storedDate(name kmiplib.AttributeName) (time.Time, bool, error) {
+	values := k.entry(attrEntry(name))
+	if len(values) == 0 {
+		return time.Time{}, false, nil
+	}
+	if len(values) > 1 {
+		return time.Time{}, false, operationErrorf(kmiplib.ResultReasonGeneralFailure, "object %q stores %d values of the single-instance attribute %s", k.Name, len(values), name)
+	}
+	attr, err := decodeAttr(k.Name, values[0])
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	at, ok := attr.AttributeValue.(time.Time)
+	if !ok || attr.AttributeName != name {
+		return time.Time{}, false, operationErrorf(kmiplib.ResultReasonGeneralFailure, "object %q has a stored %s that is not a date", k.Name, name)
+	}
+	return at, true, nil
+}
+
+// withRecord returns a copy of the key with record as its metadata, so a
+// writeMetadataFunc mutation can derive the State from the record it
+// changes.
+func (k *keyInfo) withRecord(record metadataRecord) *keyInfo {
+	out := *k
+	out.Metadata = record
+	return &out
+}
+
+// initialDate returns the object's Initial Date: when the first key version
+// was created, not the latest rotation, or the oldest version still kept if
+// version 1 was archived.
+func (k *keyInfo) initialDate() (time.Time, bool) {
+	if created, ok := k.createdAt(1); ok {
+		return created, true
+	}
+	return k.createdAt(k.MinDecryptionVersion)
 }
 
 // createdAt returns when a key version was created. Transit reports it as
@@ -210,14 +287,14 @@ func (k *keyInfo) publicKey(alg kmiplib.CryptographicAlgorithm, bitlen int32) (k
 	}
 	raw := k.Keys[strconv.Itoa(k.LatestVersion)]
 	if err := json.Unmarshal(raw, &ver); err != nil || ver.PublicKey == "" {
-		return nil, kmipserver.Errorf(
+		return nil, operationErrorf(
 			kmiplib.ResultReasonGeneralFailure,
 			"transit returned no public key for version %d of %q", k.LatestVersion, k.Name,
 		)
 	}
 	block, _ := pem.Decode([]byte(ver.PublicKey))
 	if block == nil {
-		return nil, kmipserver.Errorf(
+		return nil, operationErrorf(
 			kmiplib.ResultReasonGeneralFailure,
 			"transit returned a public key for %q that is not PEM", k.Name,
 		)

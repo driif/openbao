@@ -5,14 +5,51 @@ package forwarding
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
+	"sync"
 
 	"github.com/openbao/openbao/v2/internal/helper/buffer"
 )
+
+// RequestIDMetadata is internal RPC response metadata, never an HTTP header.
+const RequestIDMetadata = "openbao-internal-request-ids"
+
+type requestIDsKey struct{}
+
+// RequestIDs collects server-generated IDs, including calls that return errors.
+type RequestIDs struct {
+	mu  sync.Mutex
+	ids []string
+}
+
+func WithRequestIDs(ctx context.Context) (context.Context, *RequestIDs) {
+	ids := new(RequestIDs)
+	return context.WithValue(ctx, requestIDsKey{}, ids), ids
+}
+
+func RecordRequestID(ctx context.Context, id string) {
+	ids, _ := ctx.Value(requestIDsKey{}).(*RequestIDs)
+	if ids == nil || id == "" {
+		return
+	}
+	ids.mu.Lock()
+	defer ids.mu.Unlock()
+	if !slices.Contains(ids.ids, id) {
+		ids.ids = append(ids.ids, id)
+	}
+}
+
+func (ids *RequestIDs) Values() []string {
+	ids.mu.Lock()
+	defer ids.mu.Unlock()
+	return slices.Clone(ids.ids)
+}
 
 type bufCloser struct {
 	*bytes.Buffer

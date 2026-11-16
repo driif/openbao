@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -30,6 +31,7 @@ import (
 	kmiplib "github.com/ovh/kmip-go"
 	"github.com/ovh/kmip-go/kmipserver"
 	"github.com/ovh/kmip-go/payloads"
+	"github.com/ovh/kmip-go/ttlv"
 	"github.com/stretchr/testify/require"
 	"github.com/tink-crypto/tink-go/v2/kwp/subtle"
 
@@ -278,7 +280,7 @@ func TestTranslator_RequestsCarryClientIdentity(t *testing.T) {
 	bao.route(http.MethodPost, "transit/keys/app-a", keyRoute("aes256-gcm96", nil))
 	ctx, _ := newTestSession(t, bao, Config{})
 
-	id, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256)
+	id, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
 	require.NoError(t, err)
 	require.Equal(t, "app-a", id)
 
@@ -351,7 +353,7 @@ func TestTranslator_LoginFailure(t *testing.T) {
 	ctx, _ := newTestSession(t, bao, Config{})
 
 	_, err := op(t, ctx).readKey(ctx, "k")
-	require.ErrorContains(t, err, "login through auth/cert/login failed: no chain matching all constraints")
+	require.ErrorContains(t, err, "login through auth/cert/login failed")
 	require.Len(t, bao.all(), 1)
 }
 
@@ -397,7 +399,7 @@ func TestTranslator_NoRetryAfterServerError(t *testing.T) {
 	ctx, _ := newTestSession(t, bao, Config{})
 
 	_, err := op(t, ctx).readKey(ctx, "k")
-	require.ErrorContains(t, err, "GET transit/keys/k: status 500: storage unavailable")
+	require.ErrorContains(t, err, "GET transit/keys/k: status 500")
 	require.Len(t, bao.sent(http.MethodGet, "transit/keys/k"), 1)
 	require.Equal(t, 1, bao.loginCount())
 }
@@ -407,7 +409,7 @@ func TestTranslator_RejectsNamesOutsideTransitCharset(t *testing.T) {
 	ctx, _ := newTestSession(t, bao, Config{})
 
 	for _, name := range []string{"../sys/seal", "a/b", "key?x", "-lead", "trail-"} {
-		_, err := op(t, ctx).create(ctx, name, kmiplib.CryptographicAlgorithmAES, 256)
+		_, err := op(t, ctx).create(ctx, name, kmiplib.CryptographicAlgorithmAES, 256, nil)
 		require.ErrorContains(t, err, "invalid key name", name)
 
 		_, err = op(t, ctx).get(ctx, name)
@@ -427,7 +429,7 @@ func TestTranslator_Create(t *testing.T) {
 		}))
 		ctx, _ := newTestSession(t, bao, Config{})
 
-		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256)
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
 		require.ErrorContains(t, err, `key "app-a" already exists`)
 	})
 
@@ -436,7 +438,7 @@ func TestTranslator_Create(t *testing.T) {
 		bao.fallback = keyRoute("hmac", map[string]any{"key_size": 64})
 		ctx, _ := newTestSession(t, bao, Config{})
 
-		id, err := op(t, ctx).create(ctx, "", kmiplib.CryptographicAlgorithmHMACSHA256, 512)
+		id, err := op(t, ctx).create(ctx, "", kmiplib.CryptographicAlgorithmHMACSHA256, 512, nil)
 		require.NoError(t, err)
 		require.Regexp(t, `^app-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, id)
 
@@ -449,7 +451,7 @@ func TestTranslator_Create(t *testing.T) {
 		bao := newFakeBao(t)
 		ctx, _ := newTestSession(t, bao, Config{})
 
-		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 192)
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 192, nil)
 		require.ErrorContains(t, err, "unsupported algorithm")
 		require.Empty(t, bao.all())
 	})
@@ -470,7 +472,7 @@ func TestTranslator_RegisterWrapsMaterial(t *testing.T) {
 	ctx, _ := newTestSession(t, bao, Config{})
 
 	material := []byte("0123456789abcdef0123456789abcdef")
-	id, err := op(t, ctx).register(ctx, "app-imported", kmiplib.CryptographicAlgorithmAES, 256, material)
+	id, err := op(t, ctx).register(ctx, "app-imported", kmiplib.CryptographicAlgorithmAES, 256, material, nil)
 	require.NoError(t, err)
 	require.Equal(t, "app-imported", id)
 
@@ -681,7 +683,7 @@ func TestTranslator_LocatePropagatesCandidateErrors(t *testing.T) {
 	ctx, _ := newTestSession(t, bao, Config{})
 
 	_, err := op(t, ctx).locate(ctx, nil)
-	require.ErrorContains(t, err, "GET transit/keys/rsa: status 500: storage unavailable")
+	require.ErrorContains(t, err, "GET transit/keys/rsa: status 500")
 }
 
 func TestTranslator_LocateEmptyMount(t *testing.T) {
@@ -712,33 +714,40 @@ func TestHandleLocate_Pages(t *testing.T) {
 }
 
 func TestTranslator_Lifecycle(t *testing.T) {
-	bao := newFakeBao(t)
-	bao.route(http.MethodGet, "transit/keys/active", keyRoute("aes256-gcm96", nil))
-	bao.route(http.MethodGet, "transit/keys/active/metadata", respond(http.StatusOK, withData(map[string]any{"custom_metadata": map[string]string{}, "version": 0})))
-	bao.route(http.MethodGet, "transit/keys/revoked", keyRoute("aes256-gcm96", map[string]any{"soft_deleted": true}))
-	bao.route(http.MethodDelete, "transit/keys/active/soft-delete",
-		keyRoute("aes256-gcm96", map[string]any{"soft_deleted": true}))
-	// transit answers a soft-delete of a missing key with no content
-	bao.route(http.MethodDelete, "transit/keys/gone/soft-delete", respond(http.StatusNoContent, nil))
-	bao.route(http.MethodDelete, "transit/keys/active", respond(http.StatusNoContent, nil))
-	bao.route(http.MethodDelete, "transit/keys/kept", respond(http.StatusBadRequest,
-		withErrors("error deleting policy kept: deletion is not allowed for this key")))
-	bao.route(http.MethodDelete, "transit/keys/gone", respond(http.StatusBadRequest,
-		withErrors("error deleting policy gone: could not delete key; not found")))
+	bao, m := transitBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
+	m.createKey("active")
 
+	// Activate of an Active key reads it and writes nothing.
+	start := len(bao.all())
 	require.NoError(t, op(t, ctx).activate(ctx, "active"))
-	require.ErrorContains(t, op(t, ctx).activate(ctx, "revoked"), "wrong key lifecycle state")
+	require.Equal(t, []string{"GET transit/keys/active", "GET transit/keys/active/metadata"}, since(bao, start))
 
-	require.NoError(t, op(t, ctx).revoke(ctx, "active"))
-	require.Len(t, bao.sent(http.MethodDelete, "transit/keys/active/soft-delete"), 1)
-	require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/active"))
-	require.ErrorContains(t, op(t, ctx).revoke(ctx, "gone"), `object "gone" not found`)
+	// Revoke writes the record, then soft-deletes the key.
+	start = len(bao.all())
+	require.NoError(t, op(t, ctx).revoke(ctx, "active", unspecified, nil))
+	require.Equal(t, []string{
+		"GET transit/keys/active", "GET transit/keys/active/metadata",
+		"GET transit/keys/active/metadata", "POST transit/keys/active/metadata",
+		"DELETE transit/keys/active/soft-delete",
+	}, since(bao, start))
+	require.True(t, m.key("active").SoftDeleted)
+	requireReason(t, op(t, ctx).activate(ctx, "active"), kmiplib.ResultReasonPermissionDenied, "wrong key lifecycle state")
+	requireReason(t, op(t, ctx).revoke(ctx, "gone", unspecified, nil), kmiplib.ResultReasonItemNotFound, `object "gone" not found`)
 
+	// Destroy of a soft-deleted key writes the record only, and never
+	// deletes the key.
+	start = len(bao.all())
 	require.NoError(t, op(t, ctx).destroy(ctx, "active"))
-	require.Len(t, bao.sent(http.MethodDelete, "transit/keys/active"), 1)
-	require.ErrorContains(t, op(t, ctx).destroy(ctx, "kept"), "until deletion_allowed is set with keys/kept/config")
-	require.ErrorContains(t, op(t, ctx).destroy(ctx, "gone"), `object "gone" not found`)
+	require.Equal(t, []string{
+		"GET transit/keys/active", "GET transit/keys/active/metadata",
+		"GET transit/keys/active/metadata", "POST transit/keys/active/metadata",
+	}, since(bao, start))
+	require.NotNil(t, m.key("active"))
+	requireReason(t, op(t, ctx).destroy(ctx, "gone"), kmiplib.ResultReasonItemNotFound, `object "gone" not found`)
+	for _, r := range bao.all() {
+		require.NotEqual(t, http.MethodDelete+" transit/keys/active", r.method+" "+r.path)
+	}
 }
 
 func TestHandleQuery_AnsweredLocally(t *testing.T) {
@@ -756,7 +765,9 @@ func TestConnect_RequiresClientCertificate(t *testing.T) {
 	tr, err := newTranslator(newFakeBao(t), Config{AuthMount: "auth/cert"})
 	require.NoError(t, err)
 
-	_, err = tr.connect(t.Context())
+	ln := newHandshakeListener(nil, time.Second)
+	ln.t = tr
+	_, err = ln.connect(t.Context())
 	require.ErrorContains(t, err, "client certificate required")
 }
 
@@ -1167,8 +1178,13 @@ func requireAttr(t *testing.T, attrs []kmiplib.Attribute, name kmiplib.Attribute
 }
 
 var (
-	testActivation   = time.Unix(1700000000, 0)
-	testDeactivation = time.Unix(1800000000, 0)
+	testActivation = time.Unix(1700000000, 0)
+	// A stored Deactivation Date at or before now makes State Deactivated,
+	// so the one every Active test key carries lies far ahead.
+	testDeactivation = time.Unix(4000000000, 0)
+
+	// unspecified is the Revocation Reason of a Revoke that deactivates.
+	unspecified = kmiplib.RevocationReason{RevocationReasonCode: kmiplib.RevocationReasonCodeUnspecified}
 )
 
 // newRekeyKey creates the AES key app-r through KMIP with one instance of
@@ -1176,7 +1192,7 @@ var (
 func newRekeyKey(t *testing.T, ctx context.Context) {
 	t.Helper()
 
-	_, err := op(t, ctx).create(ctx, "app-r", kmiplib.CryptographicAlgorithmAES, 256)
+	_, err := op(t, ctx).create(ctx, "app-r", kmiplib.CryptographicAlgorithmAES, 256, nil)
 	require.NoError(t, err)
 	for _, attr := range []kmiplib.Attribute{
 		customAttr("x-tag", "blue"),
@@ -1213,7 +1229,7 @@ func requireRekeyed(t *testing.T, m *transitMount, anchor, pred, succ string, ge
 func TestTranslator_AddAttribute(t *testing.T) {
 	bao, _ := transitBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
-	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256)
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
 	require.NoError(t, err)
 
 	start := len(bao.all())
@@ -1264,7 +1280,7 @@ func TestTranslator_AddAttribute(t *testing.T) {
 func TestTranslator_AddAttributeRefusals(t *testing.T) {
 	bao, _ := transitBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
-	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256)
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
 	require.NoError(t, err)
 	start := len(bao.all())
 
@@ -1299,7 +1315,7 @@ func TestTranslator_AddAttributeRefusals(t *testing.T) {
 
 	// A record over transit's bounds is an invalid field.
 	err = op(t, ctx).addAttribute(ctx, "app-a", customAttr("x-big", strings.Repeat("v", 8<<10)))
-	requireReason(t, err, kmiplib.ResultReasonInvalidField, "the limit is 8192")
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, "invalid request")
 
 	// A missing object is not found.
 	err = op(t, ctx).addAttribute(ctx, "app-missing", customAttr("x-tag", "blue"))
@@ -1309,7 +1325,7 @@ func TestTranslator_AddAttributeRefusals(t *testing.T) {
 func requireReason(t *testing.T, err error, reason kmiplib.ResultReason, msg string) {
 	t.Helper()
 	require.ErrorContains(t, err, msg)
-	kerr, ok := err.(kmipserver.Error)
+	kerr, ok := errors.AsType[kmipserver.Error](err)
 	require.True(t, ok, "%T: %v", err, err)
 	require.Equal(t, reason, kerr.Reason)
 }
@@ -1331,7 +1347,7 @@ func TestTranslator_MetadataWriteDenied(t *testing.T) {
 func TestTranslator_UsageMaskIsNotEnforced(t *testing.T) {
 	bao, _ := transitBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
-	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256)
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
 	require.NoError(t, err)
 
 	verifyOnly := kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageVerify}
@@ -1344,9 +1360,9 @@ func TestTranslator_UsageMaskIsNotEnforced(t *testing.T) {
 	require.NoError(t, err)
 
 	// A revoked key is refused by transit itself.
-	require.NoError(t, op(t, ctx).revoke(ctx, "app-a"))
+	require.NoError(t, op(t, ctx).revoke(ctx, "app-a", unspecified, nil))
 	_, err = op(t, ctx).encrypt(ctx, "app-a", []byte("refused"))
-	require.ErrorContains(t, err, "refusing to use soft-deleted key")
+	require.ErrorContains(t, err, "invalid request")
 }
 
 // The crypto operations send one request each, as before attributes
@@ -1384,9 +1400,9 @@ func TestTranslator_ReservedNameSuffix(t *testing.T) {
 	bao := newFakeBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
 
-	_, err := op(t, ctx).create(ctx, "app-a.2", kmiplib.CryptographicAlgorithmAES, 256)
+	_, err := op(t, ctx).create(ctx, "app-a.2", kmiplib.CryptographicAlgorithmAES, 256, nil)
 	requireReason(t, err, kmiplib.ResultReasonInvalidField, "reserved for the replacements ReKey creates")
-	_, err = op(t, ctx).register(ctx, "app-a.10", kmiplib.CryptographicAlgorithmAES, 256, make([]byte, 32))
+	_, err = op(t, ctx).register(ctx, "app-a.10", kmiplib.CryptographicAlgorithmAES, 256, make([]byte, 32), nil)
 	requireReason(t, err, kmiplib.ResultReasonInvalidField, "reserved for the replacements ReKey creates")
 	require.Empty(t, bao.all())
 }
@@ -1520,7 +1536,7 @@ func TestTranslator_RekeyTemplateAndRefusals(t *testing.T) {
 
 	// A soft-deleted key is refused.
 	m.createKey("app-gone")
-	require.NoError(t, op(t, ctx).revoke(ctx, "app-gone"))
+	require.NoError(t, op(t, ctx).revoke(ctx, "app-gone", unspecified, nil))
 	_, err = op(t, ctx).rekey(ctx, "app-gone", nil, nil)
 	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "wrong key lifecycle state")
 }
@@ -1744,7 +1760,7 @@ func TestTranslator_RekeySuccessorExists(t *testing.T) {
 		// marker is cleared.
 		m.failOnce(func(r fakeRequest) bool { return isMetadataWrite(r, "app-r", "delete", entryPending) }, false)
 		_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
-		require.ErrorContains(t, err, "injected failure")
+		require.ErrorContains(t, err, "status 500")
 
 		start := len(bao.all())
 		id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
@@ -1799,7 +1815,7 @@ func TestTranslator_RekeyInterrupted(t *testing.T) {
 
 				m.failOnce(b.match, applied)
 				_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
-				require.ErrorContains(t, err, "injected failure")
+				require.ErrorContains(t, err, "status 500")
 
 				id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
 				if b.name == "link" && applied {
@@ -1851,30 +1867,29 @@ func TestTranslator_RekeyRefusedCreateClearsMarker(t *testing.T) {
 	require.Empty(t, m.record("app-r")[entryCurrent])
 }
 
-// Destroying the first generation of a rekeyed Name would delete the record
-// that resolves the Name: Locate by Name would find nothing, the next ReKey
-// could not commit, and a Create could reuse the Name. deletion_allowed is
-// set, so without the guard the delete would go through.
-func TestTranslator_DestroyRefusesAnchorOfRekeyedName(t *testing.T) {
+// The first generation of a rekeyed Name holds the record that resolves the
+// Name. Destroy keeps the key and its record, so destroying that generation
+// loses nothing: Locate by Name still finds the current generation, even
+// with deletion_allowed set.
+func TestTranslator_DestroyKeepsAnchorOfRekeyedName(t *testing.T) {
 	bao, m := transitBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
 	newRekeyKey(t, ctx)
 	id, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
 	require.NoError(t, err)
 	require.Equal(t, "app-r.2", id)
+	status, raw := m.do(http.MethodPost, "keys/app-r/config", map[string]any{"deletion_allowed": true})
+	require.Equal(t, http.StatusOK, status, string(raw))
 
-	allowDeletion := func(name string) {
-		t.Helper()
-		status, raw := m.do(http.MethodPost, "keys/"+name+"/config", map[string]any{"deletion_allowed": true})
-		require.Equal(t, http.StatusOK, status, string(raw))
-	}
-	allowDeletion("app-r")
+	// The replaced anchor is Deactivated, so Destroy accepts it.
+	require.NoError(t, op(t, ctx).destroy(ctx, "app-r"))
+	anchor := m.key("app-r")
+	require.NotNil(t, anchor, "the anchor was deleted")
+	require.True(t, anchor.SoftDeleted)
+	require.Equal(t, kmiplib.StateDestroyed, anchor.state())
+	require.Equal(t, []string{"app-r.2"}, anchor.entry(entryCurrent))
+	require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-r"))
 
-	err = op(t, ctx).destroy(ctx, "app-r")
-	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `"app-r.2"`)
-	require.NotNil(t, m.key("app-r"), "the anchor was deleted")
-
-	// The Name still resolves to its current generation.
 	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
 		AttributeName:  kmiplib.AttributeNameName,
 		AttributeValue: kmiplib.Name{NameValue: "app-r"},
@@ -1882,20 +1897,11 @@ func TestTranslator_DestroyRefusesAnchorOfRekeyedName(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"app-r.2"}, ids)
 
-	// Destroying the later generation first releases the anchor: current
-	// still names app-r.2, but that key is gone, so the Name has nothing
-	// left to lose.
-	allowDeletion("app-r.2")
-	require.NoError(t, op(t, ctx).destroy(ctx, "app-r.2"))
-	require.NoError(t, op(t, ctx).destroy(ctx, "app-r"))
-	require.Nil(t, m.key("app-r"))
-
-	// A key that no ReKey replaced is destroyed as before.
-	_, err = op(t, ctx).create(ctx, "plain", kmiplib.CryptographicAlgorithmAES, 256)
+	// The Name moves on as before.
+	id, err = op(t, ctx).rekey(ctx, "app-r.2", nil, nil)
 	require.NoError(t, err)
-	allowDeletion("plain")
-	require.NoError(t, op(t, ctx).destroy(ctx, "plain"))
-	require.Nil(t, m.key("plain"))
+	require.Equal(t, "app-r.3", id)
+	requireRekeyed(t, m, "app-r", "app-r.2", "app-r.3", 3)
 }
 
 // A ReKey that committed and then failed to link the predecessor is
@@ -1911,7 +1917,7 @@ func TestTranslator_RekeyRepairsLinkAfterNameMoved(t *testing.T) {
 		return isMetadataWrite(r, "app-r", "link", linkEntry(kmiplib.LinkTypeReplacementObjectLink))
 	}, false)
 	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
-	require.ErrorContains(t, err, "injected failure")
+	require.ErrorContains(t, err, "status 500")
 
 	// The Name already resolves to the replacement, and a client rekeys it.
 	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{
@@ -1966,7 +1972,7 @@ func TestTranslator_RekeyRepairsLinkAfterSweep(t *testing.T) {
 		return isMetadataWrite(r, "app-r", "link", linkEntry(kmiplib.LinkTypeReplacementObjectLink))
 	}, false)
 	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
-	require.ErrorContains(t, err, "injected failure")
+	require.ErrorContains(t, err, "status 500")
 
 	id, err := op(t, ctx).rekey(ctx, "app-r.2", nil, nil)
 	require.NoError(t, err)
@@ -2182,7 +2188,7 @@ func TestTranslator_LocateSkipsUndecodableMetadata(t *testing.T) {
 	bao, m := transitBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
 	for _, name := range []string{"app-a", "app-b"} {
-		_, err := op(t, ctx).create(ctx, name, kmiplib.CryptographicAlgorithmAES, 256)
+		_, err := op(t, ctx).create(ctx, name, kmiplib.CryptographicAlgorithmAES, 256, nil)
 		require.NoError(t, err)
 		_, err = op(t, ctx).addAttributeAt(ctx, name, customAttr("x-tag", "blue"))
 		require.NoError(t, err)
@@ -2452,11 +2458,11 @@ func TestTranslator_LocateByStoredAttribute(t *testing.T) {
 	bao, _ := transitBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
 	for name, tag := range map[string]string{"app-a": "blue", "app-b": "red"} {
-		_, err := op(t, ctx).create(ctx, name, kmiplib.CryptographicAlgorithmAES, 256)
+		_, err := op(t, ctx).create(ctx, name, kmiplib.CryptographicAlgorithmAES, 256, nil)
 		require.NoError(t, err)
 		require.NoError(t, op(t, ctx).addAttribute(ctx, name, customAttr("x-tag", tag)))
 	}
-	_, err := op(t, ctx).create(ctx, "app-c", kmiplib.CryptographicAlgorithmAES, 256)
+	_, err := op(t, ctx).create(ctx, "app-c", kmiplib.CryptographicAlgorithmAES, 256, nil)
 	require.NoError(t, err)
 
 	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{customAttr("x-tag", "blue")})
@@ -2578,4 +2584,1039 @@ func TestTranslator_RekeyRetainAll(t *testing.T) {
 			}
 		})
 	}
+}
+
+func dateAttr(name kmiplib.AttributeName, at time.Time) kmiplib.Attribute {
+	return kmiplib.Attribute{AttributeName: name, AttributeValue: at}
+}
+
+func templateOf(attrs ...kmiplib.Attribute) *kmiplib.TemplateAttribute {
+	return &kmiplib.TemplateAttribute{Attribute: attrs}
+}
+
+// attrOf returns the value of the only instance of name that uid has.
+func attrOf(t *testing.T, ctx context.Context, uid string, name kmiplib.AttributeName) any {
+	t.Helper()
+	attrs, err := op(t, ctx).getAttributes(ctx, uid, []kmiplib.AttributeName{name})
+	require.NoError(t, err)
+	got := attrsNamed(attrs, name)
+	require.Len(t, got, 1, "instances of %s on %s", name, uid)
+	return got[0].AttributeValue
+}
+
+// requireDate checks that uid's only instance of name is the date want, to
+// the second, which is all KMIP keeps.
+func requireDate(t *testing.T, ctx context.Context, uid string, name kmiplib.AttributeName, want time.Time) {
+	t.Helper()
+	got, ok := attrOf(t, ctx, uid, name).(time.Time)
+	require.True(t, ok, "%s is not a date", name)
+	require.Equal(t, want.Unix(), got.Unix(), "%s", name)
+}
+
+// requireRecent checks that uid's only instance of name is a date close to
+// now.
+func requireRecent(t *testing.T, ctx context.Context, uid string, name kmiplib.AttributeName) time.Time {
+	t.Helper()
+	got, ok := attrOf(t, ctx, uid, name).(time.Time)
+	require.True(t, ok, "%s is not a date", name)
+	require.WithinDuration(t, time.Now(), got, 10*time.Second, "%s", name)
+	return got
+}
+
+// newPreActive creates the AES key uid through KMIP with an Activation Date
+// an hour ahead.
+func newPreActive(t *testing.T, ctx context.Context, uid string) {
+	t.Helper()
+	_, err := op(t, ctx).create(ctx, uid, kmiplib.CryptographicAlgorithmAES, 256,
+		templateOf(dateAttr(kmiplib.AttributeNameActivationDate, time.Now().Add(time.Hour))))
+	require.NoError(t, err)
+	require.Equal(t, kmiplib.StatePreActive, attrOf(t, ctx, uid, kmiplib.AttributeNameState))
+}
+
+// Every row of the State precedence, from the record and the transit key
+// alone.
+func TestKeyInfo_State(t *testing.T) {
+	past, future := time.Now().Add(-time.Hour), time.Now().Add(time.Hour)
+	mark := func(entry string) map[string][]string { return map[string][]string{entry: {markSet}} }
+	date := func(name kmiplib.AttributeName, at time.Time) map[string][]string {
+		return map[string][]string{attrEntry(name): {encodeAttr(dateAttr(name, at))}}
+	}
+	join := func(parts ...map[string][]string) map[string][]string {
+		out := map[string][]string{}
+		for _, part := range parts {
+			maps.Copy(out, part)
+		}
+		return out
+	}
+	replaced := map[string][]string{linkEntry(kmiplib.LinkTypeReplacementObjectLink): {"k.2"}}
+
+	cases := []struct {
+		name        string
+		softDeleted bool
+		entries     map[string][]string
+		want        kmiplib.State
+	}{
+		{"new key", false, nil, kmiplib.StateActive},
+		{"destroy mark", true, mark(entryDestroyed), kmiplib.StateDestroyed},
+		{"destroy mark on a key that is not soft-deleted", false, mark(entryDestroyed), kmiplib.StateDestroyed},
+		{"destroy and compromise marks", true, join(mark(entryDestroyed), mark(entryCompromised)), kmiplib.StateDestroyedCompromised},
+		{"destroy mark before a future activation", true, join(mark(entryDestroyed), date(kmiplib.AttributeNameActivationDate, future)), kmiplib.StateDestroyed},
+		{"compromise mark", false, mark(entryCompromised), kmiplib.StateCompromised},
+		{"compromise mark on a soft-deleted key", true, mark(entryCompromised), kmiplib.StateCompromised},
+		{"compromise mark on a replaced key", false, join(mark(entryCompromised), replaced), kmiplib.StateCompromised},
+		{"soft-deleted", true, nil, kmiplib.StateDeactivated},
+		{"soft-deleted before a future activation", true, date(kmiplib.AttributeNameActivationDate, future), kmiplib.StateDeactivated},
+		{"replaced by ReKey", false, replaced, kmiplib.StateDeactivated},
+		{"past deactivation date", false, date(kmiplib.AttributeNameDeactivationDate, past), kmiplib.StateDeactivated},
+		{"past deactivation before a future activation", false, join(date(kmiplib.AttributeNameDeactivationDate, past), date(kmiplib.AttributeNameActivationDate, future)), kmiplib.StateDeactivated},
+		{"future deactivation date", false, date(kmiplib.AttributeNameDeactivationDate, future), kmiplib.StateActive},
+		{"future activation date", false, date(kmiplib.AttributeNameActivationDate, future), kmiplib.StatePreActive},
+		{"future activation and deactivation dates", false, join(date(kmiplib.AttributeNameActivationDate, future), date(kmiplib.AttributeNameDeactivationDate, future.Add(time.Hour))), kmiplib.StatePreActive},
+		{"past activation date", false, date(kmiplib.AttributeNameActivationDate, past), kmiplib.StateActive},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &keyInfo{Name: "k", SoftDeleted: tc.softDeleted}
+			if tc.entries != nil {
+				info.Metadata = metadataRecord{metadataScope: tc.entries}
+			}
+			require.Equal(t, tc.want, info.state())
+			state, err := info.checkedState()
+			require.NoError(t, err)
+			require.Equal(t, tc.want, state)
+		})
+	}
+}
+
+// A stored Activation Date or Deactivation Date that is not one date fails
+// checkedState. state reports the State as if the date were absent.
+func TestKeyInfo_CheckedStateRefusesBadDates(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	activation, deactivation := attrEntry(kmiplib.AttributeNameActivationDate), attrEntry(kmiplib.AttributeNameDeactivationDate)
+	mask := encodeAttr(kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageEncrypt})
+
+	cases := []struct {
+		name    string
+		entries map[string][]string
+		msg     string
+	}{
+		{"undecodable activation date", map[string][]string{activation: {"not ttlv"}}, `object "k" has an undecodable stored attribute`},
+		{"undecodable deactivation date", map[string][]string{deactivation: {"not ttlv"}}, `object "k" has an undecodable stored attribute`},
+		{"activation date that is not a date", map[string][]string{activation: {mask}}, `object "k" has a stored Activation Date that is not a date`},
+		{"deactivation date stored as another date", map[string][]string{deactivation: {encodeAttr(dateAttr(kmiplib.AttributeNameActivationDate, future))}}, `object "k" has a stored Deactivation Date that is not a date`},
+		{"two activation dates", map[string][]string{activation: {encodeAttr(dateAttr(kmiplib.AttributeNameActivationDate, future)), encodeAttr(dateAttr(kmiplib.AttributeNameActivationDate, future))}}, `object "k" stores 2 values of the single-instance attribute Activation Date`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &keyInfo{Name: "k", Metadata: metadataRecord{metadataScope: tc.entries}}
+			_, err := info.checkedState()
+			requireReason(t, err, kmiplib.ResultReasonGeneralFailure, tc.msg)
+			require.Equal(t, kmiplib.StateActive, info.state())
+		})
+	}
+}
+
+// Activate fails on a stored lifecycle date that does not decode, whether
+// the first read finds it or a concurrent write puts it there before the
+// write of the Activation Date.
+func TestTranslator_ActivateRefusesBadDates(t *testing.T) {
+	for _, name := range []kmiplib.AttributeName{kmiplib.AttributeNameActivationDate, kmiplib.AttributeNameDeactivationDate} {
+		corrupt := replaceOps(attrEntry(name), "not ttlv")
+
+		t.Run(string(name)+" on the first read", func(t *testing.T) {
+			bao, m := transitBao(t)
+			ctx, _ := newTestSession(t, bao, Config{})
+			_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+			require.NoError(t, err)
+			m.write("app-a", corrupt...)
+
+			err = op(t, ctx).activate(ctx, "app-a")
+			requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `object "app-a" has an undecodable stored attribute`)
+			require.Empty(t, bao.sent(http.MethodPost, "transit/keys/app-a/metadata"))
+		})
+
+		t.Run(string(name)+" on a write attempt", func(t *testing.T) {
+			bao, m := transitBao(t)
+			ctx, _ := newTestSession(t, bao, Config{})
+			newPreActive(t, ctx, "app-a")
+			var once sync.Once
+			m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+				if r.method == http.MethodPost && r.path == "transit/keys/app-a/metadata" {
+					once.Do(func() { m.write("app-a", corrupt...) })
+				}
+				return serve()
+			}
+
+			err := op(t, ctx).activate(ctx, "app-a")
+			requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `object "app-a" has an undecodable stored attribute`)
+			require.Len(t, bao.sent(http.MethodPost, "transit/keys/app-a/metadata"), 2)
+			require.Equal(t, []string{"not ttlv"}, m.record("app-a")[attrEntry(name)])
+		})
+	}
+}
+
+// Locate's State filter matches the derived states.
+func TestTranslator_LocateByState(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	_, err := op(t, ctx).create(ctx, "app-active", kmiplib.CryptographicAlgorithmAES, 256, nil)
+	require.NoError(t, err)
+	newPreActive(t, ctx, "app-pre")
+	_, err = op(t, ctx).create(ctx, "app-dated", kmiplib.CryptographicAlgorithmAES, 256,
+		templateOf(dateAttr(kmiplib.AttributeNameDeactivationDate, time.Now().Add(-time.Hour))))
+	require.NoError(t, err)
+	_, err = op(t, ctx).create(ctx, "app-gone", kmiplib.CryptographicAlgorithmAES, 256, nil)
+	require.NoError(t, err)
+	require.NoError(t, op(t, ctx).revoke(ctx, "app-gone", kmiplib.RevocationReason{RevocationReasonCode: kmiplib.RevocationReasonCodeKeyCompromise}, nil))
+	require.NoError(t, op(t, ctx).destroy(ctx, "app-gone"))
+
+	for state, want := range map[kmiplib.State][]string{
+		kmiplib.StateActive:               {"app-active"},
+		kmiplib.StatePreActive:            {"app-pre"},
+		kmiplib.StateDeactivated:          {"app-dated"},
+		kmiplib.StateDestroyedCompromised: {"app-gone"},
+		kmiplib.StateCompromised:          nil,
+	} {
+		ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{AttributeName: kmiplib.AttributeNameState, AttributeValue: state}})
+		require.NoError(t, err)
+		require.ElementsMatch(t, want, ids, ttlv.EnumStr(state))
+	}
+}
+
+func TestTranslator_CreateTemplate(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	future := time.Now().Add(time.Hour)
+
+	// A template without stored attributes sends what Create always sent.
+	start := len(bao.all())
+	_, err := op(t, ctx).create(ctx, "app-plain", kmiplib.CryptographicAlgorithmAES, 256, templateOf(
+		kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicAlgorithm, AttributeValue: kmiplib.CryptographicAlgorithmAES},
+		kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicLength, AttributeValue: int32(256)},
+		kmiplib.Attribute{AttributeName: kmiplib.AttributeNameObjectType, AttributeValue: kmiplib.ObjectTypeSymmetricKey},
+		kmiplib.Attribute{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-plain"}},
+	))
+	require.NoError(t, err)
+	require.Equal(t, []string{"POST transit/keys/app-plain"}, since(bao, start))
+	require.Empty(t, m.record("app-plain"))
+
+	// Stored attributes go to the record in one write. A future Activation
+	// Date makes the object Pre-Active.
+	start = len(bao.all())
+	_, err = op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, templateOf(
+		kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageEncrypt},
+		dateAttr(kmiplib.AttributeNameActivationDate, future),
+		customAttr("x-tag", "blue"),
+		customAttr("x-tag", "green"),
+	))
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"GET transit/keys/app-a", "POST transit/keys/app-a",
+		"GET transit/keys/app-a/metadata", "POST transit/keys/app-a/metadata",
+	}, since(bao, start))
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-a", nil)
+	require.NoError(t, err)
+	requireAttr(t, attrs, kmiplib.AttributeNameState, kmiplib.StatePreActive)
+	requireAttr(t, attrs, kmiplib.AttributeNameCryptographicUsageMask, kmiplib.CryptographicUsageEncrypt)
+	require.Len(t, attrsNamed(attrs, "x-tag"), 2)
+	requireDate(t, ctx, "app-a", kmiplib.AttributeNameActivationDate, future)
+
+	// Activate makes it Active, with now as its Activation Date.
+	start = len(bao.all())
+	require.NoError(t, op(t, ctx).activate(ctx, "app-a"))
+	require.Equal(t, []string{
+		"GET transit/keys/app-a", "GET transit/keys/app-a/metadata",
+		"GET transit/keys/app-a/metadata", "POST transit/keys/app-a/metadata",
+	}, since(bao, start))
+	require.Equal(t, kmiplib.StateActive, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+	activated := requireRecent(t, ctx, "app-a", kmiplib.AttributeNameActivationDate)
+
+	// A second Activate succeeds and writes nothing.
+	start = len(bao.all())
+	require.NoError(t, op(t, ctx).activate(ctx, "app-a"))
+	require.Equal(t, []string{"GET transit/keys/app-a", "GET transit/keys/app-a/metadata"}, since(bao, start))
+	requireDate(t, ctx, "app-a", kmiplib.AttributeNameActivationDate, activated)
+
+	// Register stores its template the same way.
+	material := make([]byte, 32)
+	_, err = rand.Read(material)
+	require.NoError(t, err)
+	_, err = op(t, ctx).register(ctx, "app-imported", kmiplib.CryptographicAlgorithmAES, 256, material, templateOf(
+		kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageDecrypt},
+	))
+	require.NoError(t, err)
+	require.Equal(t, kmiplib.CryptographicUsageDecrypt, attrOf(t, ctx, "app-imported", kmiplib.AttributeNameCryptographicUsageMask))
+	require.Equal(t, kmiplib.StateActive, attrOf(t, ctx, "app-imported", kmiplib.AttributeNameState))
+}
+
+// A template is checked before any request.
+func TestTranslator_CreateTemplateRefusals(t *testing.T) {
+	bao := newFakeBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+
+	cases := []struct {
+		name   string
+		attr   kmiplib.Attribute
+		reason kmiplib.ResultReason
+		msg    string
+	}{
+		{"derived", kmiplib.Attribute{AttributeName: kmiplib.AttributeNameState, AttributeValue: kmiplib.StatePreActive}, kmiplib.ResultReasonPermissionDenied, "attribute State is set by the server"},
+		{"server-set date", dateAttr(kmiplib.AttributeNameDestroyDate, time.Now()), kmiplib.ResultReasonPermissionDenied, "attribute Destroy Date is set by the server"},
+		{"server-set reason", kmiplib.Attribute{AttributeName: kmiplib.AttributeNameRevocationReason, AttributeValue: unspecified}, kmiplib.ResultReasonPermissionDenied, "attribute Revocation Reason is set by the server"},
+		{"other length", kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicLength, AttributeValue: int32(128)}, kmiplib.ResultReasonInvalidField, "the template's Cryptographic Length does not match"},
+		{"other object type", kmiplib.Attribute{AttributeName: kmiplib.AttributeNameObjectType, AttributeValue: kmiplib.ObjectTypePrivateKey}, kmiplib.ResultReasonInvalidField, "the template's Object Type does not match"},
+		{"second Name", kmiplib.Attribute{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-b"}}, kmiplib.ResultReasonInvalidField, `an object takes one Name: the template gives "app-a" and "app-b"`},
+		{"no value", kmiplib.Attribute{AttributeName: "x-empty"}, kmiplib.ResultReasonInvalidField, "attribute x-empty has no value"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, templateOf(tc.attr))
+			requireReason(t, err, tc.reason, tc.msg)
+			_, err = op(t, ctx).register(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, make([]byte, 32), templateOf(tc.attr))
+			requireReason(t, err, tc.reason, tc.msg)
+		})
+	}
+	require.Empty(t, bao.all())
+}
+
+// A Create whose metadata write fails after transit made the key does not
+// report success: it soft-deletes the key and names it in the error.
+func TestTranslator_CreateTemplateWriteFails(t *testing.T) {
+	mask := templateOf(kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageEncrypt})
+	denied := respond(http.StatusForbidden, withErrors("permission denied"))
+	metadataWrite := func(r fakeRequest) bool {
+		return r.method == http.MethodPost && strings.HasSuffix(r.path, "/metadata")
+	}
+
+	// A Create with a Name cannot prove that no other client holds the key,
+	// so a failed write fails the Create and leaves the key alone.
+	t.Run("named, write denied", func(t *testing.T) {
+		bao, m := transitBao(t)
+		bao.route(http.MethodPost, "transit/keys/app-a/metadata", denied)
+		ctx, _ := newTestSession(t, bao, Config{})
+
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `Create made the key "app-a" but could not store its template attributes; the key was left in place`)
+		require.ErrorContains(t, err, `POST transit/keys/app-a/metadata requires the "update" capability`)
+		require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
+		require.False(t, m.key("app-a").SoftDeleted)
+	})
+
+	t.Run("named, metadata read denied", func(t *testing.T) {
+		bao, m := transitBao(t)
+		bao.route(http.MethodGet, "transit/keys/app-a/metadata", denied)
+		ctx, _ := newTestSession(t, bao, Config{})
+
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `the key was left in place`)
+		require.ErrorContains(t, err, `GET transit/keys/app-a/metadata requires the "read" capability`)
+		require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
+		require.False(t, m.key("app-a").SoftDeleted)
+	})
+
+	t.Run("named, write fails, then retry", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		m.failOnce(metadataWrite, false)
+
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, "status 500")
+		require.False(t, m.key("app-a").SoftDeleted)
+
+		// A retry finds the key and does not take it for new.
+		start := len(bao.all())
+		_, err = op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `key "app-a" already exists`)
+		require.Equal(t, []string{"GET transit/keys/app-a"}, since(bao, start))
+		require.Empty(t, m.record("app-a"))
+	})
+
+	// Another client creates the same Name between Create's key read and
+	// its create, so transit hands both the one key. Create's failed write
+	// must not soft-delete the other client's key.
+	t.Run("named, key created concurrently", func(t *testing.T) {
+		bao, m := transitBao(t)
+		bao.route(http.MethodPost, "transit/keys/app-a/metadata", denied)
+		ctx, _ := newTestSession(t, bao, Config{})
+		var once sync.Once
+		m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+			if r.method == http.MethodPost && r.path == "transit/keys/app-a" {
+				once.Do(func() { m.createKey("app-a") })
+			}
+			return serve()
+		}
+
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `the key was left in place`)
+		require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
+		require.False(t, m.key("app-a").SoftDeleted)
+	})
+
+	// A generated name is a fresh UUID: no other client holds the key, so a
+	// failed write soft-deletes it.
+	t.Run("generated name, write fails", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		m.failOnce(metadataWrite, false)
+
+		_, err := op(t, ctx).create(ctx, "", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, "but could not store its template attributes, so the key was soft-deleted")
+		var uid string
+		for _, r := range bao.all() {
+			if r.method == http.MethodDelete && strings.HasSuffix(r.path, "/soft-delete") {
+				uid = strings.TrimSuffix(strings.TrimPrefix(r.path, "transit/keys/"), "/soft-delete")
+			}
+		}
+		require.NotEmpty(t, uid)
+		require.True(t, m.key(uid).SoftDeleted)
+	})
+
+	t.Run("generated name, write and soft-delete fail", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+			if metadataWrite(r) || (r.method == http.MethodDelete && strings.HasSuffix(r.path, "/soft-delete")) {
+				return http.StatusInternalServerError, withErrors("injected failure")
+			}
+			return serve()
+		}
+
+		_, err := op(t, ctx).create(ctx, "", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, "soft-deleting the key also failed, so it stays Active without them")
+		require.Len(t, m.keys(), 1)
+		require.False(t, m.key(m.keys()[0]).SoftDeleted)
+	})
+
+	// Without the key read, nothing proves the key new: Create fails before
+	// transit makes it.
+	t.Run("key read denied", func(t *testing.T) {
+		bao, m := transitBao(t)
+		bao.route(http.MethodGet, "transit/keys/app-a", denied)
+		ctx, _ := newTestSession(t, bao, Config{})
+
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `GET transit/keys/app-a requires the "read" capability`)
+		require.Empty(t, bao.sent(http.MethodPost, "transit/keys/app-a"))
+		require.Nil(t, m.key("app-a"))
+	})
+}
+
+// Transit answers a create of an existing key with that key. A Create or
+// Register with stored attributes refuses an existing key before it writes,
+// whatever metadata grant the client holds, and never soft-deletes it.
+func TestTranslator_CreateTemplateKeepsExistingKey(t *testing.T) {
+	mask := templateOf(kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageEncrypt})
+	denied := respond(http.StatusForbidden, withErrors("permission denied"))
+
+	cases := []struct {
+		name  string
+		setup func(*fakeBao)
+	}{
+		{"metadata granted", func(*fakeBao) {}},
+		{"metadata read denied", func(bao *fakeBao) { bao.route(http.MethodGet, "transit/keys/app-a/metadata", denied) }},
+		{"metadata write denied", func(bao *fakeBao) { bao.route(http.MethodPost, "transit/keys/app-a/metadata", denied) }},
+	}
+	for _, tc := range cases {
+		t.Run("Create, "+tc.name, func(t *testing.T) {
+			bao, m := transitBao(t)
+			m.createKey("app-a")
+			tc.setup(bao)
+			ctx, _ := newTestSession(t, bao, Config{})
+
+			start := len(bao.all())
+			_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
+			requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `key "app-a" already exists`)
+			require.Equal(t, []string{"GET transit/keys/app-a"}, since(bao, start))
+			require.False(t, m.key("app-a").SoftDeleted)
+			require.Empty(t, m.record("app-a"))
+		})
+
+		t.Run("Register, "+tc.name, func(t *testing.T) {
+			bao, m := transitBao(t)
+			m.createKey("app-a")
+			tc.setup(bao)
+			ctx, _ := newTestSession(t, bao, Config{})
+
+			_, err := op(t, ctx).register(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, make([]byte, 32), mask)
+			require.ErrorContains(t, err, "status 500")
+			require.Empty(t, bao.sent(http.MethodGet, "transit/keys/app-a/metadata"))
+			require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
+			require.False(t, m.key("app-a").SoftDeleted)
+			require.Empty(t, m.record("app-a"))
+		})
+	}
+
+	// A KMIP object made between Create's key read and its create shows in
+	// the record: Create fails and leaves the object alone.
+	t.Run("object made after the key read", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		var once sync.Once
+		m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
+			if r.method == http.MethodPost && r.path == "transit/keys/app-a" {
+				once.Do(func() {
+					m.createKey("app-a")
+					m.write("app-a", addOp(attrEntry("x-tag"), encodeAttr(customAttr("x-tag", "blue"))))
+				})
+			}
+			return serve()
+		}
+		before := map[string][]string{attrEntry("x-tag"): {encodeAttr(customAttr("x-tag", "blue"))}}
+
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `key "app-a" already exists`)
+		require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
+		require.False(t, m.key("app-a").SoftDeleted)
+		require.Equal(t, before, m.record("app-a"))
+	})
+}
+
+func TestTranslator_Revoke(t *testing.T) {
+	keyCompromise := kmiplib.RevocationReason{RevocationReasonCode: kmiplib.RevocationReasonCodeKeyCompromise, RevocationMessage: "leaked"}
+	caCompromise := kmiplib.RevocationReason{RevocationReasonCode: kmiplib.RevocationReasonCodeCACompromise}
+	cessation := kmiplib.RevocationReason{RevocationReasonCode: kmiplib.RevocationReasonCodeCessationOfOperation}
+
+	t.Run("deactivating reason", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+		require.NoError(t, err)
+
+		require.NoError(t, op(t, ctx).revoke(ctx, "app-a", cessation, nil))
+		require.True(t, m.key("app-a").SoftDeleted)
+		require.Equal(t, kmiplib.StateDeactivated, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+		requireRecent(t, ctx, "app-a", kmiplib.AttributeNameDeactivationDate)
+		require.Equal(t, cessation, attrOf(t, ctx, "app-a", kmiplib.AttributeNameRevocationReason))
+		attrs, err := op(t, ctx).getAttributes(ctx, "app-a", []kmiplib.AttributeName{kmiplib.AttributeNameCompromiseDate, kmiplib.AttributeNameCompromiseOccurrenceDate})
+		require.NoError(t, err)
+		require.Empty(t, attrs)
+		require.NotContains(t, m.record("app-a"), entryCompromised)
+	})
+
+	t.Run("key compromise with an occurrence date", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+		require.NoError(t, err)
+
+		occurred := time.Unix(1750000000, 0)
+		require.NoError(t, op(t, ctx).revoke(ctx, "app-a", keyCompromise, &occurred))
+		require.True(t, m.key("app-a").SoftDeleted)
+		require.Equal(t, kmiplib.StateCompromised, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+		compromised := requireRecent(t, ctx, "app-a", kmiplib.AttributeNameCompromiseDate)
+		requireDate(t, ctx, "app-a", kmiplib.AttributeNameCompromiseOccurrenceDate, occurred)
+		require.Equal(t, keyCompromise, attrOf(t, ctx, "app-a", kmiplib.AttributeNameRevocationReason))
+		attrs, err := op(t, ctx).getAttributes(ctx, "app-a", []kmiplib.AttributeName{kmiplib.AttributeNameDeactivationDate})
+		require.NoError(t, err)
+		require.Empty(t, attrs)
+
+		// A second compromise Revoke keeps the first dates.
+		time.Sleep(1100 * time.Millisecond)
+		later := time.Unix(1760000000, 0)
+		require.NoError(t, op(t, ctx).revoke(ctx, "app-a", caCompromise, &later))
+		requireDate(t, ctx, "app-a", kmiplib.AttributeNameCompromiseDate, compromised)
+		requireDate(t, ctx, "app-a", kmiplib.AttributeNameCompromiseOccurrenceDate, occurred)
+		require.Equal(t, caCompromise, attrOf(t, ctx, "app-a", kmiplib.AttributeNameRevocationReason))
+
+		// KMIP has no transition from Compromised to Deactivated.
+		start := len(bao.all())
+		err = op(t, ctx).revoke(ctx, "app-a", cessation, nil)
+		requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `wrong key lifecycle state: object "app-a" is Compromised`)
+		require.Equal(t, []string{"GET transit/keys/app-a", "GET transit/keys/app-a/metadata"}, since(bao, start))
+	})
+
+	t.Run("CA compromise without an occurrence date", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+		require.NoError(t, err)
+
+		require.NoError(t, op(t, ctx).revoke(ctx, "app-a", caCompromise, nil))
+		initial, ok := m.key("app-a").initialDate()
+		require.True(t, ok)
+		requireDate(t, ctx, "app-a", kmiplib.AttributeNameCompromiseOccurrenceDate, initial)
+		require.Equal(t, kmiplib.StateCompromised, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+	})
+
+	t.Run("pre-active", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		newPreActive(t, ctx, "app-a")
+
+		// Only a compromise takes a Pre-Active object out of Pre-Active.
+		start := len(bao.all())
+		err := op(t, ctx).revoke(ctx, "app-a", cessation, nil)
+		requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "wrong key lifecycle state")
+		require.Equal(t, []string{"GET transit/keys/app-a", "GET transit/keys/app-a/metadata"}, since(bao, start))
+		require.False(t, m.key("app-a").SoftDeleted)
+
+		require.NoError(t, op(t, ctx).revoke(ctx, "app-a", keyCompromise, nil))
+		require.Equal(t, kmiplib.StateCompromised, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+		require.True(t, m.key("app-a").SoftDeleted)
+	})
+
+	// A Deactivation Date already past stays; Revoke only adds the reason and
+	// the soft-delete.
+	t.Run("past deactivation date", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		past := time.Unix(1750000000, 0)
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256,
+			templateOf(dateAttr(kmiplib.AttributeNameDeactivationDate, past)))
+		require.NoError(t, err)
+		require.Equal(t, kmiplib.StateDeactivated, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+		require.False(t, m.key("app-a").SoftDeleted)
+
+		require.NoError(t, op(t, ctx).revoke(ctx, "app-a", cessation, nil))
+		requireDate(t, ctx, "app-a", kmiplib.AttributeNameDeactivationDate, past)
+		require.Equal(t, cessation, attrOf(t, ctx, "app-a", kmiplib.AttributeNameRevocationReason))
+		require.True(t, m.key("app-a").SoftDeleted)
+	})
+}
+
+// Revoke writes the record first. Interrupted after it, the object already
+// reports the revoked State, and a retry finishes the soft-delete with the
+// first dates kept.
+func TestTranslator_RevokeInterrupted(t *testing.T) {
+	isSoftDelete := func(r fakeRequest) bool {
+		return r.method == http.MethodDelete && r.path == "transit/keys/app-a/soft-delete"
+	}
+	isRecordWrite := func(r fakeRequest) bool {
+		return r.method == http.MethodPost && r.path == "transit/keys/app-a/metadata"
+	}
+	for _, tc := range []struct {
+		name   string
+		reason kmiplib.RevocationReasonCode
+		match  func(fakeRequest) bool
+		// after is the State between the failure and the retry.
+		after kmiplib.State
+		date  kmiplib.AttributeName
+	}{
+		{"compromise, soft-delete fails", kmiplib.RevocationReasonCodeKeyCompromise, isSoftDelete, kmiplib.StateCompromised, kmiplib.AttributeNameCompromiseDate},
+		{"cessation, soft-delete fails", kmiplib.RevocationReasonCodeCessationOfOperation, isSoftDelete, kmiplib.StateDeactivated, kmiplib.AttributeNameDeactivationDate},
+		{"compromise, record write fails", kmiplib.RevocationReasonCodeKeyCompromise, isRecordWrite, kmiplib.StateActive, kmiplib.AttributeNameCompromiseDate},
+		{"cessation, record write fails", kmiplib.RevocationReasonCodeCessationOfOperation, isRecordWrite, kmiplib.StateActive, kmiplib.AttributeNameDeactivationDate},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bao, m := transitBao(t)
+			ctx, _ := newTestSession(t, bao, Config{})
+			_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+			require.NoError(t, err)
+			reason := kmiplib.RevocationReason{RevocationReasonCode: tc.reason}
+
+			m.failOnce(tc.match, false)
+			err = op(t, ctx).revoke(ctx, "app-a", reason, nil)
+			require.ErrorContains(t, err, "status 500")
+			require.False(t, m.key("app-a").SoftDeleted)
+			require.Equal(t, tc.after, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+
+			var first time.Time
+			if tc.after != kmiplib.StateActive {
+				first = requireRecent(t, ctx, "app-a", tc.date)
+				time.Sleep(1100 * time.Millisecond)
+			}
+			require.NoError(t, op(t, ctx).revoke(ctx, "app-a", reason, nil))
+			require.True(t, m.key("app-a").SoftDeleted)
+			if tc.after != kmiplib.StateActive {
+				requireDate(t, ctx, "app-a", tc.date, first)
+			} else {
+				requireRecent(t, ctx, "app-a", tc.date)
+			}
+		})
+	}
+}
+
+func TestTranslator_Destroy(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	for _, uid := range []string{"app-a", "app-c"} {
+		_, err := op(t, ctx).create(ctx, uid, kmiplib.CryptographicAlgorithmAES, 256, nil)
+		require.NoError(t, err)
+	}
+	// deletion_allowed no longer lets Destroy delete anything.
+	status, raw := m.do(http.MethodPost, "keys/app-a/config", map[string]any{"deletion_allowed": true})
+	require.Equal(t, http.StatusOK, status, string(raw))
+
+	// An Active object is refused, with nothing written.
+	start := len(bao.all())
+	err := op(t, ctx).destroy(ctx, "app-a")
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `wrong key lifecycle state: object "app-a" is Active`)
+	require.Equal(t, []string{"GET transit/keys/app-a", "GET transit/keys/app-a/metadata"}, since(bao, start))
+
+	// After Revoke, Destroy marks it and keeps the key soft-deleted.
+	require.NoError(t, op(t, ctx).revoke(ctx, "app-a", unspecified, nil))
+	require.NoError(t, op(t, ctx).destroy(ctx, "app-a"))
+	require.Equal(t, kmiplib.StateDestroyed, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+	destroyed := requireRecent(t, ctx, "app-a", kmiplib.AttributeNameDestroyDate)
+	require.True(t, m.key("app-a").SoftDeleted)
+	require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a"))
+
+	// A second Destroy succeeds and writes nothing.
+	start = len(bao.all())
+	require.NoError(t, op(t, ctx).destroy(ctx, "app-a"))
+	require.Equal(t, []string{"GET transit/keys/app-a", "GET transit/keys/app-a/metadata"}, since(bao, start))
+	requireDate(t, ctx, "app-a", kmiplib.AttributeNameDestroyDate, destroyed)
+
+	// Get fails as for a soft-deleted key; Activate, Revoke and ReKey refuse
+	// a Destroyed object.
+	_, err = op(t, ctx).get(ctx, "app-a")
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "wrong key lifecycle state")
+	requireReason(t, op(t, ctx).activate(ctx, "app-a"), kmiplib.ResultReasonPermissionDenied, "is Destroyed")
+	requireReason(t, op(t, ctx).revoke(ctx, "app-a", kmiplib.RevocationReason{RevocationReasonCode: kmiplib.RevocationReasonCodeKeyCompromise}, nil),
+		kmiplib.ResultReasonPermissionDenied, "is Destroyed")
+	_, err = op(t, ctx).rekey(ctx, "app-a", nil, nil)
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "is Destroyed")
+	// The key survives, so its Name is not free for a new Create.
+	_, err = op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+	requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `key "app-a" already exists`)
+
+	// A Compromised object is refused by ReKey, and becomes Destroyed
+	// Compromised.
+	require.NoError(t, op(t, ctx).revoke(ctx, "app-c", kmiplib.RevocationReason{RevocationReasonCode: kmiplib.RevocationReasonCodeKeyCompromise}, nil))
+	_, err = op(t, ctx).rekey(ctx, "app-c", nil, nil)
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "is Compromised")
+	require.NoError(t, op(t, ctx).destroy(ctx, "app-c"))
+	require.Equal(t, kmiplib.StateDestroyedCompromised, attrOf(t, ctx, "app-c", kmiplib.AttributeNameState))
+
+	// A Pre-Active object is soft-deleted first, then marked.
+	newPreActive(t, ctx, "app-p")
+	start = len(bao.all())
+	require.NoError(t, op(t, ctx).destroy(ctx, "app-p"))
+	require.Equal(t, []string{
+		"GET transit/keys/app-p", "GET transit/keys/app-p/metadata",
+		"DELETE transit/keys/app-p/soft-delete",
+		"GET transit/keys/app-p/metadata", "POST transit/keys/app-p/metadata",
+	}, since(bao, start))
+	require.True(t, m.key("app-p").SoftDeleted)
+	require.Equal(t, kmiplib.StateDestroyed, attrOf(t, ctx, "app-p", kmiplib.AttributeNameState))
+	require.Equal(t, []string{"app-a", "app-c", "app-p"}, m.keys())
+}
+
+// Destroy soft-deletes before it marks. Interrupted in between, the object
+// reports Deactivated, which a retry accepts.
+func TestTranslator_DestroyInterrupted(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		match func(fakeRequest) bool
+		after kmiplib.State
+	}{
+		{"soft-delete fails", func(r fakeRequest) bool {
+			return r.method == http.MethodDelete && r.path == "transit/keys/app-p/soft-delete"
+		}, kmiplib.StatePreActive},
+		{"record write fails", func(r fakeRequest) bool {
+			return r.method == http.MethodPost && r.path == "transit/keys/app-p/metadata"
+		}, kmiplib.StateDeactivated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bao, m := transitBao(t)
+			ctx, _ := newTestSession(t, bao, Config{})
+			newPreActive(t, ctx, "app-p")
+
+			m.failOnce(tc.match, false)
+			require.ErrorContains(t, op(t, ctx).destroy(ctx, "app-p"), "status 500")
+			require.Equal(t, tc.after, attrOf(t, ctx, "app-p", kmiplib.AttributeNameState))
+			require.NotContains(t, m.record("app-p"), entryDestroyed)
+
+			require.NoError(t, op(t, ctx).destroy(ctx, "app-p"))
+			require.True(t, m.key("app-p").SoftDeleted)
+			require.Equal(t, kmiplib.StateDestroyed, attrOf(t, ctx, "app-p", kmiplib.AttributeNameState))
+		})
+	}
+}
+
+// Dates drive the reported State only: Encrypt with a key past its
+// Deactivation Date still succeeds and sends its one request.
+func TestTranslator_CryptoIgnoresDates(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+	require.NoError(t, err)
+	require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", dateAttr(kmiplib.AttributeNameDeactivationDate, time.Now().Add(-time.Hour))))
+	require.Equal(t, kmiplib.StateDeactivated, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+
+	start := len(bao.all())
+	_, err = op(t, ctx).encrypt(ctx, "app-a", []byte("data"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"POST transit/encrypt/app-a"}, since(bao, start))
+}
+
+// newTaggedKey creates app-a with the x-tag instances values, in order.
+func newTaggedKey(t *testing.T, ctx context.Context, values ...string) {
+	t.Helper()
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+	require.NoError(t, err)
+	for _, v := range values {
+		require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", customAttr("x-tag", v)))
+	}
+}
+
+// requireTags checks the x-tag instances GetAttributes reports, in order,
+// with their indexes.
+func requireTags(t *testing.T, ctx context.Context, values ...string) {
+	t.Helper()
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-a", []kmiplib.AttributeName{"x-tag"})
+	require.NoError(t, err)
+	require.Len(t, attrs, len(values))
+	for i, v := range values {
+		require.True(t, sameValue(customAttr("x-tag", v), attrs[i]), "instance %d is %v, want %s", i, attrs[i].AttributeValue, v)
+		if i == 0 {
+			require.Nil(t, attrs[i].AttributeIndex)
+		} else {
+			require.Equal(t, int32(i), *attrs[i].AttributeIndex)
+		}
+	}
+}
+
+func indexed(attr kmiplib.Attribute, index int32) kmiplib.Attribute {
+	attr.AttributeIndex = &index
+	return attr
+}
+
+func TestTranslator_ModifyAttribute(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newTaggedKey(t, ctx, "blue", "green", "red")
+
+	// Without an index, the instance at index 0 changes.
+	start := len(bao.all())
+	got, err := op(t, ctx).modifyAttribute(ctx, "app-a", customAttr("x-tag", "cyan"))
+	require.NoError(t, err)
+	require.Nil(t, got.AttributeIndex)
+	require.True(t, sameValue(customAttr("x-tag", "cyan"), got))
+	require.Equal(t, []string{
+		"GET transit/keys/app-a", "GET transit/keys/app-a/metadata",
+		"GET transit/keys/app-a/metadata", "POST transit/keys/app-a/metadata",
+	}, since(bao, start))
+
+	got, err = op(t, ctx).modifyAttribute(ctx, "app-a", indexed(customAttr("x-tag", "purple"), 2))
+	require.NoError(t, err)
+	require.Equal(t, int32(2), *got.AttributeIndex)
+	requireTags(t, ctx, "cyan", "green", "purple")
+
+	// An index with no instance is Item Not Found, as is an attribute the
+	// object does not have.
+	_, err = op(t, ctx).modifyAttribute(ctx, "app-a", indexed(customAttr("x-tag", "black"), 3))
+	requireReason(t, err, kmiplib.ResultReasonItemNotFound, `object "app-a" has no x-tag with Attribute Index 3`)
+	_, err = op(t, ctx).modifyAttribute(ctx, "app-a", customAttr("x-none", "black"))
+	requireReason(t, err, kmiplib.ResultReasonItemNotFound, "has no x-none")
+	requireTags(t, ctx, "cyan", "green", "purple")
+
+	// The Activation Date GetAttributes supplies when none is stored can be
+	// modified, which stores it; a future one makes the object Pre-Active.
+	require.Empty(t, m.record("app-a")[attrEntry(kmiplib.AttributeNameActivationDate)])
+	future := time.Now().Add(time.Hour)
+	_, err = op(t, ctx).modifyAttribute(ctx, "app-a", dateAttr(kmiplib.AttributeNameActivationDate, future))
+	require.NoError(t, err)
+	requireDate(t, ctx, "app-a", kmiplib.AttributeNameActivationDate, future)
+	require.Equal(t, kmiplib.StatePreActive, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+	require.Len(t, m.record("app-a")[attrEntry(kmiplib.AttributeNameActivationDate)], 1)
+}
+
+func TestTranslator_DeleteAttribute(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newTaggedKey(t, ctx, "blue", "green", "red")
+
+	// A later index; the instances after it move up.
+	start := len(bao.all())
+	index := int32(1)
+	got, err := op(t, ctx).deleteAttribute(ctx, "app-a", "x-tag", &index)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), *got.AttributeIndex)
+	require.True(t, sameValue(customAttr("x-tag", "green"), got))
+	require.Equal(t, []string{
+		"GET transit/keys/app-a", "GET transit/keys/app-a/metadata",
+		"GET transit/keys/app-a/metadata", "POST transit/keys/app-a/metadata",
+	}, since(bao, start))
+	requireTags(t, ctx, "blue", "red")
+
+	// Without an index, the instance at index 0 goes.
+	got, err = op(t, ctx).deleteAttribute(ctx, "app-a", "x-tag", nil)
+	require.NoError(t, err)
+	require.Nil(t, got.AttributeIndex)
+	require.True(t, sameValue(customAttr("x-tag", "blue"), got))
+	requireTags(t, ctx, "red")
+
+	index = 1
+	_, err = op(t, ctx).deleteAttribute(ctx, "app-a", "x-tag", &index)
+	requireReason(t, err, kmiplib.ResultReasonItemNotFound, `object "app-a" has no x-tag with Attribute Index 1`)
+
+	// The Activation Date GetAttributes supplies is not stored, so there is
+	// nothing to delete.
+	_, err = op(t, ctx).deleteAttribute(ctx, "app-a", kmiplib.AttributeNameActivationDate, nil)
+	requireReason(t, err, kmiplib.ResultReasonItemNotFound, "has no Activation Date")
+
+	// The last instance takes the attribute with it.
+	_, err = op(t, ctx).deleteAttribute(ctx, "app-a", "x-tag", nil)
+	require.NoError(t, err)
+	require.NotContains(t, m.record("app-a"), attrEntry("x-tag"))
+	names, err := op(t, ctx).getAttributeList(ctx, "app-a")
+	require.NoError(t, err)
+	require.NotContains(t, names, kmiplib.AttributeName("x-tag"))
+}
+
+// ModifyAttribute and DeleteAttribute refuse what a client cannot change,
+// before any request.
+func TestTranslator_ModifyDeleteAttributeRefusals(t *testing.T) {
+	bao := newFakeBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+
+	cases := []struct {
+		attr   kmiplib.Attribute
+		reason kmiplib.ResultReason
+		msg    string
+	}{
+		{kmiplib.Attribute{AttributeName: kmiplib.AttributeNameState, AttributeValue: kmiplib.StateActive}, kmiplib.ResultReasonPermissionDenied, "attribute State is set by the server"},
+		{kmiplib.Attribute{AttributeName: kmiplib.AttributeNameInitialDate, AttributeValue: time.Now()}, kmiplib.ResultReasonPermissionDenied, "attribute Initial Date is set by the server"},
+		{dateAttr(kmiplib.AttributeNameCompromiseDate, time.Now()), kmiplib.ResultReasonPermissionDenied, "attribute Compromise Date is set by the server"},
+		{dateAttr(kmiplib.AttributeNameCompromiseOccurrenceDate, time.Now()), kmiplib.ResultReasonPermissionDenied, "attribute Compromise Occurrence Date is set by the server"},
+		{dateAttr(kmiplib.AttributeNameDestroyDate, time.Now()), kmiplib.ResultReasonPermissionDenied, "attribute Destroy Date is set by the server"},
+		{kmiplib.Attribute{AttributeName: kmiplib.AttributeNameRevocationReason, AttributeValue: unspecified}, kmiplib.ResultReasonPermissionDenied, "attribute Revocation Reason is set by the server"},
+		{kmiplib.Attribute{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-a"}}, kmiplib.ResultReasonInvalidField, "attribute Name cannot be"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.attr.AttributeName), func(t *testing.T) {
+			_, err := op(t, ctx).modifyAttribute(ctx, "app-a", tc.attr)
+			requireReason(t, err, tc.reason, tc.msg)
+			_, err = op(t, ctx).deleteAttribute(ctx, "app-a", tc.attr.AttributeName, nil)
+			requireReason(t, err, tc.reason, tc.msg)
+			if classOf(tc.attr.AttributeName) == attrServerSet {
+				err = op(t, ctx).addAttribute(ctx, "app-a", tc.attr)
+				requireReason(t, err, tc.reason, tc.msg)
+			}
+		})
+	}
+	_, err := op(t, ctx).modifyAttribute(ctx, "app-a", kmiplib.Attribute{AttributeName: "x-empty"})
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, "attribute x-empty has no value")
+	require.Empty(t, bao.all())
+}
+
+func TestTranslator_ModifyDeleteAttributeMissingObject(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	_, err := op(t, ctx).modifyAttribute(ctx, "app-missing", customAttr("x-tag", "blue"))
+	requireReason(t, err, kmiplib.ResultReasonItemNotFound, `object "app-missing" not found`)
+	_, err = op(t, ctx).deleteAttribute(ctx, "app-missing", "x-tag", nil)
+	requireReason(t, err, kmiplib.ResultReasonItemNotFound, `object "app-missing" not found`)
+}
+
+// The Links ReKey wrote come first in the Link indexes and cannot be
+// changed; a Link a client added follows them.
+func TestTranslator_ModifyDeleteAttributeLinkIndexes(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+
+	link := func(lt kmiplib.LinkType, uid string) kmiplib.Attribute {
+		return kmiplib.Attribute{AttributeName: kmiplib.AttributeNameLink, AttributeValue: kmiplib.Link{LinkType: lt, LinkedObjectIdentifier: uid}}
+	}
+	index, err := op(t, ctx).addAttributeAt(ctx, "app-r.2", link(kmiplib.LinkTypeParentLink, "app-x"))
+	require.NoError(t, err)
+	require.Equal(t, int32(1), index)
+
+	_, err = op(t, ctx).modifyAttribute(ctx, "app-r.2", link(kmiplib.LinkTypeChildLink, "app-y"))
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `Link of "app-r.2" is set by ReKey`)
+	_, err = op(t, ctx).deleteAttribute(ctx, "app-r.2", kmiplib.AttributeNameLink, nil)
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `Link of "app-r.2" is set by ReKey`)
+
+	got, err := op(t, ctx).modifyAttribute(ctx, "app-r.2", indexed(link(kmiplib.LinkTypeChildLink, "app-y"), 1))
+	require.NoError(t, err)
+	require.Equal(t, int32(1), *got.AttributeIndex)
+	attrs, err := op(t, ctx).getAttributes(ctx, "app-r.2", []kmiplib.AttributeName{kmiplib.AttributeNameLink})
+	require.NoError(t, err)
+	require.Len(t, attrs, 2)
+	require.True(t, sameValue(link(kmiplib.LinkTypeReplacedObjectLink, "app-r"), attrs[0]))
+	require.True(t, sameValue(link(kmiplib.LinkTypeChildLink, "app-y"), attrs[1]))
+
+	one, two := int32(1), int32(2)
+	_, err = op(t, ctx).deleteAttribute(ctx, "app-r.2", kmiplib.AttributeNameLink, &two)
+	requireReason(t, err, kmiplib.ResultReasonItemNotFound, "with Attribute Index 2")
+	got, err = op(t, ctx).deleteAttribute(ctx, "app-r.2", kmiplib.AttributeNameLink, &one)
+	require.NoError(t, err)
+	require.True(t, sameValue(link(kmiplib.LinkTypeChildLink, "app-y"), got))
+	requireAttr(t, attrsOf(t, ctx, "app-r.2"), kmiplib.AttributeNameLink, kmiplib.Link{LinkType: kmiplib.LinkTypeReplacedObjectLink, LinkedObjectIdentifier: "app-r"})
+}
+
+func attrsOf(t *testing.T, ctx context.Context, uid string) []kmiplib.Attribute {
+	t.Helper()
+	attrs, err := op(t, ctx).getAttributes(ctx, uid, nil)
+	require.NoError(t, err)
+	return attrs
+}
+
+// ModifyAttribute and DeleteAttribute refuse a replacement that a ReKey
+// created and has not yet recorded, as AddAttribute does.
+func TestTranslator_ModifyDeleteAttributeRefuseUninitializedSuccessor(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+	m.write("app-r", claimOp(entryPending, "app-r.2", ""))
+	m.createKey("app-r.2")
+
+	start := len(bao.all())
+	_, err := op(t, ctx).modifyAttribute(ctx, "app-r.2", dateAttr(kmiplib.AttributeNameActivationDate, time.Now()))
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "still being created")
+	_, err = op(t, ctx).deleteAttribute(ctx, "app-r.2", "x-tag", nil)
+	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "still being created")
+	require.NotContains(t, since(bao, start), "POST transit/keys/app-r.2/metadata")
+	require.Empty(t, m.record("app-r.2"))
+}
+
+// Concurrent ModifyAttributes of different attributes of one object all
+// land: each re-reads the record after a lost check-and-set.
+func TestTranslator_ModifyAttributeConcurrent(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	const n = 8
+	_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+	require.NoError(t, err)
+	for i := range n {
+		require.NoError(t, op(t, ctx).addAttribute(ctx, "app-a", customAttr(fmt.Sprintf("x-%d", i), "before")))
+	}
+
+	calls := make([]*call, n)
+	ctxs := make([]context.Context, n)
+	for i := range n {
+		ctxs[i], _ = newTestSession(t, bao, Config{})
+		calls[i] = op(t, ctxs[i])
+	}
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			_, errs[i] = calls[i].modifyAttribute(ctxs[i], "app-a", customAttr(fmt.Sprintf("x-%d", i), "after"))
+		})
+	}
+	wg.Wait()
+
+	attrs := attrsOf(t, ctx, "app-a")
+	for i := range n {
+		require.NoError(t, errs[i], "x-%d", i)
+		requireAttr(t, attrs, kmiplib.AttributeName(fmt.Sprintf("x-%d", i)), "after")
+	}
+	require.Len(t, m.record("app-a"), n)
+}
+
+// Resolve a Name again if ReKey moved it after Locate read its anchor.
+func TestTranslator_LocateNameMovesDuringRead(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	newRekeyKey(t, ctx)
+	_, err := op(t, ctx).rekey(ctx, "app-r", nil, nil)
+	require.NoError(t, err)
+	original := bao.fallback
+	moved := false
+	bao.fallback = func(r fakeRequest) (int, any) {
+		if !moved && r.method == http.MethodGet && r.path == "transit/keys/app-r.2/metadata" {
+			moved = true
+			_, moveErr := op(t, ctx).rekey(ctx, "app-r.2", nil, nil)
+			require.NoError(t, moveErr)
+		}
+		return original(r)
+	}
+	ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{{AttributeName: kmiplib.AttributeNameName, AttributeValue: kmiplib.Name{NameValue: "app-r"}}})
+	require.NoError(t, err)
+	require.Equal(t, []string{"app-r.3"}, ids)
 }

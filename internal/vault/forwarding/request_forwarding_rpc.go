@@ -22,6 +22,7 @@ import (
 	"github.com/openbao/openbao/v2/internal/physical/raft"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -40,6 +41,8 @@ func (s *forwardedRequestRPCServer) ForwardRequest(ctx context.Context, freq *fo
 	if err != nil {
 		return nil, err
 	}
+	requestCtx, requestIDs := forwarding.WithRequestIDs(req.Context())
+	req = req.WithContext(requestCtx)
 
 	// A very dummy response writer that doesn't follow normal semantics, just
 	// lets you write a status code (last written wins) and a body. But it
@@ -57,6 +60,9 @@ func (s *forwardedRequestRPCServer) ForwardRequest(ctx context.Context, freq *fo
 		s.handler.ServeHTTP(w, req)
 	}
 	runRequest()
+	if ids := requestIDs.Values(); len(ids) > 0 {
+		_ = grpc.SetTrailer(ctx, metadata.MD{forwarding.RequestIDMetadata: ids})
+	}
 	resp.StatusCode = uint32(w.StatusCode())
 	resp.Body = w.Body().Bytes()
 

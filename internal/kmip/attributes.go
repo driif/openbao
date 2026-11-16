@@ -18,7 +18,6 @@ import (
 	"time"
 
 	kmiplib "github.com/ovh/kmip-go"
-	"github.com/ovh/kmip-go/kmipserver"
 	"github.com/ovh/kmip-go/ttlv"
 )
 
@@ -40,6 +39,15 @@ const (
 	// entryPending holds the successor a ReKey is creating, on the
 	// predecessor, until the successor's record is written.
 	entryPending = "pending_successor"
+	// entryCompromised marks an object that a compromise Revoke placed in
+	// the Compromised state.
+	entryCompromised = "compromised"
+	// entryDestroyed marks an object that Destroy placed in the Destroyed
+	// state.
+	entryDestroyed = "destroyed"
+
+	// markSet is the value of a set mark.
+	markSet = "true"
 
 	entryAttrPrefix = "attr/"
 	entryLinkPrefix = "link/"
@@ -94,6 +102,10 @@ type metadataRecord map[string]map[string][]string
 
 var errClaimHeld = errors.New("metadata claim is held")
 
+// errNoChange, returned by a writeMetadataFunc mutation, ends the write
+// without a request: the record already holds what the caller wanted.
+var errNoChange = errors.New("metadata record already holds the change")
+
 func metadataRead(uid string) request {
 	return request{method: http.MethodGet, path: "keys/" + uid + "/metadata", capability: "read"}
 }
@@ -107,7 +119,7 @@ func decodeMetadata(data map[string]string) (metadataRecord, error) {
 		}
 		var values []string
 		if err := json.Unmarshal([]byte(value), &values); err != nil || values == nil {
-			return nil, kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "metadata key %q must hold a JSON string array", key)
+			return nil, operationErrorf(kmiplib.ResultReasonGeneralFailure, "metadata key %q must hold a JSON string array", key)
 		}
 		if record[metadataScope] == nil {
 			record[metadataScope] = map[string][]string{}
@@ -206,6 +218,21 @@ const (
 )
 
 func (c *call) writeMetadata(ctx context.Context, uid string, ops ...metadataOp) (*reply, error) {
+	return c.writeMetadataFunc(ctx, uid, func(record metadataRecord) error {
+		for _, op := range ops {
+			if err := record.apply(op); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// writeMetadataFunc is writeMetadata with the change given as a function. It
+// runs mutate on the record of each attempt, read again after a lost
+// check-and-set, so every check in mutate sees the record it changes. A
+// value mutate sets for its caller is final only once the write succeeds.
+func (c *call) writeMetadataFunc(ctx context.Context, uid string, mutate func(metadataRecord) error) (*reply, error) {
 	for attempt := range metadataWriteAttempts {
 		rep, err := c.do(ctx, metadataRead(uid))
 		if err != nil {
@@ -225,10 +252,12 @@ func (c *call) writeMetadata(ctx context.Context, uid string, ops ...metadataOp)
 		if err != nil {
 			return nil, err
 		}
-		for _, op := range ops {
-			if err := record.apply(op); err != nil {
-				return nil, err
+		if err := mutate(record); err != nil {
+			if errors.Is(err, errNoChange) {
+				rep.metadata = record
+				return rep, nil
 			}
+			return nil, err
 		}
 		data := stored.Data
 		if data == nil {
@@ -269,7 +298,7 @@ func (c *call) writeMetadata(ctx context.Context, uid string, ops ...metadataOp)
 		rep.metadata = record
 		return rep, nil
 	}
-	return nil, kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "metadata record kept changing; retry")
+	return nil, operationErrorf(kmiplib.ResultReasonGeneralFailure, "metadata record kept changing; retry")
 }
 
 // metadataBackoff waits before writeMetadata retries a write that lost a
@@ -302,6 +331,8 @@ const (
 	attrDerived
 	// attrHonoured attributes are stored and change behaviour.
 	attrHonoured
+	// attrServerSet attributes are stored by Revoke and Destroy only.
+	attrServerSet
 )
 
 func classOf(name kmiplib.AttributeName) attrClass {
@@ -315,8 +346,32 @@ func classOf(name kmiplib.AttributeName) attrClass {
 		return attrDerived
 	case kmiplib.AttributeNameName:
 		return attrHonoured
+	case kmiplib.AttributeNameCompromiseDate,
+		kmiplib.AttributeNameCompromiseOccurrenceDate,
+		kmiplib.AttributeNameDestroyDate,
+		kmiplib.AttributeNameRevocationReason:
+		return attrServerSet
 	}
 	return attrStored
+}
+
+// checkWritable refuses, before any request, an attribute that a client
+// cannot add, modify or delete: verb names the operation. Name is honoured,
+// so its callers check it themselves.
+func checkWritable(name kmiplib.AttributeName, verb string) error {
+	switch classOf(name) {
+	case attrDerived, attrServerSet:
+		return operationErrorf(
+			kmiplib.ResultReasonPermissionDenied,
+			"attribute %s is set by the server and cannot be %s", name, verb,
+		)
+	}
+	return nil
+}
+
+// setAttr makes attr the only instance of its attribute in record.
+func setAttr(record metadataRecord, attr kmiplib.Attribute) {
+	record.set(metadataScope, attrEntry(attr.AttributeName), []string{encodeAttr(attr)})
 }
 
 // singleInstance lists the stored attributes KMIP allows once per object.
@@ -358,7 +413,7 @@ func decodeAttr(uid, value string) (kmiplib.Attribute, error) {
 		err = ttlv.UnmarshalTTLV(raw, &attr)
 	}
 	if err != nil {
-		return attr, kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "object %q has an undecodable stored attribute: %v", uid, err)
+		return attr, operationErrorf(kmiplib.ResultReasonGeneralFailure, "object %q has an undecodable stored attribute", uid)
 	}
 	return attr, nil
 }
@@ -371,11 +426,11 @@ func sameValue(a, b kmiplib.Attribute) bool {
 // checkAttrValue rejects an attribute instance without a usable value.
 func checkAttrValue(attr kmiplib.Attribute) error {
 	if attr.AttributeValue == nil {
-		return kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "attribute %s has no value", attr.AttributeName)
+		return operationErrorf(kmiplib.ResultReasonInvalidField, "attribute %s has no value", attr.AttributeName)
 	}
 	if attr.AttributeName == kmiplib.AttributeNameName {
 		if n, ok := attr.AttributeValue.(kmiplib.Name); !ok || n.NameValue == "" {
-			return kmipserver.Errorf(kmiplib.ResultReasonInvalidField, "Name attribute is empty or invalid")
+			return operationErrorf(kmiplib.ResultReasonInvalidField, "Name attribute is empty or invalid")
 		}
 	}
 	return nil
@@ -405,13 +460,7 @@ func objectAttrs(uid string, info *keyInfo) ([]kmiplib.Attribute, error) {
 		kmiplib.Attribute{AttributeName: kmiplib.AttributeNameState, AttributeValue: info.state()},
 	)
 
-	// InitialDate/ActivationDate come from the first key version, not the latest
-	// rotation → fall back to MinDecryptionVersion if version 1 was archived.
-	created, ok := info.createdAt(1)
-	if !ok {
-		created, ok = info.createdAt(info.MinDecryptionVersion)
-	}
-	if ok {
+	if created, ok := info.initialDate(); ok {
 		attrs = append(attrs, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameInitialDate, AttributeValue: created})
 		// State=Active is only consistent with an ActivationDate set → supply
 		// it, unless the client stored its own.
@@ -545,33 +594,16 @@ func (c *call) addAttributeAt(ctx context.Context, uid string, attr kmiplib.Attr
 	if err := checkAttrValue(attr); err != nil {
 		return 0, err
 	}
-	if classOf(attr.AttributeName) == attrDerived {
-		return 0, kmipserver.Errorf(
-			kmiplib.ResultReasonPermissionDenied,
-			"attribute %s is set by the server and cannot be added", attr.AttributeName,
-		)
+	if err := checkWritable(attr.AttributeName, "added"); err != nil {
+		return 0, err
 	}
 
 	info, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return 0, err
 	}
-	// ReKey creates its replacement and then writes the replacement's
-	// record. In between, a write to the replacement would be replaced by
-	// that record, or make a retry of the ReKey take the key for a foreign
-	// one. Only a key with a generation suffix and no record can be in that
-	// state, and only while its predecessor marks it as pending.
-	if generationSuffix.MatchString(uid) && info.single(entryGeneration) == "" {
-		pending, err := c.pendingSuccessor(ctx, uid)
-		if err != nil {
-			return 0, err
-		}
-		if pending {
-			return 0, kmipserver.Errorf(
-				kmiplib.ResultReasonPermissionDenied,
-				"wrong key lifecycle state: %q is a ReKey replacement that is still being created", uid,
-			)
-		}
+	if err := c.checkNotPending(ctx, uid, info); err != nil {
+		return 0, err
 	}
 
 	if attr.AttributeName == kmiplib.AttributeNameName {
@@ -585,7 +617,7 @@ func (c *call) addAttributeAt(ctx context.Context, uid string, attr kmiplib.Attr
 	}
 	rep, err := c.writeMetadata(ctx, uid, op)
 	if errors.Is(err, errClaimHeld) {
-		return 0, kmipserver.Errorf(
+		return 0, operationErrorf(
 			kmiplib.ResultReasonInvalidField,
 			"object %q already has a %s, which takes one value", uid, attr.AttributeName,
 		)
@@ -598,6 +630,181 @@ func (c *call) addAttributeAt(ctx context.Context, uid string, attr kmiplib.Attr
 	// write assigned, whatever other writers do after it.
 	after := keyInfo{Metadata: rep.metadata}
 	return after.lastIndex(attr.AttributeName), nil
+}
+
+// checkNotPending refuses a write to a key that a ReKey is creating. ReKey
+// creates its replacement and then writes the replacement's record. In
+// between, a write to the replacement would be replaced by that record, or
+// make a retry of the ReKey take the key for a foreign one. Only a key with
+// a generation suffix and no record can be in that state, and only while its
+// predecessor marks it as pending.
+func (c *call) checkNotPending(ctx context.Context, uid string, info *keyInfo) error {
+	if !generationSuffix.MatchString(uid) || info.single(entryGeneration) != "" {
+		return nil
+	}
+	pending, err := c.pendingSuccessor(ctx, uid)
+	if err != nil {
+		return err
+	}
+	if pending {
+		return operationErrorf(
+			kmiplib.ResultReasonPermissionDenied,
+			"wrong key lifecycle state: %q is a ReKey replacement that is still being created", uid,
+		)
+	}
+	return nil
+}
+
+// modifyAttribute replaces the value of the instance of attr's attribute
+// that attr's Attribute Index selects, 0 when absent, and returns attr as
+// stored, with that index. It refuses what AddAttribute refuses, and Name,
+// since renaming is not supported.
+func (c *call) modifyAttribute(ctx context.Context, uid string, attr kmiplib.Attribute) (kmiplib.Attribute, error) {
+	index := attrIndex(attr.AttributeIndex)
+	attr.AttributeIndex = nil
+	if err := checkName(uid); err != nil {
+		return attr, err
+	}
+	if err := checkAttrValue(attr); err != nil {
+		return attr, err
+	}
+	if err := checkChangeable(attr.AttributeName, "modified"); err != nil {
+		return attr, err
+	}
+
+	info, err := c.readKeyMetadata(ctx, uid)
+	if err != nil {
+		return attr, err
+	}
+	if err := c.checkNotPending(ctx, uid, info); err != nil {
+		return attr, err
+	}
+
+	entry := attrEntry(attr.AttributeName)
+	_, err = c.writeMetadataFunc(ctx, uid, func(record metadataRecord) error {
+		current := info.withRecord(record)
+		values := slices.Clone(current.entry(entry))
+		if attr.AttributeName == kmiplib.AttributeNameActivationDate && len(values) == 0 && index == 0 {
+			// GetAttributes supplies the creation time when no Activation
+			// Date is stored; modifying that instance stores the new value.
+			if _, ok := current.initialDate(); ok {
+				setAttr(record, attr)
+				return nil
+			}
+		}
+		pos, err := current.storedPosition(uid, attr.AttributeName, index, "modified")
+		if err != nil {
+			return err
+		}
+		values[pos] = encodeAttr(attr)
+		record.set(metadataScope, entry, values)
+		return nil
+	})
+	if err != nil {
+		return attr, err
+	}
+	// KMIP lets a response omit the Attribute Index only when it is 0.
+	if index > 0 {
+		attr.AttributeIndex = &index
+	}
+	return attr, nil
+}
+
+// deleteAttribute deletes the instance of name that index selects, 0 when
+// nil, and returns it with that index. Later instances keep their order and
+// move up one index. It refuses what modifyAttribute refuses. The Activation
+// Date that GetAttributes supplies when none is stored is not stored, so it
+// cannot be deleted.
+func (c *call) deleteAttribute(ctx context.Context, uid string, name kmiplib.AttributeName, index *int32) (kmiplib.Attribute, error) {
+	idx := attrIndex(index)
+	if err := checkName(uid); err != nil {
+		return kmiplib.Attribute{}, err
+	}
+	if err := checkChangeable(name, "deleted"); err != nil {
+		return kmiplib.Attribute{}, err
+	}
+
+	info, err := c.readKeyMetadata(ctx, uid)
+	if err != nil {
+		return kmiplib.Attribute{}, err
+	}
+	if err := c.checkNotPending(ctx, uid, info); err != nil {
+		return kmiplib.Attribute{}, err
+	}
+
+	entry := attrEntry(name)
+	var deleted kmiplib.Attribute
+	_, err = c.writeMetadataFunc(ctx, uid, func(record metadataRecord) error {
+		current := info.withRecord(record)
+		pos, err := current.storedPosition(uid, name, idx, "deleted")
+		if err != nil {
+			return err
+		}
+		values := current.entry(entry)
+		if deleted, err = decodeAttr(uid, values[pos]); err != nil {
+			return err
+		}
+		record.set(metadataScope, entry, slices.Delete(slices.Clone(values), pos, pos+1))
+		return nil
+	})
+	if err != nil {
+		return kmiplib.Attribute{}, err
+	}
+	if idx > 0 {
+		deleted.AttributeIndex = &idx
+	}
+	return deleted, nil
+}
+
+// attrIndex returns the Attribute Index of a request, 0 when absent.
+func attrIndex(index *int32) int32 {
+	if index == nil {
+		return 0
+	}
+	return *index
+}
+
+// checkChangeable refuses, before any request, an attribute that
+// ModifyAttribute and DeleteAttribute cannot change: the attributes a client
+// cannot add, and Name, since renaming is not supported.
+func checkChangeable(name kmiplib.AttributeName, verb string) error {
+	if name == kmiplib.AttributeNameName {
+		return operationErrorf(
+			kmiplib.ResultReasonInvalidField,
+			"attribute Name cannot be %s: it identifies the object across ReKey, and renaming is not supported", verb,
+		)
+	}
+	return checkWritable(name, verb)
+}
+
+// storedPosition returns the position, in the stored entry of name, of the
+// instance that GetAttributes reports at index. It counts the way
+// objectAttrs does: the Links ReKey wrote come first and are refused, since
+// ReKey sets them; stored instances follow in the order they were added.
+func (k *keyInfo) storedPosition(uid string, name kmiplib.AttributeName, index int32, verb string) (int, error) {
+	pos := index
+	if name == kmiplib.AttributeNameLink {
+		for _, lt := range rekeyLinks {
+			if k.single(linkEntry(lt)) == "" {
+				continue
+			}
+			if pos == 0 {
+				return 0, operationErrorf(
+					kmiplib.ResultReasonPermissionDenied,
+					"the %s Link of %q is set by ReKey and cannot be %s", ttlv.EnumStr(lt), uid, verb,
+				)
+			}
+			pos--
+		}
+	}
+	if pos < 0 || int(pos) >= len(k.entry(attrEntry(name))) {
+		// kmip-go has no Attribute Not Found result reason for KMIP 1.x.
+		return 0, operationErrorf(
+			kmiplib.ResultReasonItemNotFound,
+			"object %q has no %s with Attribute Index %d", uid, name, index,
+		)
+	}
+	return int(pos), nil
 }
 
 // pendingSuccessor reports whether uid is a replacement that a ReKey created
@@ -655,12 +862,12 @@ func checkSameName(uid string, info *keyInfo, name string) error {
 	current, ok := info.kmipName(uid)
 	switch {
 	case !ok:
-		return kmipserver.Errorf(
+		return operationErrorf(
 			kmiplib.ResultReasonInvalidField,
 			"object %q was replaced by %q and has no Name; renaming is not supported", uid, info.replacement(),
 		)
 	case name != current:
-		return kmipserver.Errorf(
+		return operationErrorf(
 			kmiplib.ResultReasonInvalidField,
 			"renaming is not supported: object %q has the Name %q", uid, current,
 		)
@@ -683,48 +890,99 @@ func containsAttr(attrs []kmiplib.Attribute, want kmiplib.Attribute) bool {
 // Name, and a Cryptographic Algorithm, Cryptographic Length or Object Type
 // equal to the predecessor's, are accepted and change nothing. Any other
 // Name, and any other value of those three, is refused. Every other derived
-// attribute is refused, even one equal to the predecessor's.
+// attribute, and every server-set one, is refused, even one equal to the
+// predecessor's.
 func templateEntries(uid string, info *keyInfo, template *kmiplib.TemplateAttribute) (map[string][]string, error) {
-	out := map[string][]string{}
 	if template == nil {
-		return out, nil
+		return map[string][]string{}, nil
 	}
-	//nolint:staticcheck // KMIP 1.2 clients may still reference templates by name
-	if len(template.Name) > 0 {
-		return nil, kmipserver.Errorf(kmiplib.ResultReasonFeatureNotSupported, "templates referenced by name are not supported")
-	}
-
 	alg, bitlen, objType, err := info.kmipAttrs()
 	if err != nil {
 		return nil, err
 	}
+	return sortTemplate(
+		template, fixedAttrs(alg, bitlen, objType),
+		func(name string) error { return checkSameName(uid, info, name) },
+		func(name kmiplib.AttributeName) error {
+			return operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "ReKey cannot change the %s of %q", name, uid)
+		},
+	)
+}
+
+// newObjectEntries sorts the attributes of a Create or Register template,
+// by the rules of templateEntries: the object's Name, and the algorithm,
+// length and object type the operation makes, are accepted and change
+// nothing; any other value of them is refused.
+func newObjectEntries(op, name string, alg kmiplib.CryptographicAlgorithm, bitlen int32, keyType string, keySize int, template *kmiplib.TemplateAttribute) (map[string][]string, error) {
+	if template == nil {
+		return map[string][]string{}, nil
+	}
+	key := keyInfo{Type: keyType, KeySize: keySize}
+	_, _, objType, err := key.kmipAttrs()
+	if err != nil {
+		return nil, err
+	}
+	return sortTemplate(
+		template, fixedAttrs(alg, bitlen, objType),
+		func(other string) error {
+			if other != name {
+				return operationErrorf(kmiplib.ResultReasonInvalidField, "an object takes one Name: the template gives %q and %q", name, other)
+			}
+			return nil
+		},
+		func(attr kmiplib.AttributeName) error {
+			return operationErrorf(kmiplib.ResultReasonInvalidField, "the template's %s does not match the object %s makes", attr, op)
+		},
+	)
+}
+
+// fixedAttrs returns the derived attributes a template may repeat.
+func fixedAttrs(alg kmiplib.CryptographicAlgorithm, bitlen int32, objType kmiplib.ObjectType) []kmiplib.Attribute {
+	return []kmiplib.Attribute{
+		{AttributeName: kmiplib.AttributeNameCryptographicAlgorithm, AttributeValue: alg},
+		{AttributeName: kmiplib.AttributeNameCryptographicLength, AttributeValue: bitlen},
+		{AttributeName: kmiplib.AttributeNameObjectType, AttributeValue: objType},
+	}
+}
+
+// sortTemplate sorts the attributes of a template into stored entries. A
+// Name goes to name, which accepts or refuses it. A Cryptographic
+// Algorithm, Cryptographic Length or Object Type equal to one in fixed is
+// accepted and changes nothing; changed refuses any other value. Every other
+// derived attribute, and every server-set one, is refused. Of a
+// single-instance attribute, the last value counts.
+func sortTemplate(
+	template *kmiplib.TemplateAttribute,
+	fixed []kmiplib.Attribute,
+	name func(string) error,
+	changed func(kmiplib.AttributeName) error,
+) (map[string][]string, error) {
+	out := map[string][]string{}
+	//nolint:staticcheck // KMIP 1.2 clients may still reference templates by name
+	if len(template.Name) > 0 {
+		return nil, operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "templates referenced by name are not supported")
+	}
+
 	for _, attr := range template.Attribute {
 		if err := checkAttrValue(attr); err != nil {
 			return nil, err
 		}
 		switch attr.AttributeName {
 		case kmiplib.AttributeNameName:
-			if err := checkSameName(uid, info, attr.AttributeValue.(kmiplib.Name).NameValue); err != nil {
+			if err := name(attr.AttributeValue.(kmiplib.Name).NameValue); err != nil {
 				return nil, err
 			}
 			continue
 		case kmiplib.AttributeNameCryptographicAlgorithm,
 			kmiplib.AttributeNameCryptographicLength,
 			kmiplib.AttributeNameObjectType:
-			if !containsAttr([]kmiplib.Attribute{
-				{AttributeName: kmiplib.AttributeNameCryptographicAlgorithm, AttributeValue: alg},
-				{AttributeName: kmiplib.AttributeNameCryptographicLength, AttributeValue: bitlen},
-				{AttributeName: kmiplib.AttributeNameObjectType, AttributeValue: objType},
-			}, attr) {
-				return nil, kmipserver.Errorf(kmiplib.ResultReasonFeatureNotSupported, "ReKey cannot change the %s of %q", attr.AttributeName, uid)
+			if !containsAttr(fixed, attr) {
+				return nil, changed(attr.AttributeName)
 			}
 			continue
 		}
-		if classOf(attr.AttributeName) == attrDerived {
-			return nil, kmipserver.Errorf(
-				kmiplib.ResultReasonPermissionDenied,
-				"attribute %s is set by the server and cannot be added", attr.AttributeName,
-			)
+		if err := checkWritable(attr.AttributeName, "added"); err != nil {
+			return nil, err
 		}
 		entry := attrEntry(attr.AttributeName)
 		if singleInstance[attr.AttributeName] {

@@ -14,7 +14,6 @@ import (
 	"time"
 
 	kmiplib "github.com/ovh/kmip-go"
-	"github.com/ovh/kmip-go/kmipserver"
 	"github.com/ovh/kmip-go/ttlv"
 )
 
@@ -26,10 +25,10 @@ import (
 // Every step is safe to repeat, so a client that retries an interrupted
 // ReKey resumes it:
 //
-//  1. Read P. Refuse a replaced or non-symmetric key. Refuse a
-//     soft-deleted key too, unless it is the predecessor of a committed
-//     ReKey that the retention sweep reached before step 7 linked it:
-//     then only write that link.
+//  1. Read P. Refuse a Compromised or Destroyed object, a replaced key and
+//     a non-symmetric key. Refuse a soft-deleted key too, unless it is the
+//     predecessor of a committed ReKey that the retention sweep reached
+//     before step 7 linked it: then only write that link.
 //  2. Take A and g from P's record; a key without one is A itself, g=1.
 //  3. Read S. When S is missing, mark it as P's pending_successor, then
 //     create it. When S's record links back to P, resume and keep that
@@ -49,18 +48,22 @@ import (
 //  8. Soft-delete the generations beyond kmip_rekey_retain, best effort.
 func (c *call) rekey(ctx context.Context, uid string, offset *time.Duration, template *kmiplib.TemplateAttribute) (string, error) {
 	if offset != nil && *offset != 0 {
-		return "", kmipserver.Errorf(kmiplib.ResultReasonFeatureNotSupported, "ReKey with an Offset is not supported")
+		return "", operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "ReKey with an Offset is not supported")
 	}
 
 	pred, err := c.readKeyMetadata(ctx, uid)
 	if err != nil {
 		return "", err
 	}
+	switch state := pred.state(); state {
+	case kmiplib.StateCompromised, kmiplib.StateDestroyed, kmiplib.StateDestroyedCompromised:
+		return "", errWrongState(uid, state)
+	}
 	if pred.SoftDeleted {
 		return c.repairSweptLink(ctx, uid, pred)
 	}
 	if next := pred.replacement(); next != "" {
-		return "", kmipserver.Errorf(
+		return "", operationErrorf(
 			kmiplib.ResultReasonPermissionDenied,
 			"wrong key lifecycle state: object %q is Deactivated: ReKey replaced it with %q", uid, next,
 		)
@@ -70,7 +73,7 @@ func (c *call) rekey(ctx context.Context, uid string, offset *time.Duration, tem
 		return "", err
 	}
 	if objType != kmiplib.ObjectTypeSymmetricKey {
-		return "", kmipserver.Errorf(
+		return "", operationErrorf(
 			kmiplib.ResultReasonFeatureNotSupported,
 			"ReKey replaces symmetric keys only; %q is a %s", uid, ttlv.EnumStr(objType),
 		)
@@ -173,7 +176,7 @@ func (c *call) rekey(ctx context.Context, uid string, offset *time.Duration, tem
 			return "", readErr
 		}
 		if !moved {
-			return "", kmipserver.Errorf(
+			return "", operationErrorf(
 				kmiplib.ResultReasonPermissionDenied,
 				"wrong key lifecycle state: object %q is no longer the current object of the Name %q: %s", uid, anchor, err,
 			)
@@ -204,7 +207,7 @@ func successorOf(uid string, pred *keyInfo) (anchor string, gen int, succ string
 		anchor = a
 		gen, err = strconv.Atoi(pred.single(entryGeneration))
 		if err != nil || gen < 2 {
-			return "", 0, "", kmipserver.Errorf(kmiplib.ResultReasonGeneralFailure, "object %q has the anchor %q but no valid generation", uid, a)
+			return "", 0, "", operationErrorf(kmiplib.ResultReasonGeneralFailure, "object %q has the anchor %q but no valid generation", uid, a)
 		}
 	}
 	succ = anchor + "." + strconv.Itoa(gen+1)
@@ -294,7 +297,7 @@ func (c *call) movedPast(ctx context.Context, anchor string, gen int) (bool, err
 }
 
 func errForeignSuccessor(uid, succ string) error {
-	return kmipserver.Errorf(
+	return operationErrorf(
 		kmiplib.ResultReasonGeneralFailure,
 		"ReKey of %q must create the key %q, which already exists and is not its replacement: retry the ReKey, and if this error repeats, rename or delete %q", uid, succ, succ,
 	)

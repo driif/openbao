@@ -140,6 +140,14 @@ func rateLimitQuotaWrapping(handler http.Handler, core *vault.Core) http.Handler
 			return
 		}
 
+		// Namespace resolution below waits on core's state lock, which is held
+		// for the whole of post-unseal while the node becomes active. Rate limit
+		// exempt paths like sys/health skip it.
+		if core.RateLimitPathExempt(path) {
+			handler.ServeHTTP(w, r)
+			return
+		}
+
 		// NOTE: The namespace and mount resolved here may differ from the ones
 		// later resolved in core and used for the remainder of request handling.
 		// For example, this can happen if there is a seal->unseal transition
@@ -175,16 +183,18 @@ func rateLimitQuotaWrapping(handler http.Handler, core *vault.Core) http.Handler
 		// If any role-based quotas are enabled for this namespace/mount, just
 		// do the role resolution once here.
 		if requiresResolveRole {
-			role := core.DetermineRoleFromLoginRequestFromReader(ctx, mountPath, r.Body)
-
-			// Reset our body to the beginning.
-			if err := resetBody(r); err != nil {
-				respondError(w, http.StatusInternalServerError, err)
+			data, status, err := parseBodyData(r)
+			if err != nil {
+				core.Logger().Error("failed to parse body data", "path", path, "error", err)
+				respondError(w, status, err)
+				return
 			}
 
-			// add an entry to the context to prevent recalculating request role unnecessarily
-			r = r.WithContext(context.WithValue(r.Context(), logical.CtxKeyRequestRole{}, role))
-			quotaReq.Role = role
+			if role := core.DetermineRoleFromLoginRequest(ctx, mountPath, data, getConnection(r)); role != "" {
+				// Add an entry to the context to prevent recalculating request role unnecessarily.
+				r = r.WithContext(context.WithValue(r.Context(), logical.CtxKeyRequestRole{}, role))
+				quotaReq.Role = role
+			}
 		}
 
 		quotaResp, err := core.ApplyRateLimitQuota(r.Context(), quotaReq)
@@ -290,4 +300,65 @@ func pemDecodeHeader(headerValue string) (string, error) {
 	}
 	// This is later validated in handleCertHeader in http/logical.go as part of buildLogicalRequestNoAuth
 	return base64.StdEncoding.EncodeToString(block.Bytes), nil
+}
+
+// https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_conn_man/headers#x-forwarded-client-cert
+func envoyDecodeHeader(headerValue string) (string, error) {
+	// The Envoy XFCC header value is a comma (",") separated string. Each substring is an XFCC element, which holds
+	// information added by a single proxy. Each XFCC element is a semicolon (";") separated list of key-value pairs.
+	// Each key-value pair is separated by an equal sign ("=").
+	//
+	// Extract only the first (leftmost) XFCC element, which is added by the outermost proxy that terminates the client's TLS connection.
+	//
+	// Example:
+	// x-forwarded-client-cert: Hash=<hash>;Cert="<PEM>";Subject="CN=client,O=example",<other elements from other proxies>
+
+	headerValue += ","                 // Ensures that also single-element header is terminated by ','.
+	inQuotes := false                  // State variable to track if we are currently within quotes.
+	pairStart := 0                     // Index of the currently processed key-value pair.
+	results := make(map[string]string) // Map to store the extracted key-value pairs.
+
+LOOP:
+	for i := 0; i < len(headerValue); i++ {
+		c := headerValue[i]
+
+		if inQuotes {
+			switch c {
+			case '\\':
+				i++ // Skip escaped character.
+			case '"':
+				inQuotes = false
+			}
+			continue
+		}
+
+		switch c {
+		case '"':
+			inQuotes = true
+		case ';', ',':
+			// Now we have the end of a key-value pair: process it.
+			key, value, found := strings.Cut(headerValue[pairStart:i], "=")
+			if found && (strings.EqualFold(key, "Cert") || strings.EqualFold(key, "Chain")) {
+				value = strings.Trim(value, `"`)
+				decoded, err := url.QueryUnescape(value)
+				if err != nil {
+					return "", err
+				}
+				results[strings.ToLower(key)] = decoded
+			}
+			if c == ',' {
+				break LOOP // Stop parsing after the first XFCC element.
+			}
+			pairStart = i + 1 // Move to the next key-value pair.
+		}
+	}
+
+	if cert, ok := results["chain"]; ok {
+		return cert, nil
+	}
+	if cert, ok := results["cert"]; ok {
+		return cert, nil
+	}
+
+	return "", errors.New("neither Cert nor Chain key found in XFCC header")
 }

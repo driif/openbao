@@ -49,6 +49,10 @@ path "cubbyhole/response" {
 path "sys/wrapping/unwrap" {
     capabilities = ["update"]
 }
+
+path "auth/token/revoke-self" {
+    capabilities = ["update"]
+}
 `
 	// DefaultPolicy is the "default" policy
 	DefaultPolicy = `
@@ -153,7 +157,7 @@ var (
 type Store struct {
 	core core
 
-	tokenPoliciesLRU *lru.TwoQueueCache[string, *Policy]
+	tokenPoliciesLRU *lru.TwoQueueCache[cacheKey, *Policy]
 
 	// This is used to ensure that writes to the store (acl) or to the egp
 	// path tree don't happen concurrently. We are okay reading stale data so
@@ -180,7 +184,7 @@ func NewStore(ctx context.Context, core core, baseView barrier.View, system logi
 	}
 
 	if !system.CachingDisabled() {
-		cache, _ := lru.New2Q[string, *Policy](policyCacheSize)
+		cache, _ := lru.New2Q[cacheKey, *Policy](policyCacheSize)
 		ps.tokenPoliciesLRU = cache
 	}
 
@@ -216,7 +220,7 @@ func (ps *Store) InvalidateNamespace(ctx context.Context, uuid string) {
 	defer ps.lockWithUnlock(ctx)()
 
 	for _, key := range ps.tokenPoliciesLRU.Keys() {
-		if strings.HasPrefix(key, uuid) {
+		if key.namespace == uuid {
 			ps.tokenPoliciesLRU.Remove(key)
 		}
 	}
@@ -259,7 +263,7 @@ func (ps *Store) SetPolicy(ctx context.Context, p *Policy, casVersion *int) erro
 		return errors.New("policy name missing")
 	}
 	// Policies are normalized to lower-case
-	p.Name = ps.sanitizeName(p.Name)
+	p.Name = ps.SanitizeName(p.Name)
 	if slices.Contains(immutablePolicies, p.Name) {
 		return fmt.Errorf("cannot update %q policy", p.Name)
 	}
@@ -297,7 +301,7 @@ func (ps *Store) setPolicyInternal(ctx context.Context, p *Policy, casVersion *i
 		}
 
 		if *casVersion != -1 && *casVersion != existing.DataVersion {
-			return fmt.Errorf("check-and-set parameter did not match the current version")
+			return fmt.Errorf("check-and-set parameter %v did not match the current version %v", *casVersion, existing.DataVersion)
 		}
 	}
 
@@ -369,10 +373,10 @@ func (ps *Store) switchedGetPolicy(ctx context.Context, name string, policyType 
 	}
 
 	// Policies are normalized to lower-case
-	name = ps.sanitizeName(name)
+	name = ps.SanitizeName(name)
 	index := ps.cacheKey(ns, name)
 
-	var cache *lru.TwoQueueCache[string, *Policy]
+	var cache *lru.TwoQueueCache[cacheKey, *Policy]
 	var view barrier.View
 
 	switch policyType {
@@ -553,7 +557,7 @@ func (ps *Store) switchedDeletePolicy(ctx context.Context, name string, policyTy
 	}
 
 	// Policies are normalized to lower-case
-	name = ps.sanitizeName(name)
+	name = ps.SanitizeName(name)
 	index := ps.cacheKey(ns, name)
 
 	view := ps.getBarrierView(ns, policyType)
@@ -663,6 +667,9 @@ func (ps *Store) LoadACLPolicy(ctx context.Context, policyName, policyText strin
 		return err
 	}
 
+	// Assume we're creating the policy.
+	cas := -1
+
 	// Check if the pol already exists
 	pol, err := ps.GetPolicy(ctx, policyName, TypeACL)
 	if err != nil {
@@ -672,6 +679,9 @@ func (ps *Store) LoadACLPolicy(ctx context.Context, policyName, policyText strin
 		if !slices.Contains(immutablePolicies, policyName) || policyText == pol.Raw {
 			return nil
 		}
+
+		// Policy exists; record its CAS value.
+		cas = pol.DataVersion
 	}
 
 	pol, err = ParseACLPolicy(ns, policyText)
@@ -683,18 +693,29 @@ func (ps *Store) LoadACLPolicy(ctx context.Context, policyName, policyText strin
 		return fmt.Errorf("parsing %q policy resulted in nil policy", policyName)
 	}
 
-	cas := &pol.DataVersion
 	pol.Name = policyName
 	pol.Type = TypeACL
-	return ps.setPolicyInternal(ctx, pol, cas)
+	return ps.setPolicyInternal(ctx, pol, &cas)
 }
 
-func (ps *Store) sanitizeName(name string) string {
-	return strings.ToLower(strings.TrimSpace(name))
+func (ps *Store) SanitizeName(name string) string {
+	sanitized := path.Clean(strings.ToLower(strings.TrimSpace(name)))
+	if sanitized == "." {
+		return ""
+	}
+
+	return sanitized
 }
 
-func (ps *Store) cacheKey(ns *namespace.Namespace, name string) string {
-	return path.Join(ns.UUID, name)
+type cacheKey struct {
+	name, namespace string
+}
+
+func (ps *Store) cacheKey(ns *namespace.Namespace, name string) cacheKey {
+	return cacheKey{
+		name:      name,
+		namespace: ns.UUID,
+	}
 }
 
 // LoadDefaultPolicies loads default policies for the namespace in the provided context

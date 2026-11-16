@@ -274,20 +274,14 @@ func (c *Core) mountInternalWithLock(ctx context.Context, entry *routing.MountEn
 		return err
 	}
 
-	origReadOnlyErr := view.GetReadOnlyErr()
-
-	// Mark the view as read-only until the mounting is complete and
-	// ensure that it is reset after. This ensures that there will be no
-	// writes during the construction of the backend.
+	// Mark the view as read-only until the mounting is complete. This ensures
+	// that there will be no writes during the construction of the backend.
 	view.SetReadOnlyErr(logical.ErrSetupReadOnly)
-	// We defer this because we're already up and running so we don't need to
-	// time it for after postUnseal
-	defer view.SetReadOnlyErr(origReadOnlyErr)
 
 	var backend logical.Backend
 	// Create the new backend
 	sysView := c.mountEntrySysView(entry)
-	backend, entry.RunningSha256, err = c.newLogicalBackend(ctx, entry, sysView, view)
+	backend, err = c.newLogicalBackend(ctx, entry, sysView, view)
 	if err != nil {
 		return err
 	}
@@ -305,15 +299,6 @@ func (c *Core) mountInternalWithLock(ctx context.Context, entry *routing.MountEn
 	if backendType != logical.TypeLogical {
 		if err := knownMountType(entry.Type); err != nil {
 			return err
-		}
-	}
-
-	// update the entry running version with the configured version, which was verified during registration.
-	entry.RunningVersion = entry.Version
-	if entry.RunningVersion == "" {
-		// don't set the running version to a builtin if it is running as an external plugin
-		if entry.RunningSha256 == "" {
-			entry.RunningVersion = versions.GetBuiltinVersion(consts.PluginTypeSecrets, entry.Type)
 		}
 	}
 
@@ -337,9 +322,9 @@ func (c *Core) mountInternalWithLock(ctx context.Context, entry *routing.MountEn
 		return err
 	}
 
-	// restore the original readOnlyErr, so we can write to the view in
-	// Initialize() if necessary
-	view.SetReadOnlyErr(origReadOnlyErr)
+	// Mark as writable again and ensure Initialize can write to the view if
+	// necessary.
+	view.SetReadOnlyErr(nil)
 
 	// Initialize, using the core's active context.
 	activeCtx := namespace.ContextWithNamespace(c.activeContext.Load(), ns)
@@ -1499,20 +1484,18 @@ func (c *Core) setupMount(ctx context.Context, entry *routing.MountEntry) (func(
 		return nil, err
 	}
 
-	origReadOnlyErr := view.GetReadOnlyErr()
-
-	// Mark the view as read-only until the mounting is complete and
-	// ensure that it is reset after. This ensures that there will be no
-	// writes during the construction of the backend.
+	// Mark the view as read-only until the mounting is complete and ensure that
+	// it is reset after. This ensures that there will be no writes during the
+	// construction of the backend.
 	view.SetReadOnlyErr(logical.ErrSetupReadOnly)
 	if slices.Contains(singletonMounts, entry.Type) {
-		defer view.SetReadOnlyErr(origReadOnlyErr)
+		defer view.SetReadOnlyErr(nil)
 	}
 
 	// Create the new backend
 	var backend logical.Backend
 	sysView := c.mountEntrySysView(entry)
-	backend, entry.RunningSha256, err = c.newLogicalBackend(ctx, entry, sysView, view)
+	backend, err = c.newLogicalBackend(ctx, entry, sysView, view)
 	if err != nil {
 		c.logger.Error("failed to create mount entry", "path", entry.Path, "error", err)
 		if !c.isMountable(ctx, entry, consts.PluginTypeSecrets) {
@@ -1521,14 +1504,6 @@ func (c *Core) setupMount(ctx context.Context, entry *routing.MountEntry) (func(
 
 		c.logger.Warn("skipping plugin-based mount entry", "path", entry.Path)
 	} else {
-		// update the entry running version with the configured
-		// version, which was verified during registration.
-		entry.RunningVersion = entry.Version
-		if entry.RunningVersion == "" && entry.RunningSha256 == "" {
-			// don't set the running version to a builtin if it is running as an external plugin
-			entry.RunningVersion = versions.GetBuiltinVersion(consts.PluginTypeSecrets, entry.Type)
-		}
-
 		// Do not start up deprecated builtin plugins. If this is a major
 		// upgrade, stop unsealing and shutdown. If we've already mounted this
 		// plugin, proceed with unsealing and skip backend initialization.
@@ -1570,7 +1545,7 @@ func (c *Core) setupMount(ctx context.Context, entry *routing.MountEntry) (func(
 			return
 		}
 		if !slices.Contains(singletonMounts, localEntry.Type) {
-			view.SetReadOnlyErr(origReadOnlyErr)
+			view.SetReadOnlyErr(nil)
 		}
 
 		if err := backend.Initialize(namespace.ContextWithNamespace(ctx, localEntry.Namespace), &logical.InitializationRequest{Storage: view}); err != nil {
@@ -1618,35 +1593,38 @@ func (c *Core) unloadMounts(ctx context.Context) error {
 
 // newLogicalBackend is used to create and configure a new logical backend by name.
 // It also returns the SHA256 of the plugin, if available.
-func (c *Core) newLogicalBackend(ctx context.Context, entry *routing.MountEntry, sysView logical.SystemView, view logical.Storage) (logical.Backend, string, error) {
+func (c *Core) newLogicalBackend(ctx context.Context, entry *routing.MountEntry, sysView logical.SystemView, view logical.Storage) (logical.Backend, error) {
 	t := entry.Type
 	if alias, ok := mountAliases[t]; ok {
 		t = alias
 	}
 
-	var runningSha string
+	var runningSha, runningVersion string
 	f, ok := c.logicalBackends[t]
 	if !ok {
 		plug, err := c.pluginCatalog.Get(ctx, t, consts.PluginTypeSecrets, entry.Version)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		if plug == nil {
 			errContext := t
 			if entry.Version != "" {
 				errContext += fmt.Sprintf(", version=%s", entry.Version)
 			}
-			return nil, "", fmt.Errorf("%w: %s", ErrPluginNotFound, errContext)
+			return nil, fmt.Errorf("%w: %s", ErrPluginNotFound, errContext)
 		}
-		if len(plug.Sha256) > 0 {
-			runningSha = hex.EncodeToString(plug.Sha256)
-		}
+
+		runningSha = hex.EncodeToString(plug.Sha256)
+		runningVersion = plug.Version
 
 		f = plugin.Factory
 		if !plug.Builtin {
 			f = wrapFactoryCheckPerms(c, plugin.Factory)
 		}
+	} else {
+		runningVersion = versions.GetBuiltinVersion(consts.PluginTypeSecrets, t)
 	}
+
 	// Set up conf to pass in plugin_name
 	conf := make(map[string]string)
 	maps.Copy(conf, entry.Options)
@@ -1676,13 +1654,16 @@ func (c *Core) newLogicalBackend(ctx context.Context, entry *routing.MountEntry,
 	ctx = context.WithValue(ctx, "core_number", c.coreNumber)
 	b, err := f(ctx, config)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if b == nil {
-		return nil, "", fmt.Errorf("nil backend of type %q returned from factory", t)
+		return nil, fmt.Errorf("nil backend of type %q returned from factory", t)
 	}
 
-	return b, runningSha, nil
+	entry.RunningSha256 = runningSha
+	entry.RunningVersion = runningVersion
+
+	return b, nil
 }
 
 // defaultMountTable creates a default mount table
@@ -2183,16 +2164,35 @@ func (c *Core) reloadMountInternalWithLock(ctx context.Context, table, uuid stri
 			}
 		}
 
+		if actualMountEntry.Description != desiredMountEntry.Description {
+			actualMountEntry.Description = desiredMountEntry.Description
+		}
+
+		// Now check for fields that impact our need to reload.
+		needReload := false
+		if !maps.Equal(desiredMountEntry.Options, actualMountEntry.Options) {
+			actualMountEntry.Options = desiredMountEntry.Options
+			needReload = true
+		}
+
 		if !reflect.DeepEqual(desiredMountEntry.Config, actualMountEntry.Config) {
 			actualMountEntry.Config = desiredMountEntry.Config
 			actualMountEntry.SyncCache()
+			needReload = true
 		}
 
-		if desiredMountEntry.Options["version"] != actualMountEntry.Options["version"] {
-			err := c.reloadBackendCommon(ctx, desiredMountEntry, table == routing.CredentialTableType)
-			if err != nil {
-				return err
-			}
+		if actualMountEntry.Reload != desiredMountEntry.Reload {
+			actualMountEntry.Reload = desiredMountEntry.Reload
+			needReload = true
+		}
+
+		// A change to the version by itself should not effect a reload; this
+		// is not the case on the primary either. An explicit plugin reload is
+		// required, which will bump the Reload field handled above.
+		actualMountEntry.Version = desiredMountEntry.Version
+
+		if needReload && !slices.Contains(singletonMounts, actualMountEntry.Type) {
+			return c.reloadBackendCommon(ctx, actualMountEntry, table == routing.CredentialTableType, false)
 		}
 	}
 

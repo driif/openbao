@@ -73,7 +73,26 @@ type batchResponseVerifyItem struct {
 	Reference string `json:"reference" mapstructure:"reference"`
 }
 
-const defaultHashAlgorithm = "sha2-256"
+func getHashAlgorithm(d *framework.FieldData, kt keysutil.KeyType) (keysutil.HashType, error) {
+	hashAlgorithmStr := d.Get("urlalgorithm").(string)
+	if hashAlgorithmStr == "" {
+		hashAlgorithmStr = d.Get("hash_algorithm").(string)
+		if hashAlgorithmStr == "" {
+			hashAlgorithmStr = d.Get("algorithm").(string)
+		}
+	}
+
+	if hashAlgorithmStr == "" {
+		return kt.DefaultHashAlgorithm(), nil
+	}
+
+	hashAlgorithmType, ok := keysutil.HashTypeMap[hashAlgorithmStr]
+	if !ok {
+		return 0, fmt.Errorf("invalid hash algorithm %q", hashAlgorithmStr)
+	}
+
+	return hashAlgorithmType, nil
+}
 
 func (b *backend) pathSign() *framework.Path {
 	return &framework.Path{
@@ -103,8 +122,7 @@ derivation is enabled; currently only available with ed25519 keys.`,
 			},
 
 			"hash_algorithm": {
-				Type:    framework.TypeString,
-				Default: defaultHashAlgorithm,
+				Type: framework.TypeString,
 				Description: `Hash algorithm to use (POST body parameter). Valid values are:
 
 * sha1
@@ -116,17 +134,19 @@ derivation is enabled; currently only available with ed25519 keys.`,
 * sha3-256
 * sha3-384
 * sha3-512
+* mldsa-mu
 * none
 
-Defaults to "sha2-256". Not valid for all key types,
-including ed25519. Using none requires setting prehashed=true and
-signature_algorithm=pkcs1v15, yielding a PKCSv1_5_NoOID instead of
-the usual PKCSv1_5_DERnull signature.`,
+Defaults to "sha2-256" for RSA- and ECDSA-type keys, and "none" otherwise. Not
+valid for all key types, including Ed25519 and ML-DSA. Using "none" with a key
+type that otherwise requires a hash function requires setting prehashed=true
+and signature_algorithm=pkcs1v15, yielding a PKCSv1_5_NoOID instead of the usual
+PKCSv1_5_DERnull signature. "mldsa-mu" is only valid for prehashed input for
+MLDSA-type keys.`,
 			},
 
 			"algorithm": {
 				Type:        framework.TypeString,
-				Default:     defaultHashAlgorithm,
 				Description: `Deprecated: use "hash_algorithm" instead.`,
 			},
 
@@ -229,8 +249,7 @@ derivation is enabled; currently only available with ed25519 keys.`,
 			},
 
 			"hash_algorithm": {
-				Type:    framework.TypeString,
-				Default: defaultHashAlgorithm,
+				Type: framework.TypeString,
 				Description: `Hash algorithm to use (POST body parameter). Valid values are:
 
 * sha1
@@ -244,13 +263,12 @@ derivation is enabled; currently only available with ed25519 keys.`,
 * sha3-512
 * none
 
-Defaults to "sha2-256". Not valid for all key types. See note about
-none on signing path.`,
+Defaults to "sha2-256" for RSA-, ECDSA-, and HMAC-type keys, and "none"
+otherwise. Not valid for all key types. See note about "none" on signing path.`,
 			},
 
 			"algorithm": {
 				Type:        framework.TypeString,
-				Default:     defaultHashAlgorithm,
 				Description: `Deprecated: use "hash_algorithm" instead.`,
 			},
 
@@ -328,21 +346,6 @@ func (b *backend) getSaltLength(d *framework.FieldData) (int, error) {
 func (b *backend) pathSignWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	name := d.Get("name").(string)
 	ver := d.Get("key_version").(int)
-	hashAlgorithmStr := d.Get("urlalgorithm").(string)
-	if hashAlgorithmStr == "" {
-		hashAlgorithmStr = d.Get("hash_algorithm").(string)
-		if hashAlgorithmStr == "" {
-			hashAlgorithmStr = d.Get("algorithm").(string)
-			if hashAlgorithmStr == "" {
-				hashAlgorithmStr = defaultHashAlgorithm
-			}
-		}
-	}
-
-	hashAlgorithm, ok := keysutil.HashTypeMap[hashAlgorithmStr]
-	if !ok {
-		return logical.ErrorResponse("invalid hash algorithm %q", hashAlgorithmStr), logical.ErrInvalidRequest
-	}
 
 	marshalingStr := d.Get("marshaling_algorithm").(string)
 	marshaling, ok := keysutil.MarshalingTypeMap[marshalingStr]
@@ -374,8 +377,17 @@ func (b *backend) pathSignWrite(ctx context.Context, req *logical.Request, d *fr
 		return logical.ErrorResponse("key type %v does not support signing", p.Type), logical.ErrInvalidRequest
 	}
 
-	if hashAlgorithm == keysutil.HashTypeNone && (!prehashed || sigAlgorithm != "pkcs1v15") {
+	hashAlgorithm, err := getHashAlgorithm(d, p.Type)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+	}
+
+	if hashAlgorithm == keysutil.HashTypeNone && (!prehashed || sigAlgorithm != "pkcs1v15") && p.Type.HashSignatureInput() {
 		return logical.ErrorResponse("hash_algorithm=none requires both prehashed=true and signature_algorithm=pkcs1v15"), logical.ErrInvalidRequest
+	}
+
+	if hashAlgorithm == keysutil.HashTypeMLDSAMu && (!prehashed || !p.Type.MLDSAExternalMuSupported()) {
+		return logical.ErrorResponse("hash_algorithm=mldsa-mu requires prehashed=true and a ML-DSA compatible key"), logical.ErrInvalidRequest
 	}
 
 	batchInputRaw := d.Raw["batch_input"]
@@ -416,11 +428,13 @@ func (b *backend) pathSignWrite(ctx context.Context, req *logical.Request, d *fr
 			continue
 		}
 
+		prehashed := prehashed
 		if p.Type.HashSignatureInput() && !prehashed {
 			hf := keysutil.HashFuncMap[hashAlgorithm]()
 			if hf != nil {
 				hf.Write(input)
 				input = hf.Sum(nil)
+				prehashed = true
 			}
 		}
 
@@ -437,6 +451,7 @@ func (b *backend) pathSignWrite(ctx context.Context, req *logical.Request, d *fr
 
 		sig, err := p.SignWithOptions(ver, context, input, &keysutil.SigningOptions{
 			HashAlgorithm:      hashAlgorithm,
+			Prehashed:          prehashed,
 			Marshaling:         marshaling,
 			SaltLength:         saltLength,
 			SigAlgorithm:       sigAlgorithm,
@@ -562,21 +577,6 @@ func (b *backend) pathVerifyWrite(ctx context.Context, req *logical.Request, d *
 	}
 
 	name := d.Get("name").(string)
-	hashAlgorithmStr := d.Get("urlalgorithm").(string)
-	if hashAlgorithmStr == "" {
-		hashAlgorithmStr = d.Get("hash_algorithm").(string)
-		if hashAlgorithmStr == "" {
-			hashAlgorithmStr = d.Get("algorithm").(string)
-			if hashAlgorithmStr == "" {
-				hashAlgorithmStr = defaultHashAlgorithm
-			}
-		}
-	}
-
-	hashAlgorithm, ok := keysutil.HashTypeMap[hashAlgorithmStr]
-	if !ok {
-		return logical.ErrorResponse("invalid hash algorithm %q", hashAlgorithmStr), logical.ErrInvalidRequest
-	}
 
 	marshalingStr := d.Get("marshaling_algorithm").(string)
 	marshaling, ok := keysutil.MarshalingTypeMap[marshalingStr]
@@ -608,8 +608,17 @@ func (b *backend) pathVerifyWrite(ctx context.Context, req *logical.Request, d *
 		return logical.ErrorResponse("key type %v does not support verification", p.Type), logical.ErrInvalidRequest
 	}
 
-	if hashAlgorithm == keysutil.HashTypeNone && (!prehashed || sigAlgorithm != "pkcs1v15") {
+	hashAlgorithm, err := getHashAlgorithm(d, p.Type)
+	if err != nil {
+		return logical.ErrorResponse(err.Error()), logical.ErrInvalidRequest
+	}
+
+	if hashAlgorithm == keysutil.HashTypeNone && (!prehashed || sigAlgorithm != "pkcs1v15") && p.Type.HashSignatureInput() {
 		return logical.ErrorResponse("hash_algorithm=none requires both prehashed=true and signature_algorithm=pkcs1v15"), logical.ErrInvalidRequest
+	}
+
+	if hashAlgorithm == keysutil.HashTypeMLDSAMu {
+		return logical.ErrorResponse("hash_algorithm=mldsa-mu does not support verification"), logical.ErrInvalidRequest
 	}
 
 	response := make([]batchResponseVerifyItem, len(batchInputItems))
@@ -637,11 +646,13 @@ func (b *backend) pathVerifyWrite(ctx context.Context, req *logical.Request, d *
 			continue
 		}
 
+		prehashed := prehashed
 		if p.Type.HashSignatureInput() && !prehashed {
 			hf := keysutil.HashFuncMap[hashAlgorithm]()
 			if hf != nil {
 				hf.Write(input)
 				input = hf.Sum(nil)
+				prehashed = true
 			}
 		}
 
@@ -658,6 +669,7 @@ func (b *backend) pathVerifyWrite(ctx context.Context, req *logical.Request, d *
 
 		signingOptions := &keysutil.SigningOptions{
 			HashAlgorithm:      hashAlgorithm,
+			Prehashed:          prehashed,
 			Marshaling:         marshaling,
 			SaltLength:         saltLength,
 			SigAlgorithm:       sigAlgorithm,

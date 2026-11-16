@@ -448,9 +448,6 @@ type Core struct {
 	clusterListenerAddrs []*net.TCPAddr
 	// The handler to use for request forwarding
 	clusterHandler http.Handler
-	// Write lock used to ensure that we don't have multiple connections adjust
-	// this value at the same time
-	requestForwardingConnectionLock sync.RWMutex
 	// Lock for the leader values, ensuring we don't run the parts of Leader()
 	// that change things concurrently
 	leaderParamsLock sync.RWMutex
@@ -458,16 +455,17 @@ type Core struct {
 	clusterLeaderParams atomic.Pointer[ClusterLeaderParams]
 	// Info on cluster members
 	clusterPeerClusterAddrsCache *zcache.Cache[string, forwarding.NodeHAConnectionInfo]
-	// The context for the client
-	rpcClientConnContext context.Context
-	// The function for canceling the client connection
-	rpcClientConnCancelFunc context.CancelFunc
-	// The grpc ClientConn for RPC calls
-	rpcClientConn *grpc.ClientConn
-	// The grpc forwarding client
-	rpcForwardingClient *forwarding.Client
 	// The UUID used to hold the leader lock. Only set on active node
 	leaderUUID string
+	// When the first time a GRPC invalidation node discovered it did not have
+	// any active leader.
+	firstMissingLeader time.Time
+
+	// Request forwarding information
+	// The context for the client
+	rpcClientConnContext atomic.Pointer[atomicContext]
+	// The grpc forwarding client
+	rpcForwardingClient atomic.Pointer[forwarding.Client]
 
 	// CORS Information
 	corsConfig *CORSConfig
@@ -654,7 +652,7 @@ type Core struct {
 func (c *Core) HAState() consts.HAState {
 	switch {
 	case c.standby.Load():
-		if c.StandbyReadsEnabled() {
+		if !c.activeContext.Load().IsNil() {
 			return consts.PerfStandby
 		}
 
@@ -1061,28 +1059,10 @@ func CreateCore(conf *CoreConfig) (*Core, error) {
 	c.NewInvalidationPeers()
 
 	if replicated, ok := c.underlyingPhysical.(physical.ReplicationIndexBackend); ok {
-		c.indexManager = NewIndexManager(replicated, 0)
+		c.indexManager = NewIndexManager(replicated, c.invalidations, 0)
 	}
 
 	return c, nil
-}
-
-func shouldUseGRPCInvalidation(phys physical.Backend) bool {
-	if _, ok := phys.(physical.CacheInvalidationBackend); ok {
-		return false
-	}
-
-	_, ok := phys.(physical.ReplicationIndexBackend)
-	return ok
-}
-
-func (c *Core) shouldHookInvalidate(phys physical.Backend) bool {
-	if !c.StandbyReadsEnabled() {
-		return false
-	}
-
-	_, ok := phys.(physical.CacheInvalidationBackend)
-	return ok
 }
 
 func coreInit(c *Core, conf *CoreConfig) error {
@@ -1971,7 +1951,7 @@ func (c *Core) sealInitCommon(ctx context.Context, req *logical.Request) (retErr
 	// validation and the operation should be performed. But for now, just
 	// returning with an error and recommending a vault restart, which
 	// essentially does the same thing.
-	if c.standby.Load() && !c.StandbyReadsEnabled() {
+	if c.standby.Load() && c.activeContext.Load().IsNil() {
 		c.logger.Error("vault cannot seal when in standby mode; please restart instead")
 		return errors.New("vault cannot seal when in standby mode; please restart instead")
 	}
@@ -2101,9 +2081,7 @@ func (c *Core) sealInternalWithOptions(grabStateLock bool) error {
 	c.logger.Info("marked as sealed")
 
 	// Clear forwarding clients
-	c.requestForwardingConnectionLock.Lock()
 	c.clearForwardingClients()
-	c.requestForwardingConnectionLock.Unlock()
 
 	activeCtxCancel := c.activeContext.Load().Canceler()
 	cancelCtxAndLock := func() {
@@ -2217,9 +2195,7 @@ func (s standardUnsealStrategy) unseal(ctx context.Context, logger log.Logger, c
 	c.logger.Debug("standard unseal starting")
 
 	// Clear forwarding clients; we're active
-	c.requestForwardingConnectionLock.Lock()
 	c.clearForwardingClients()
-	c.requestForwardingConnectionLock.Unlock()
 
 	if shouldUseGRPCInvalidation(c.underlyingPhysical) {
 		c.SetupInvalidationPeers()
@@ -2268,8 +2244,6 @@ func (s standardUnsealStrategy) unseal(ctx context.Context, logger log.Logger, c
 type readonlyUnsealStrategy struct{}
 
 func (s readonlyUnsealStrategy) unseal(ctx context.Context, logger log.Logger, c *Core) error {
-	c.logger.Debug("read-only unseal starting")
-
 	// Start tracking invalidations.
 	c.invalidations.Track()
 
@@ -2308,7 +2282,7 @@ func (readonlyUnsealStrategy) unsealShared(ctx context.Context, c *Core, standby
 	if err := c.setupMounts(ctx); err != nil {
 		return err
 	}
-	if err := c.setupPolicyStore(ctx); err != nil {
+	if err := c.setupPolicyStore(ctx, standby); err != nil {
 		return err
 	}
 	if err := c.loadCORSConfig(ctx); err != nil {
@@ -3063,6 +3037,11 @@ func (c *Core) setupQuotas(ctx context.Context) error {
 	return c.quotaManager.Setup(ctx, c.systemBarrierView)
 }
 
+// RateLimitPathExempt reports whether the path is exempt from rate limit quotas.
+func (c *Core) RateLimitPathExempt(path string) bool {
+	return c.quotaManager == nil || c.quotaManager.RateLimitPathExempt(path)
+}
+
 // ApplyRateLimitQuota checks the request against all the applicable quota rules.
 // If the given request's path is exempt, no rate limiting will be applied.
 func (c *Core) ApplyRateLimitQuota(ctx context.Context, req *quotas.Request) (quotas.Response, error) {
@@ -3593,48 +3572,23 @@ func (c *Core) LoadNodeID() (string, error) {
 	return hostname, nil
 }
 
-// DetermineRoleFromLoginRequest will determine the role that should be applied to a quota for a given
-// login request
-func (c *Core) DetermineRoleFromLoginRequest(ctx context.Context, mountPoint string, data map[string]any) string {
+// DetermineRoleFromLoginRequest will determine the role that should be applied
+// to a quota for a given login request.
+func (c *Core) DetermineRoleFromLoginRequest(ctx context.Context, mountPoint string, data map[string]any, conn *logical.Connection) string {
 	c.authLock.RLock()
 	defer c.authLock.RUnlock()
 	matchingBackend := c.router.MatchingBackend(ctx, mountPoint)
 	if matchingBackend == nil || matchingBackend.Type() != logical.TypeCredential {
-		// Role based quotas do not apply to this request
-		return ""
-	}
-	return c.doResolveRoleLocked(ctx, mountPoint, matchingBackend, data)
-}
-
-// DetermineRoleFromLoginRequestFromReader will determine the role that should
-// be applied to a quota for a given login request. The reader will only be
-// consumed if the matching backend for the mount point exists and is a secret
-// backend
-func (c *Core) DetermineRoleFromLoginRequestFromReader(ctx context.Context, mountPoint string, reader io.Reader) string {
-	c.authLock.RLock()
-	defer c.authLock.RUnlock()
-	matchingBackend := c.router.MatchingBackend(ctx, mountPoint)
-	if matchingBackend == nil || matchingBackend.Type() != logical.TypeCredential {
-		// Role based quotas do not apply to this request
+		// Role based quotas do not apply to this request.
 		return ""
 	}
 
-	data := make(map[string]any)
-	err := jsonutil.DecodeJSONFromReader(reader, &data)
-	if err != nil {
-		return ""
-	}
-	return c.doResolveRoleLocked(ctx, mountPoint, matchingBackend, data)
-}
-
-// doResolveRoleLocked does a login and resolve role request on the matching
-// backend. Callers should have a read lock on c.authLock
-func (c *Core) doResolveRoleLocked(ctx context.Context, mountPoint string, matchingBackend logical.Backend, data map[string]any) string {
 	resp, err := matchingBackend.HandleRequest(ctx, &logical.Request{
 		MountPoint: mountPoint,
 		Path:       "login",
 		Operation:  logical.ResolveRoleOperation,
 		Data:       data,
+		Connection: conn,
 		Storage:    c.router.MatchingStorageByAPIPath(ctx, mountPoint+"login"),
 	})
 	if err != nil || resp == nil || resp.Data == nil || resp.Data["role"] == nil {
@@ -3850,9 +3804,7 @@ func (c *Core) startForwarding(ctx context.Context) error {
 	defer c.logger.Debug("leaving request forwarding setup function")
 
 	// Clean up in case we have transitioned from a client to a server
-	c.requestForwardingConnectionLock.Lock()
 	c.clearForwardingClients()
-	c.requestForwardingConnectionLock.Unlock()
 
 	clusterListener := c.getClusterListener()
 	if c.ha == nil || clusterListener == nil {
@@ -3892,9 +3844,6 @@ func (c *Core) refreshRequestForwardingConnection(ctx context.Context, clusterAd
 	c.logger.Debug("refreshing forwarding connection", "clusterAddr", clusterAddr)
 	defer c.logger.Debug("done refreshing forwarding connection", "clusterAddr", clusterAddr)
 
-	c.requestForwardingConnectionLock.Lock()
-	defer c.requestForwardingConnectionLock.Unlock()
-
 	// Clean things up first
 	c.clearForwardingClients()
 
@@ -3928,7 +3877,8 @@ func (c *Core) refreshRequestForwardingConnection(ctx context.Context, clusterAd
 	// ALPN header right. It's just "insecure" because GRPC isn't managing
 	// the TLS state.
 	dctx, cancelFunc := context.WithCancel(ctx)
-	c.rpcClientConn, err = grpc.NewClient(fmt.Sprintf("passthrough:///%s", clusterURL.Host),
+	rpcClientConn, err := grpc.NewClient(
+		fmt.Sprintf("passthrough:///%s", clusterURL.Host),
 		grpc.WithContextDialer(clusterListener.GetContextDialerFunc(ctx, consts.RequestForwardingALPN)),
 		grpc.WithTransportCredentials(
 			insecure.NewCredentials(), // it's not, we handle it in the dialer
@@ -3939,22 +3889,28 @@ func (c *Core) refreshRequestForwardingConnection(ctx context.Context, clusterAd
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(math.MaxInt32),
 			grpc.MaxCallSendMsgSize(math.MaxInt32),
-		))
+		),
+		grpc.WithUnaryInterceptor(forwarding.LegacyPackageFallback),
+	)
 	if err != nil {
 		cancelFunc()
 		c.logger.Error("err setting up forwarding rpc client", "error", err)
 		return err
 	}
-	c.rpcClientConnContext = dctx
-	c.rpcClientConnCancelFunc = cancelFunc
-	c.rpcForwardingClient = forwarding.NewClient(
+
+	client := forwarding.NewClient(
 		c,
-		forwarding.NewRequestForwardingClient(c.rpcClientConn),
+		rpcClientConn,
 		dctx,
 		time.NewTicker(c.clusterHeartbeatInterval),
 		time.NewTicker(c.clusterNamespaceSyncInterval),
 	)
-	c.rpcForwardingClient.Start()
+	client.Start()
+
+	oldCtx := c.rpcClientConnContext.Swap(NewAtomicContext(dctx, cancelFunc))
+	oldCtx.Cancel()
+
+	c.rpcForwardingClient.Store(client)
 
 	if _, ok := c.underlyingPhysical.(physical.CacheInvalidationBackend); !ok {
 		c.logger.Info("restarting standby as active node has changed; may enable grpc invalidation")
@@ -3968,21 +3924,14 @@ func (c *Core) clearForwardingClients() {
 	c.logger.Debug("clearing forwarding clients")
 	defer c.logger.Debug("done clearing forwarding clients")
 
-	c.rpcForwardingClient.StopInvalidations()
+	c.rpcClientConnContext.Load().Cancel()
 
-	if c.rpcClientConnCancelFunc != nil {
-		c.rpcClientConnCancelFunc()
-		c.rpcClientConnCancelFunc = nil
-	}
-	if c.rpcClientConn != nil {
-		if err := c.rpcClientConn.Close(); err != nil {
+	client := c.rpcForwardingClient.Swap(nil)
+	if client != nil {
+		if err := client.Stop(); err != nil {
 			c.logger.Warn("error closing rpc client connection", "error", err)
 		}
-		c.rpcClientConn = nil
 	}
-
-	c.rpcClientConnContext = nil
-	c.rpcForwardingClient = nil
 
 	clusterListener := c.getClusterListener()
 	if clusterListener != nil {
@@ -3994,10 +3943,8 @@ func (c *Core) clearForwardingClients() {
 // ForwardRequest forwards a given request to the active node and returns the
 // response.
 func (c *Core) ForwardRequest(req *http.Request) (int, http.Header, []byte, error) {
-	c.requestForwardingConnectionLock.RLock()
-	defer c.requestForwardingConnectionLock.RUnlock()
-
-	if c.rpcForwardingClient == nil {
+	client := c.rpcForwardingClient.Load()
+	if client == nil {
 		return 0, nil, nil, ErrCannotForward
 	}
 
@@ -4023,7 +3970,8 @@ func (c *Core) ForwardRequest(req *http.Request) (int, http.Header, []byte, erro
 		c.logger.Error("got nil forwarding RPC request")
 		return 0, nil, nil, errors.New("got nil forwarding RPC request")
 	}
-	resp, err := c.rpcForwardingClient.ForwardRequest(req.Context(), freq)
+
+	resp, err := client.ForwardRequest(req.Context(), freq)
 	if err != nil {
 		metrics.IncrCounter([]string{"ha", "rpc", "client", "forward", "errors"}, 1)
 		c.logger.Error("error during forwarded RPC request", "error", err)
@@ -4096,7 +4044,7 @@ func (c *Core) performPolicyChecks(ctx context.Context, acl *policy.ACL, te *log
 
 // setupPolicyStore is used to initialize the policy store
 // when the vault is being unsealed.
-func (c *Core) setupPolicyStore(ctx context.Context) error {
+func (c *Core) setupPolicyStore(ctx context.Context, standby bool) error {
 	// Create the policy store
 	var err error
 	sysView := &dynamicSystemView{core: c}
@@ -4107,7 +4055,12 @@ func (c *Core) setupPolicyStore(ctx context.Context) error {
 		return err
 	}
 
-	// Ensure that the default policy exists, and if not, create it
+	if standby {
+		return nil
+	}
+
+	// Ensure that the default policy exists, and if not, create it. Do not do
+	// this on standby nodes as it writes to storage.
 	return c.policyStore.LoadDefaultPolicies(ctx)
 }
 

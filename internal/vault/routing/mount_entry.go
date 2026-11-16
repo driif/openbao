@@ -11,6 +11,7 @@ import (
 	"github.com/mitchellh/copystructure"
 	"github.com/openbao/openbao/sdk/v2/helper/consts"
 	"github.com/openbao/openbao/v2/internal/helper/namespace"
+	"github.com/openbao/openbao/v2/internal/helper/versions"
 )
 
 // MountEntry is used to represent a mount table entry
@@ -40,9 +41,15 @@ type MountEntry struct {
 	SynthesizedConfigCache sync.Map `json:"-"`
 
 	// version info
-	Version        string `json:"plugin_version,omitempty"`         // The semantic version of the mounted plugin, e.g. v1.2.3.
-	RunningVersion string `json:"running_plugin_version,omitempty"` // The semantic version of the mounted plugin as reported by the plugin.
-	RunningSha256  string `json:"running_sha256,omitempty"`
+	Version        string `json:"plugin_version,omitempty"` // The semantic version of the mounted plugin, e.g. v1.2.3.
+	RunningVersion string `json:"-"`                        // The semantic version of the mounted plugin as reported by the plugin.
+	RunningSha256  string `json:"-"`
+
+	// Reload is a monotonically increasing counter that serves no purpose
+	// beyond notifying standbys to reload the mount. Specifically, a global
+	// mount reload may sometimes be desired even when no other field in this
+	// struct has changed, for example when using Version="latest".
+	Reload int `json:"reload,omitempty"`
 }
 
 type APIUserLockoutConfig struct {
@@ -61,10 +68,9 @@ func (e *MountEntry) Clone() (*MountEntry, error) {
 	return cp.(*MountEntry), nil
 }
 
-// IsExternalPlugin returns whether the plugin is running externally
-// if the RunningSha256 is non-empty, the builtin is external. Otherwise, it's builtin
+// IsExternalPlugin returns whether the plugin is an external one.
 func (e *MountEntry) IsExternalPlugin() bool {
-	return e.RunningSha256 != ""
+	return !versions.IsBuiltinVersion(e.RunningVersion)
 }
 
 // MountClass returns the mount class based on Accessor and Path

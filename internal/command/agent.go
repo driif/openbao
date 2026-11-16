@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	systemd "github.com/coreos/go-systemd/v22/daemon"
 	"github.com/hashicorp/cli"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-multierror"
@@ -49,6 +48,7 @@ import (
 	"github.com/openbao/openbao/v2/internal/helper/listenerutil"
 	"github.com/openbao/openbao/v2/internal/helper/logging"
 	"github.com/openbao/openbao/v2/internal/helper/metricsutil"
+	"github.com/openbao/openbao/v2/internal/helper/systemd"
 	"github.com/openbao/openbao/v2/internal/helper/useragent"
 	"github.com/openbao/openbao/v2/internal/version"
 )
@@ -541,12 +541,6 @@ func (c *AgentCommand) Run(args []string) int {
 			muxHandler = cache.ProxyHandler(ctx, apiProxyLogger, apiProxy, inmemSink, proxyVaultToken)
 		}
 
-		// Parse 'require_request_header' listener config option, and wrap
-		// the request handler if necessary
-		if lnConfig.RequireRequestHeader && (lnConfig.Role != "metrics_only") {
-			muxHandler = verifyRequestHeader(muxHandler)
-		}
-
 		// Create a muxer and add paths relevant for the lease cache layer
 		mux := http.NewServeMux()
 		quitEnabled := lnConfig.AgentAPI != nil && lnConfig.AgentAPI.EnableQuit
@@ -556,6 +550,13 @@ func (c *AgentCommand) Run(args []string) int {
 			mux.Handle(consts.AgentPathCacheClear, leaseCache.HandleCacheClear(ctx))
 			mux.Handle(consts.AgentPathQuit, c.handleQuit(quitEnabled))
 			mux.Handle("/", muxHandler)
+		}
+
+		// Parse 'require_request_header' listener config option, and wrap the
+		// whole muxer if necessary so that every registered path is covered
+		var mainHandler http.Handler = mux
+		if lnConfig.RequireRequestHeader && (lnConfig.Role != "metrics_only") {
+			mainHandler = verifyRequestHeader(mainHandler)
 		}
 
 		scheme := "https://"
@@ -573,7 +574,7 @@ func (c *AgentCommand) Run(args []string) int {
 		server := &http.Server{
 			Addr:              ln.Addr().String(),
 			TLSConfig:         tlsCfg,
-			Handler:           mux,
+			Handler:           mainHandler,
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       30 * time.Second,
 			IdleTimeout:       5 * time.Minute,
@@ -790,7 +791,7 @@ func (c *AgentCommand) Run(args []string) int {
 	}
 
 	// Notify systemd that the server is ready (if applicable)
-	c.notifySystemd(systemd.SdNotifyReady)
+	c.notifySystemd(systemd.Ready)
 
 	defer func() {
 		if err := c.removePidFile(config.PidFile); err != nil {
@@ -813,7 +814,7 @@ func (c *AgentCommand) Run(args []string) int {
 		}
 	}
 
-	c.notifySystemd(systemd.SdNotifyStopping)
+	c.notifySystemd(systemd.Stopping)
 
 	return exitCode
 }
@@ -902,7 +903,7 @@ func verifyRequestHeader(handler http.Handler) http.Handler {
 }
 
 func (c *AgentCommand) notifySystemd(status string) {
-	sent, err := systemd.SdNotify(false, status)
+	sent, err := systemd.Notify(status)
 	if err != nil {
 		c.logger.Error("error notifying systemd", "error", err)
 	} else {
@@ -1135,8 +1136,8 @@ func (c *AgentCommand) loadConfig(paths []string) (*agentConfig.Config, error) {
 // * TLS config for the upstream vault connection (ca_cert, ca_path, client_cert, client_key)
 func (c *AgentCommand) reloadConfig(paths []string) error {
 	// Notify systemd that the server is reloading
-	c.notifySystemd(systemd.SdNotifyReloading)
-	defer c.notifySystemd(systemd.SdNotifyReady)
+	c.notifySystemd(systemd.Reloading)
+	defer c.notifySystemd(systemd.Ready)
 
 	var errors error
 

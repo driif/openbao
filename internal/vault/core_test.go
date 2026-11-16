@@ -5,6 +5,8 @@ package vault
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"reflect"
 	"strings"
@@ -40,12 +42,12 @@ import (
 	"github.com/openbao/openbao/sdk/v2/helper/logging"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
-	"github.com/openbao/openbao/sdk/v2/physical/inmem"
 	"github.com/openbao/openbao/v2/internal/audit"
 	"github.com/openbao/openbao/v2/internal/helper/configutil"
 	"github.com/openbao/openbao/v2/internal/helper/identity/mfa"
 	"github.com/openbao/openbao/v2/internal/helper/namespace"
 	"github.com/openbao/openbao/v2/internal/helper/testhelpers/corehelpers"
+	"github.com/openbao/openbao/v2/internal/physical/inmem"
 	"github.com/openbao/openbao/v2/internal/version"
 )
 
@@ -703,6 +705,67 @@ func TestCore_LoadLoginMFAConfigs(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, mfaEnforcementConfigKeys, 1)
 	require.Equal(t, "eConfigID", mfaEnforcementConfigKeys[0])
+}
+
+// TestCore_DeleteLoginMFAEnforcementConfig verifies that deleting a login MFA
+// enforcement config also removes it from barrier storage so it does not
+// load again after unseal.
+func TestCore_DeleteLoginMFAEnforcementConfig(t *testing.T) {
+	c, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+	ns1 := &namespace.Namespace{Path: "ns1/"}
+	TestCoreCreateNamespaces(t, c, ns1)
+
+	eConfig := &mfa.MFAEnforcementConfig{Name: "eConfig", NamespaceID: ns1.ID, ID: "eConfigID"}
+	err := c.loginMFABackend.PutMFALoginEnforcementConfig(ctx, eConfig, ns1)
+	require.NoError(t, err)
+	require.NoError(t, c.loadLoginMFAConfigs(ctx))
+
+	require.NoError(t, c.loginMFABackend.DeleteMFALoginEnforcementConfigByNameAndNamespace(ctx, eConfig.Name, ns1))
+
+	loaded, err := c.loginMFABackend.MemDBMFALoginEnforcementConfigByNameAndNamespace(eConfig.Name, ns1.ID)
+	require.NoError(t, err)
+	require.Nil(t, loaded)
+
+	// The config must be gone from barrier storage as well.
+	nsView := c.NamespaceView(ns1)
+	mfaEnforcementConfigs, err := nsView.SubView(barrier.SystemBarrierPrefix).SubView(mfaLoginEnforcementPrefix).List(ctx, "")
+	require.NoError(t, err)
+	require.Empty(t, mfaEnforcementConfigs)
+
+	// Try to load back the configs from storage.
+	require.NoError(t, c.loadLoginMFAConfigs(ctx))
+	loaded, err = c.loginMFABackend.MemDBMFALoginEnforcementConfigByNameAndNamespace(eConfig.Name, ns1.ID)
+	require.NoError(t, err)
+	require.Nil(t, loaded)
+}
+
+// TestCore_DeleteMFAConfigInvalidate verifies that when a login MFA method
+// config is deleted from barrier storage elsewhere (e.g. on the active node
+// in an HA cluster), the memdb entry is dropped as well so it does not stay
+// in memdb on standby nodes.
+func TestCore_DeleteMFAConfigInvalidate(t *testing.T) {
+	c, _, _ := TestCoreUnsealed(t)
+	ctx := namespace.RootContext(t.Context())
+	ns1 := &namespace.Namespace{Path: "ns1/"}
+	TestCoreCreateNamespaces(t, c, ns1)
+	nsCtx := namespace.ContextWithNamespace(ctx, ns1)
+
+	mConfig := &mfa.Config{Name: "mConfig", NamespaceID: ns1.ID, ID: "mConfigID", Type: ident.MfaMethodTypeTOTP}
+	require.NoError(t, c.loginMFABackend.PutMFAConfigByID(nsCtx, mConfig))
+	require.NoError(t, c.loadLoginMFAConfigs(ctx))
+
+	nsView := c.NamespaceView(ns1)
+	mfaConfigBarrierView := nsView.SubView(barrier.SystemBarrierPrefix).SubView(loginMFAConfigPrefix)
+
+	// Simulate storage entry removal.
+	require.NoError(t, mfaConfigBarrierView.Delete(ctx, mConfig.ID))
+
+	// Verify deletion of the memdb entry through invalidate invocation.
+	require.NoError(t, c.loginMFABackend.invalidate(ctx, ns1, barrier.SystemBarrierPrefix+loginMFAConfigPrefix+mConfig.ID))
+	loaded, err := c.loginMFABackend.MemDBMFAConfigByID(mConfig.ID)
+	require.NoError(t, err)
+	require.Nil(t, loaded)
 }
 
 // TestCore_RunLockedUserUpdatesForStaleEntry tests that
@@ -1434,6 +1497,55 @@ func TestCore_HandleLogin_Token(t *testing.T) {
 	// Check that we have a lease with default duration
 	if lresp.Auth.TTL != noop.System().DefaultLeaseTTL() {
 		t.Fatalf("bad: %#v, defaultLeaseTTL: %#v", lresp.Auth, c.defaultLeaseTTL)
+	}
+}
+
+func TestCore_DetermineRoleFromLoginRequest(t *testing.T) {
+	const testRole = "test-role"
+	mock := &be.Noop{
+		BackendType: logical.TypeCredential,
+		RequestHandler: func(_ context.Context, req *logical.Request) (*logical.Response, error) {
+			if req.Operation == logical.ResolveRoleOperation {
+				certs, _ := req.Connection.GetPreferredCerts()
+				role := ""
+				if len(certs) > 0 {
+					role = testRole
+				}
+				return &logical.Response{Data: map[string]any{"role": role}}, nil
+			}
+			return nil, nil
+		},
+	}
+
+	c, _, root := TestCoreUnsealed(t)
+	c.credentialBackends["noop"] = func(_ context.Context, _ *logical.BackendConfig) (logical.Backend, error) {
+		return mock, nil
+	}
+
+	// Enable the credential backend.
+	req := logical.TestRequest(t, logical.UpdateOperation, "sys/auth/foo")
+	req.Data["type"] = "noop"
+	req.ClientToken = root
+	_, err := c.HandleRequest(namespace.RootContext(t.Context()), req)
+	require.NoError(t, err)
+
+	tt := map[string]struct {
+		conn     *logical.Connection
+		wantRole string
+	}{
+		"nil connection":                  {nil, ""},
+		"empty connection":                {&logical.Connection{}, ""},
+		"peer cert connection":            {&logical.Connection{PeerCertificates: []*x509.Certificate{{}}}, testRole},
+		"peer cert connection from state": {&logical.Connection{ConnState: &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{}}}}, testRole},
+		"proxied cert connection":         {&logical.Connection{ProxiedCertificates: []*x509.Certificate{{}}}, testRole},
+	}
+
+	for name, tc := range tt {
+		t.Run(name, func(t *testing.T) {
+			role := c.DetermineRoleFromLoginRequest(namespace.RootContext(t.Context()), "auth/foo/", map[string]any{}, tc.conn)
+			require.Equal(t, tc.wantRole, role)
+			require.Same(t, tc.conn, mock.Requests[len(mock.Requests)-1].Connection)
+		})
 	}
 }
 

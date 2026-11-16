@@ -6,6 +6,7 @@ package configutil
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net/textproto"
 	"regexp"
 	"slices"
@@ -67,10 +68,14 @@ type Listener struct {
 	RequireRequestHeader     bool          `hcl:"-"`
 	RequireRequestHeaderRaw  any           `hcl:"require_request_header"`
 
-	TLSDisable    bool `hcl:"-"`
-	TLSDisableRaw any  `hcl:"tls_disable"`
-	TLSCertGetter any  `hcl:"-"`
+	ConsistencyFallbackBehavior     string        `hcl:"consistency_fallback_behavior"`
+	ConsistencyMissingHeaderForward bool          `hcl:"consistency_missing_header_forward"`
+	ConsistencyMaxIndexWait         time.Duration `hcl:"-"`
+	ConsistencyMaxIndexWaitRaw      any           `hcl:"consistency_max_index_wait"`
 
+	TLSDisable                       bool          `hcl:"-"`
+	TLSDisableRaw                    any           `hcl:"tls_disable"`
+	TLSCertGetter                    any           `hcl:"-"`
 	TLSCertFile                      string        `hcl:"tls_cert_file"`
 	TLSKeyFile                       string        `hcl:"tls_key_file"`
 	TLSMinVersion                    string        `hcl:"tls_min_version"`
@@ -101,6 +106,9 @@ type Listener struct {
 	TLSACMEDisableHttpChallengeRaw any      `hcl:"tls_acme_disable_http_challenge"`
 	TLSACMEDisableAlpnChallenge    bool     `hcl:"-"`
 	TLSACMEDisableAlpnChallengeRaw any      `hcl:"tls_acme_disable_alpn_challenge"`
+	TLSACMEHttpChallengePort       int      `hcl:"tls_acme_http_challenge_port"`
+	TLSACMEAlpnChallengePort       int      `hcl:"tls_acme_alpn_challenge_port"`
+	TLSACMEChallengeHost           string   `hcl:"tls_acme_challenge_host"`
 
 	HTTPReadTimeout          time.Duration `hcl:"-"`
 	HTTPReadTimeoutRaw       any           `hcl:"http_read_timeout"`
@@ -200,6 +208,25 @@ func (l *Listener) Validate(path string) []ConfigError {
 	return append(results, ValidateUnusedFields(l.Profiling.UnusedKeys, path)...)
 }
 
+func (l *Listener) Sanitized() map[string]any {
+	if l == nil {
+		return nil
+	}
+
+	var cleanCfg map[string]any
+	if l.RawConfig != nil {
+		cleanCfg = make(map[string]any, len(l.RawConfig))
+		maps.Copy(cleanCfg, l.RawConfig)
+		delete(cleanCfg, "tls_acme_eab_mac_key")
+	}
+
+	sanitizedListener := map[string]any{
+		"type":   l.Type,
+		"config": cleanCfg,
+	}
+	return sanitizedListener
+}
+
 func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 	var err error
 	result.Listeners = make([]*Listener, 0, len(list.Items))
@@ -217,6 +244,11 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 			return multierror.Prefix(err, fmt.Sprintf("listeners.%d:", i))
 		} else {
 			l.ClusterAddress = rendered
+		}
+		if rendered, err := ParseSingleIPTemplate(l.TLSACMEChallengeHost); err != nil {
+			return multierror.Prefix(err, fmt.Sprintf("listeners.%d:", i))
+		} else {
+			l.TLSACMEChallengeHost = rendered
 		}
 
 		// Hacky way, for now, to get the values we want for sanitizing
@@ -307,6 +339,18 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 
 				l.MaxRequestJsonStringsRaw = nil
 			}
+
+			if l.ConsistencyMaxIndexWaitRaw != nil {
+				if l.ConsistencyMaxIndexWait, err = parseutil.ParseDurationSecond(l.ConsistencyMaxIndexWaitRaw); err != nil {
+					return multierror.Prefix(fmt.Errorf("error parsing consistency_max_index_wait: %w", err), fmt.Sprintf("listeners.%d", i))
+				}
+				if l.ConsistencyMaxIndexWait < 0 {
+					return multierror.Prefix(errors.New("consistency_max_index_wait cannot be negative"), fmt.Sprintf("listeners.%d", i))
+				}
+
+				l.ConsistencyMaxIndexWaitRaw = nil
+			}
+
 		}
 
 		// TLS Parameters
@@ -622,7 +666,7 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 		// in sync with the http handler implementation.
 		for _, decoder := range l.XForwardedForClientCertDecoders {
 			switch decoder {
-			case "RFC9440", "URL", "PEM":
+			case "RFC9440", "URL", "PEM", "Envoy":
 			default:
 				return multierror.Prefix(fmt.Errorf("invalid value for x_forwarded_for_client_cert_decoders: %v", decoder), fmt.Sprintf("listeners.%d", i))
 			}

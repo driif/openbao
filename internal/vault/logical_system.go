@@ -439,6 +439,19 @@ func sortVersionedPlugins(versionedPlugins []pluginutil.VersionedPlugin) {
 	})
 }
 
+func handleRootNamespaceOnly(f framework.OperationFunc) framework.OperationFunc {
+	return func(ctx context.Context, r *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		ns, err := namespace.FromContext(ctx)
+		switch {
+		case err != nil:
+			return handleError(err)
+		case ns.ID != namespace.RootNamespaceID:
+			return nil, logical.ErrUnsupportedPath
+		}
+		return f(ctx, r, d)
+	}
+}
+
 func (b *SystemBackend) handlePluginCatalogUpdate(ctx context.Context, _ *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	pluginName := d.Get("name").(string)
 	if pluginName == "" {
@@ -500,6 +513,10 @@ func (b *SystemBackend) handlePluginCatalogUpdate(ctx context.Context, _ *logica
 	sha256Bytes, err := hex.DecodeString(sha256)
 	if err != nil {
 		return logical.ErrorResponse("Could not decode SHA-256 value from Hex"), err
+	}
+
+	if len(sha256Bytes) != 32 {
+		return logical.ErrorResponse("Decoded SHA-256 value is not 32 bytes"), nil
 	}
 
 	err = b.Core.pluginCatalog.Set(ctx, pluginName, pluginType, pluginVersion, parts[0], args, env, sha256Bytes, oci)
@@ -630,6 +647,7 @@ func getVersion(d *framework.FieldData) (version string, builtin bool, err error
 }
 
 func (b *SystemBackend) handlePluginReloadUpdate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	scope := d.Get("scope").(string)
 	pluginName := d.Get("plugin").(string)
 	pluginMounts := d.Get("mounts").([]string)
 
@@ -640,13 +658,29 @@ func (b *SystemBackend) handlePluginReloadUpdate(ctx context.Context, req *logic
 		return logical.ErrorResponse("plugin or mounts must be provided"), nil
 	}
 
+	var global bool
+	switch scope {
+	case "":
+	case "global":
+		global = true
+	default:
+		return logical.ErrorResponse(`scope must be unset or "global"`), nil
+	}
+
+	if global && b.Core.Standby() {
+		// Fast-path to forwarding here so we don't make it halfway through a
+		// reload and then attempt to write to storage to propagate to other
+		// nodes.
+		return nil, logical.ErrReadOnly
+	}
+
 	if pluginName != "" {
-		err := b.Core.reloadMatchingPlugin(ctx, pluginName)
+		err := b.Core.reloadMatchingPlugin(ctx, pluginName, global)
 		if err != nil {
 			return handleError(err)
 		}
 	} else if len(pluginMounts) > 0 {
-		err := b.Core.reloadMatchingPluginMounts(ctx, pluginMounts)
+		err := b.Core.reloadMatchingPluginMounts(ctx, pluginMounts, global)
 		if err != nil {
 			return handleError(err)
 		}
@@ -1729,11 +1763,13 @@ func (b *SystemBackend) handleTuneWriteCommon(ctx context.Context, path string, 
 
 	if rawVal, ok := data.GetOk("plugin_version"); ok {
 		version := rawVal.(string)
-		semanticVersion, err := semver.NewVersion(version)
-		if err != nil {
-			return logical.ErrorResponse("version %q is not a valid semantic version: %s", version, err), nil
+		if version != versionLatest {
+			semanticVersion, err := semver.NewVersion(version)
+			if err != nil {
+				return logical.ErrorResponse("version %q is not a valid semantic version: %s", version, err), nil
+			}
+			version = "v" + semanticVersion.String()
 		}
-		version = "v" + semanticVersion.String()
 
 		pluginType := consts.PluginTypeSecrets
 		if isAuth {
@@ -1741,7 +1777,7 @@ func (b *SystemBackend) handleTuneWriteCommon(ctx context.Context, path string, 
 		}
 
 		// Lookup the version to ensure it exists in the catalog before committing.
-		if _, err = b.System().LookupPluginVersion(ctx, mountEntry.Type, pluginType, version); err != nil {
+		if _, err := b.System().LookupPluginVersion(ctx, mountEntry.Type, pluginType, version); err != nil {
 			return handleError(err)
 		}
 
@@ -1879,7 +1915,7 @@ func (b *SystemBackend) handleTuneWriteCommon(ctx context.Context, path string, 
 	if kvUpgrade {
 		resp := &logical.Response{}
 		resp.AddWarning(fmt.Sprintf("Upgrading mount from version %d to version %d. This mount will be unavailable for a brief period and will resume service shortly.", meVersion, optVersion))
-		if err := b.Core.reloadBackendCommon(ctx, mountEntry, isAuth); err != nil {
+		if err := b.Core.reloadBackendCommon(ctx, mountEntry, isAuth, false); err != nil {
 			b.Core.logger.Error("mount tuning of options: could not reload backend", "error", err, "path", path, "options", mountEntry.Options)
 			return handleError(err)
 		}
@@ -2362,6 +2398,11 @@ func (b *SystemBackend) validateVersion(ctx context.Context, version string, plu
 		if version != "" {
 			b.logger.Debug("pinning plugin version", "plugin type", pluginType.String(), "plugin name", pluginName, "plugin version", version)
 		}
+	case versionLatest:
+		// If set to "latest", we derive the latest plugin version dynamically
+		// when setting up the backend. This is distinct from the above case
+		// (empty string) where we derive the latest version on the spot and
+		// then pin it.
 	default:
 		semanticVersion, err := semver.NewVersion(version)
 		if err != nil {
@@ -2479,6 +2520,26 @@ func (b *SystemBackend) handlePoliciesList(policyType policy.Type) framework.Ope
 		}
 
 		return logical.ErrorResponse("unknown policy type"), nil
+	}
+}
+
+func (b *SystemBackend) handlePoliciesResolvePath(policyType policy.Type) framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+		name := data.Get("name").(string)
+		name = b.Core.policyStore.SanitizeName(name)
+
+		result := fmt.Sprintf("policies/%s/%s", policyType.String(), name)
+		if policyType == policy.TypeACL && strings.HasPrefix(req.Path, "policy") {
+			result = "policy/" + name
+		}
+
+		if strings.HasSuffix(req.Path, "/") {
+			// GenericNameRegex does not include the trailing '/' present when
+			// listing a subset of policies.
+			result += "/"
+		}
+
+		return logical.ResolvePathResponse(result)
 	}
 }
 
@@ -4519,7 +4580,7 @@ func (c *Core) GetSealStatus(ctx context.Context, lock bool) (*CoreSealStatusRes
 
 type LeaderResponse struct {
 	HAEnabled            bool      `json:"ha_enabled"`
-	IsSelf               bool      `json:"is_self,omitempty"`
+	IsSelf               *bool     `json:"is_self,omitempty"`
 	ActiveTime           time.Time `json:"active_time,omitzero"`
 	LeaderAddress        string    `json:"leader_address,omitempty"`
 	LeaderClusterAddress string    `json:"leader_cluster_address,omitempty"`
@@ -4549,7 +4610,7 @@ func (core *Core) GetLeaderStatusLocked() (*LeaderResponse, error) {
 
 	resp := &LeaderResponse{
 		HAEnabled:            true,
-		IsSelf:               isLeader,
+		IsSelf:               &isLeader,
 		LeaderAddress:        address,
 		LeaderClusterAddress: clusterAddr,
 		ActiveTime:           core.activeTime,
@@ -5473,7 +5534,7 @@ Each entry is of the form "key=value".`,
 		"",
 	},
 	"plugin-catalog_version": {
-		"The semantic version of the plugin to use.",
+		`The semantic version of the plugin to use, or "latest".`,
 		"",
 	},
 	"leases": {

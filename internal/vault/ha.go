@@ -153,6 +153,12 @@ func (c *Core) LeaderLocked() (isLeader bool, leaderAddr, clusterAddr string, er
 		return false, "", "", err
 	}
 	if !held {
+		// Since we don't have a lock, no point keeping around a stale
+		// forwarding connection.
+		if c.rpcForwardingClient.Load() != nil {
+			c.clearForwardingClients()
+		}
+
 		return false, "", "", nil
 	}
 
@@ -496,14 +502,23 @@ func (c *Core) runHALoop(doneCh chan<- struct{}, manualStepDownCh chan struct{},
 }
 
 func (c *Core) runHALoopOnce(manualStepDownCh chan struct{}, stopCh, restartCh <-chan struct{}) bool {
+	c.logger.Trace("runHALoopOnce starting")
+	defer c.logger.Trace("runHALoopOnce completed")
+
 	restart := false
-	isReadEnabledStandby := c.StandbyReadsEnabled()
+	isReadEnabledStandby := c.MaybeStandbyReadsEnabled()
+
+	var standbyCtx atomic.Pointer[atomicContext]
+	var runStandby atomic.Bool
 
 	var g run.Group
 	{
 		// This will cause all the other actors to close when the stop channel
 		// is closed or the restartCh is triggered.
 		g.Add(func() error {
+			c.logger.Trace("runHALoopOnce: starting monitor")
+			defer c.logger.Trace("runHALoopOnce: done monitor")
+
 			select {
 			case <-stopCh:
 			case <-restartCh:
@@ -517,6 +532,9 @@ func (c *Core) runHALoopOnce(manualStepDownCh chan struct{}, stopCh, restartCh <
 		keyRotateStop := make(chan struct{})
 
 		g.Add(func() error {
+			c.logger.Trace("runHALoopOnce: starting keyring")
+			defer c.logger.Trace("runHALoopOnce: done keyring")
+
 			c.periodicCheckKeyringUpgrades(context.Background(), keyRotateStop, isReadEnabledStandby)
 			return nil
 		}, func(error) {
@@ -529,6 +547,9 @@ func (c *Core) runHALoopOnce(manualStepDownCh chan struct{}, stopCh, restartCh <
 		checkLeaderStop := make(chan struct{})
 
 		g.Add(func() error {
+			c.logger.Trace("runHALoopOnce: starting leadership refresh")
+			defer c.logger.Trace("runHALoopOnce: done leadership refresh")
+
 			c.periodicLeaderRefresh(checkLeaderStop)
 			return nil
 		}, func(error) {
@@ -540,6 +561,9 @@ func (c *Core) runHALoopOnce(manualStepDownCh chan struct{}, stopCh, restartCh <
 		metricsStop := make(chan struct{})
 
 		g.Add(func() error {
+			c.logger.Trace("runHALoopOnce: starting metrics")
+			defer c.logger.Trace("runHALoopOnce: done metrics")
+
 			c.metricsLoop(metricsStop)
 			return nil
 		}, func(error) {
@@ -548,11 +572,30 @@ func (c *Core) runHALoopOnce(manualStepDownCh chan struct{}, stopCh, restartCh <
 		})
 	}
 	{
-		// Wait for leadership
+		// Maybe run read-enabled standbys.
+		standbyStopCh := make(chan struct{})
+
+		runStandby.Store(true)
+		g.Add(func() error {
+			c.logger.Trace("runHALoopOnce: starting read-enabled loop")
+			defer c.logger.Trace("runHALoopOnce: done read-enabled loop")
+
+			c.readStandbyLoop(standbyStopCh, &standbyCtx, &runStandby)
+			return nil
+		}, func(error) {
+			close(standbyStopCh)
+			c.logger.Debug("shutting down read-enabled standby handler")
+		})
+	}
+	{
+		// Wait for leadership.
 		leaderStopCh := make(chan struct{})
 
 		g.Add(func() error {
-			c.leadershipLoop(manualStepDownCh, leaderStopCh, isReadEnabledStandby)
+			c.logger.Trace("runHALoopOnce: starting leadership loop")
+			defer c.logger.Trace("runHALoopOnce: done leadership loop")
+
+			c.leadershipLoop(manualStepDownCh, leaderStopCh, &standbyCtx, &runStandby)
 			return nil
 		}, func(error) {
 			close(leaderStopCh)
@@ -570,11 +613,101 @@ func (c *Core) runHALoopOnce(manualStepDownCh chan struct{}, stopCh, restartCh <
 	return restart
 }
 
+// readStandbyLoop is a long-running routine that is used when an HA backend is
+// in use and read standbys are enabled. It actively tries to startup in
+// read-only mode, skipping when we're trying to become active.
+func (c *Core) readStandbyLoop(stopCh <-chan struct{}, standbyCtx *atomic.Pointer[atomicContext], runStandby *atomic.Bool) {
+	// Even in the case of needing to back off, we don't want to wait too long
+	// to retry read-enabled standby operations as that could lead to downtime.
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = 15 * time.Millisecond
+	b.MaxInterval = 1 * time.Second
+
+	for {
+		// Check for shutdown.
+		select {
+		case <-stopCh:
+			c.logger.Debug("stop channel triggered in runHALoop")
+			return
+		default:
+		}
+
+		stop, wait := c.runReadStandby(stopCh, standbyCtx, runStandby)
+		if stop {
+			return
+		}
+
+		if !wait {
+			b.Reset()
+		} else {
+			// If we restarted the for loop due to an error, wait a second
+			// so that we don't busy loop if the error persists.
+			time.Sleep(b.NextBackOff())
+		}
+	}
+}
+
+// runReadStandby runs a single iteration of the standby loop. It decides if
+// it should acquire standby status (based on runStandby) and waits for any
+// started standby node to complete.
+func (c *Core) runReadStandby(stopCh <-chan struct{}, sharedStandbyCtx *atomic.Pointer[atomicContext], runStandby *atomic.Bool) (stop bool, wait bool) {
+	// If we're not instructed to become a read-enabled standby (because we're
+	// currently an active node), skip for now.
+	if !runStandby.Load() {
+		return false, true
+	}
+
+	// If we're not able to become a read-enabled standby, skip this as well.
+	if !c.MaybeStandbyReadsEnabled() {
+		return false, true
+	}
+
+	c.logger.Trace("starting read-enabled standby loop iteration")
+	defer c.logger.Trace("done with read-enabled standby loop iteration")
+
+	// Create the standby context (this becomes activeCtx on core, oh well).
+	standbyCtx, standbyCtxCancel := context.WithCancel(namespace.RootContext(context.Background()))
+	// Cancel if we exit the loop.
+	defer standbyCtxCancel()
+
+	// Store this context into sharedStandbyCtx for others to use, cancelling
+	// anything that exists currently. This is so that, if we become active,
+	// we can cancel this context from the other goroutine.
+	sharedStandbyCtx.Load().Cancel()
+	sharedStandbyCtx.Store(NewAtomicContext(standbyCtx, standbyCtxCancel))
+
+	stop, retry := c.runReadEnabledStandby(standbyCtx, standbyCtxCancel, stopCh, runStandby)
+	if stop {
+		return true, false
+	} else if retry {
+		return false, true
+	}
+
+	// Await standby completion.
+	c.logger.Trace("awaiting end of standby mode")
+
+	select {
+	case <-stopCh:
+		return true, false
+	case <-standbyCtx.Done():
+	}
+
+	// Try it all again. We presume we've successfully started up as a
+	// read-enabled standby so there's no need (this iteration) to delay the
+	// retry and we should reset our backoff.
+	return false, false
+}
+
 // leadershipLoop is a long-running routine that is used when an HA backend is
 // enabled. It waits until we are the leader and switches this node to active.
-func (c *Core) leadershipLoop(manualStepDownCh, stopCh <-chan struct{}, isReadEnabled bool) {
+func (c *Core) leadershipLoop(manualStepDownCh, stopCh <-chan struct{}, standbyCtx *atomic.Pointer[atomicContext], runStandby *atomic.Bool) {
 	var manualStepDown bool
-	iteration := 0
+
+	// This has a little longer backoff so we don't attempt to constantly
+	// re-acquire the same remote lock ourselves if we're in a crash loop.
+	b := backoff.NewExponentialBackOff()
+	b.InitialInterval = 15 * time.Millisecond
+	b.MaxInterval = lockRetryInterval
 
 	for {
 		// Check for a shutdown
@@ -585,68 +718,28 @@ func (c *Core) leadershipLoop(manualStepDownCh, stopCh <-chan struct{}, isReadEn
 		default:
 		}
 
-		stop := c.waitForLeadership(iteration, &manualStepDown, manualStepDownCh, stopCh, isReadEnabled)
+		stop, wait := c.waitForLeadership(&manualStepDown, manualStepDownCh, stopCh, standbyCtx, runStandby)
 		if stop {
 			return
 		}
 
-		iteration += 1
+		if !wait {
+			b.Reset()
+		} else {
+			// If we restarted the for loop due to an error, wait a second
+			// so that we don't busy loop if the error persists.
+			time.Sleep(b.NextBackOff())
+		}
 	}
 }
 
 // waitForLeadership handles a single loop of leadershipLoop, trying to
 // become leader and potentially running a read-enabled standby in the
 // interim.
-func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStepDownCh, stopCh <-chan struct{}, isReadEnabled bool) (stop bool) {
-	if iteration > 0 && !*manualStepDown {
-		// If we restarted the for loop due to an error, wait a second
-		// so that we don't busy loop if the error persists.
-		time.Sleep(1 * time.Second)
-	}
-
-	c.logger.Info("entering standby mode")
-
-	// Create the standby context (this becomes activeCtx on core, oh well).
-	standbyCtx, standbyCtxCancel := context.WithCancel(namespace.RootContext(context.Background()))
-	// Cancel if we exit the loop without transitioning to active.
-	defer standbyCtxCancel()
-
-	failedLeaderAcquisition := make(chan struct{})
-	acquiredLeadership := make(chan struct{})
-
-	// If possible, unseal in read-only mode and start acting as a
-	// read-enabled standby.
-	if isReadEnabled {
-		stop, retry, tryActive := c.runReadEnabledStandby(standbyCtx, standbyCtxCancel, stopCh)
-		if stop {
-			return true
-		} else if retry && !tryActive && iteration < 5 {
-			// When iteration count reaches too high, it suggests we've
-			// perhaps all failed to unseal. See if attempting to become
-			// leader will help us to make progress.
-			return false
-		} else if retry {
-			go func() {
-				// If we've been told to stop, give up.
-				select {
-				case <-stopCh:
-					return
-				case <-failedLeaderAcquisition:
-					return
-				case <-acquiredLeadership:
-					return
-				case <-time.After(1 * time.Minute):
-				}
-
-				// Restart.
-				c.logger.Info("ha: re-attempting failed standby setup as not yet active")
-				c.Restart()
-			}()
-		}
-	}
-
+func (c *Core) waitForLeadership(manualStepDown *bool, manualStepDownCh, stopCh <-chan struct{}, standbyCtx *atomic.Pointer[atomicContext], runStandby *atomic.Bool) (stop bool, wait bool) {
 	// If we've just stepped down, we could instantly grab the lock
-	// again. Give the other nodes a chance.
+	// again. Give the other nodes a chance, on top of whatever retry
+	// backoff we might've had.
 	if *manualStepDown {
 		time.Sleep(manualStepDownSleepPeriod)
 		*manualStepDown = false
@@ -656,23 +749,22 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 	uuid, err := uuid.GenerateUUID()
 	if err != nil {
 		c.logger.Error("failed to generate uuid", "error", err)
-		close(failedLeaderAcquisition)
-		return false
+		return false, true
 	}
 	lock, err := c.ha.LockWith(CoreLockPath, uuid)
 	if err != nil {
 		c.logger.Error("failed to create lock", "error", err)
-		close(failedLeaderAcquisition)
-		return false
+		return false, true
 	}
+
+	c.logger.Info("attempting leadership lock acquisition")
 
 	// Attempt the acquisition
 	leaderLostCh := c.acquireLock(lock, stopCh)
 
 	// Bail if we are being shutdown
 	if leaderLostCh == nil {
-		close(failedLeaderAcquisition)
-		return true
+		return true, false
 	}
 
 	// If the backend is a FencingHABackend, register the lock with it so it can
@@ -685,12 +777,18 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 			c.heldHALock = nil
 			lock.Unlock()
 			c.logger.Error("failed registering lock with fencing backend, giving up active state")
-			return false
+			return false, true
 		}
 	}
 
 	c.logger.Info("acquired lock, enabling active operation")
-	close(acquiredLeadership)
+	defer c.logger.Info("done with active loop iteration")
+
+	// Notify the standby loop that we've acquired the lock; it shouldn't
+	// re-attempt standby operations until we're done. This won't interrupt
+	// any existing standby operations but will stop us from finishing startup.
+	runStandby.Store(false)
+	defer runStandby.Store(true)
 
 	// This is used later to log a metrics event; this can be helpful to
 	// detect flapping
@@ -702,11 +800,11 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 	go func() {
 		timer := time.NewTimer(DefaultMaxRequestDuration)
 		select {
-		case <-standbyCtx.Done():
+		case <-standbyCtx.Load().Done():
 			timer.Stop()
 		case <-timer.C:
 			// Attempt to drain any inflight requests.
-			standbyCtxCancel()
+			standbyCtx.Load().Cancel()
 		}
 	}()
 
@@ -716,7 +814,7 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 	if stopped := l.lockOrStop(); stopped {
 		lock.Unlock()
 		metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
-		return true
+		return true, false
 	}
 
 	if c.Sealed() {
@@ -724,11 +822,11 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 		lock.Unlock()
 		c.stateLock.Unlock()
 		metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
-		return true
+		return true, false
 	}
 
 	// Cancel the standby context if it hasn't already been.
-	standbyCtxCancel()
+	standbyCtx.Load().Cancel()
 
 	// Clear pending standby restarts, not that it matters too much.
 	c.drainPendingRestarts()
@@ -755,7 +853,7 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 		c.heldHALock = nil
 		lock.Unlock()
 		c.stateLock.Unlock()
-		return true
+		return true, false
 	}
 
 	// This block is used to wipe barrier/seal state and verify that
@@ -788,9 +886,9 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 			// If we are shutting down we should return from this function,
 			// otherwise continue
 			if !strings.Contains(err.Error(), context.Canceled.Error()) {
-				return false
+				return false, true
 			} else {
-				return true
+				return true, false
 			}
 		}
 	}
@@ -808,7 +906,7 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 			c.stateLock.Unlock()
 			c.logger.Error("cluster setup failed", "error", err)
 			metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
-			return false
+			return false, true
 		}
 
 	}
@@ -819,7 +917,7 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 		c.stateLock.Unlock()
 		c.logger.Error("leader advertisement setup failed", "error", err)
 		metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
-		return false
+		return false, true
 	}
 
 	// wipe any existing mount tables before stepping up as leader
@@ -845,7 +943,7 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 		c.logger.Error("post-unseal setup failed", "error", err)
 		lock.Unlock()
 		metrics.MeasureSince([]string{"core", "leadership_setup_failed"}, activeTime)
-		return false
+		return false, true
 	}
 
 	// Monitor a loss of leadership
@@ -915,35 +1013,145 @@ func (c *Core) waitForLeadership(iteration int, manualStepDown *bool, manualStep
 
 		// If we are stopped return, otherwise unlock the statelock
 		if stopped {
-			return true
+			return true, false
 		}
 		c.stateLock.Unlock()
 	}
 
-	// Try again
-	return false
+	// Restart the outer HA loop invocation.
+	return false, false
 }
 
-func (c *Core) setupGRPCStandbyInvalidations(ctx context.Context) bool {
+func (c *Core) maybeBypassGRPCRequirement(ctx context.Context) bool {
+	// We can enter read-only mode without having an active GRPC forwarding
+	// because we have (mostly) synchronized storage. When the underlying lock
+	// is not held with an active reservation, it means there is no active
+	// leader and other nodes may be competing for that value. When one wins,
+	// we'll restart and wait for the active lock requirement again.
+	lock, err := c.ha.LockWith(CoreLockPath, "read")
+	if err != nil {
+		c.firstMissingLeader = time.Time{}
+		c.logger.Debug("unable to create ha lock to validate leadership status", "error", err)
+		return false
+	}
+
+	held, _, err := lock.Value()
+	if err != nil {
+		c.firstMissingLeader = time.Time{}
+		c.logger.Debug("unable to check ha lock to validate leadership status", "error", err)
+		return false
+	}
+
+	if held {
+		c.firstMissingLeader = time.Time{}
+		// This means that we are unable to connect to the leader, but (per
+		// storage) they definitely exist.
+		return false
+	}
+
+	if c.firstMissingLeader.IsZero() {
+		// This is our first time missing a leader; wait until two lock
+		// retry intervals have passed so we don't prematurely enter read-only
+		// mode if a new leader has been found.
+		c.firstMissingLeader = time.Now()
+		return false
+	}
+
+	if time.Since(c.firstMissingLeader) < 2*lockRetryInterval {
+		// We've not yet found a leader but our time hasn't elapsed.
+		return false
+	}
+
+	// We're good to start as read-only, given we haven't found a leader. If we
+	// get restarted though, make sure we start from scratch.
+	c.firstMissingLeader = time.Time{}
+
+	// Periodically check this lock. If we error or find a leader, we exit and
+	// restart the core.
+	go func() {
+		c.logger.Trace("starting polling to ensure lock remains unheld")
+		defer c.logger.Trace("done polling to ensure lock remains unheld")
+
+		restart := true
+		defer func() {
+			if restart {
+				c.logger.Info("restarting due to discovered active node")
+				c.Restart()
+			}
+		}()
+
+		t := time.NewTimer(lockRetryInterval)
+		for {
+			select {
+			case <-ctx.Done():
+				// Do not restart the core because of a cancelled context;
+				// we're likely already restarting or have experienced a
+				// state change.
+				restart = false
+				return
+			case <-t.C:
+			}
+
+			held, _, err := lock.Value()
+			if err != nil {
+				c.logger.Debug("unable to check ha lock to validate missing leadership status", "error", err)
+				return
+			}
+
+			if held {
+				return
+			}
+
+			t.Reset(lockRetryInterval)
+		}
+	}()
+
+	return true
+}
+
+// setupGRPCStandbyInvalidations returns (bypass, isOk):
+//
+//   - bypass means that GRPC invalidation was bypassed and we still want to
+//     stand up as read-enabled,
+//   - isOk means a fatal error occurred
+func (c *Core) setupGRPCStandbyInvalidations(ctx context.Context) (bool, bool) {
 	// Potentially refresh replication information before we get
 	// too far. This ensures we do not attempt to contact a stale
 	// leader.
 	if _, _, _, err := c.LeaderLocked(); err != nil {
 		c.logger.Error("skipping invalidation streaming as unable to read leader information", "err", err)
-		return false
+		return false, false
 	}
 
-	c.requestForwardingConnectionLock.RLock()
-	defer c.requestForwardingConnectionLock.RUnlock()
-
-	if c.rpcForwardingClient == nil {
+	client := c.rpcForwardingClient.Load()
+	if client == nil {
 		// When the active node has not indicated a cluster address
 		// or there's a problem connecting, we may not have a
 		// forwarding client. This renders us unable to perform any
 		// invalidations so we're unable to start-up in read-enabled
 		// mode.
-		c.logger.Error("skipping invalidation streaming as no RPC client is present")
-		return false
+		//
+		// Treat this as an error most of the time.
+		//
+		// However, we bypass this error if we can prove that there is no
+		// leader.
+		wasZero := c.firstMissingLeader.IsZero()
+		bypass := c.maybeBypassGRPCRequirement(ctx)
+		isNoLongerZero := !c.firstMissingLeader.IsZero()
+
+		if !bypass && wasZero && isNoLongerZero {
+			// Reduce the number of errors we spew.
+			c.logger.Error("skipping invalidation streaming as no GRPC client is present; this is required for read-only standby node operation; ensure valid cluster_addr and connectivity")
+		} else if bypass {
+			c.logger.Info("bypassing GRPC leader requirements as no leader lock found")
+		}
+
+		// Callers expect (bypass, ok): when we don't want to bypass, we
+		// aren't ok and so want the parent to treat this as an error and
+		// stop setup accordingly. However, when we do want to bypass
+		// GRPC invalidation and start as a read-enabled standby anyways,
+		// we want to continue on, so ok == bypass.
+		return bypass, bypass
 	}
 
 	// Start tracking any invalidations; we won't begin processing
@@ -957,16 +1165,13 @@ func (c *Core) setupGRPCStandbyInvalidations(ctx context.Context) bool {
 	// reached and the startup is complete.
 	c.invalidations.Track()
 
-	// Start the dispatch manager on the standby nodes.
-	c.LocalGRPCDispatching()
-
 	// Start streaming invalidation events from the primary.
-	if err := c.rpcForwardingClient.StreamInvalidations(ctx); err != nil {
+	if err := client.StreamInvalidations(ctx); err != nil {
 		c.logger.Error("failed to begin streaming invalidations", "err", err)
-		return false
+		return false, false
 	}
 
-	return true
+	return false, true
 }
 
 // runReadEnabledStandby grabs the state lock and unseals in read-only mode. It
@@ -975,16 +1180,63 @@ func (c *Core) setupGRPCStandbyInvalidations(ctx context.Context) bool {
 //   - retry: if the operation should be retried.
 //   - attempt active: if retry is also true, if we should retry after a
 //     period of time if we don't become the active in the interim.
-func (c *Core) runReadEnabledStandby(ctx context.Context, ctxCancel context.CancelFunc, stopCh <-chan struct{}) (stop bool, retry bool, activeAttempt bool) {
-	c.logger.Info("enabling horizontal scalability (reads)")
-	c.barrier.SetReadOnly(true)
+func (c *Core) runReadEnabledStandby(ctx context.Context, ctxCancel context.CancelFunc, stopCh <-chan struct{}, runStandby *atomic.Bool) (stop bool, retry bool) {
+	if ctx.Err() != nil || !runStandby.Load() {
+		c.logger.Debug("context cancelled before grabbing state lock")
+		// We want to retry eventually.
+		return false, true
+	}
+
+	c.logger.Trace("attempting state lock acquisition before read-enabled standby setup")
 
 	if err := c.runStandbyGrabStateLock(stopCh); err != nil {
 		c.logger.Error("unable to grab state lock for standby", "err", err)
-		return true, false, false
+		return true, false
 	}
 
+	// From here on out, we hold the state lock; defer its unlocking.
 	defer c.stateLock.Unlock()
+
+	// Bail if we're told we should cancel.
+	if ctx.Err() != nil || !runStandby.Load() {
+		c.logger.Debug("context cancelled after grabbing state lock")
+		// We want to retry eventually.
+		return false, true
+	}
+
+	// Mark the barrier as read-only only when the state lock is held. This
+	// ensures we don't conflict with waitForLeadership(...).
+	c.barrier.SetReadOnly(true)
+
+	// Before preSeal, check if we need to do GRPC based invalidation;
+	// if so, start streaming invalidations. While it is overkill to do so
+	// before preSeal, this ensures we get fewer log messages if we end up
+	// not being able to start up.
+	if shouldUseGRPCInvalidation(c.underlyingPhysical) {
+		c.logger.Debug("setting up GRPC-backed streaming of invalidations")
+
+		bypass, ok := c.setupGRPCStandbyInvalidations(ctx)
+		if !ok {
+			// Clear any events we might have received.
+			c.CleanupInvalidationPeers()
+			c.invalidations.Stop()
+
+			// Try this again.
+			return false, true
+		}
+
+		if !bypass {
+			// Wait for our initial invalidation checkpoint.
+			if err := c.AwaitReplication(ctx); err != nil {
+				// Clear any events we might have received.
+				c.CleanupInvalidationPeers()
+				c.invalidations.Stop()
+
+				c.logger.Error("failed to await replication", "err", err)
+				return false, true
+			}
+		}
+	}
 
 	// Wipe any existing state.
 	if err := c.preSeal(); err != nil {
@@ -993,30 +1245,22 @@ func (c *Core) runReadEnabledStandby(ctx context.Context, ctxCancel context.Canc
 
 	c.drainPendingRestarts()
 
-	// Before unseal, check if we need to do GRPC based invalidation;
-	// if so, start streaming invalidations.
-	if shouldUseGRPCInvalidation(c.underlyingPhysical) {
-		c.logger.Debug("setting up GRPC-backed streaming of invalidations")
-
-		if ok := c.setupGRPCStandbyInvalidations(ctx); !ok {
-			// Clear any events we might have received.
-			c.CleanupInvalidationPeers()
-			c.invalidations.Stop()
-
-			// Try this again, but allow attempting to become active.
-			return false, true, true
-		}
-
-		// Wait for our initial invalidation checkpoint.
-		if err := c.AwaitReplication(ctx); err != nil {
-			// Clear any events we might have received.
-			c.CleanupInvalidationPeers()
-			c.invalidations.Stop()
-
-			c.logger.Error("failed to await replication", "err", err)
-			return false, true, true
+	// Check if we're missing a cluster identifier; if so, attempt to load one.
+	if c.ClusterID() == "" {
+		if _, err := c.Cluster(ctx); err != nil {
+			c.logger.Error("failed to load cluster information; unable to respond with index identifiers", "error", err)
 		}
 	}
+
+	// Bail if we're told we should cancel.
+	if ctx.Err() != nil || !runStandby.Load() {
+		c.logger.Debug("context cancelled before calling read-only post-unseal setup")
+		// We want to retry eventually.
+		return false, true
+	}
+
+	// Notify that we're most likely to be successful
+	c.logger.Info("entering read-enabled standby mode")
 
 	// Unseal, holding the state lock.
 	c.replicationState.Store(uint32(consts.ReplicationDRDisabled | consts.ReplicationPerformanceStandby))
@@ -1027,13 +1271,11 @@ func (c *Core) runReadEnabledStandby(ctx context.Context, ctxCancel context.Canc
 		c.CleanupInvalidationPeers()
 		c.invalidations.Stop()
 
-		// We shouldn't attempt to keep grabbing the HA lock if we failed to
-		// unseal.
-		return false, true, false
+		return false, true
 	}
 
 	// All good.
-	return false, false, false
+	return false, false
 }
 
 // grabLockOrStop returns stopped=false if the lock is acquired. Returns
@@ -1423,20 +1665,48 @@ func (c *Core) clearLeader(uuid string) error {
 	return c.barrier.Delete(context.Background(), key)
 }
 
-// StandbyReadsEnabled returns true iff standby read are enabled and supported
-// by the physical backend
-func (c *Core) StandbyReadsEnabled() bool {
-	if shouldUseGRPCInvalidation(c.underlyingPhysical) {
-		if c.rpcForwardingClient == nil {
-			return false
-		}
-	} else if _, ok := c.underlyingPhysical.(physical.CacheInvalidationBackend); !ok {
-		return false
-	}
+func isCacheInvalidationBackend(phys physical.Backend) bool {
+	_, ok := phys.(physical.CacheInvalidationBackend)
+	return ok
+}
 
-	conf := c.rawConfig.Load()
-	if conf == nil {
-		return false
+func isReplicationIndexBackend(phys physical.Backend) bool {
+	_, ok := phys.(physical.ReplicationIndexBackend)
+	return ok
+}
+
+func shouldUseGRPCInvalidation(phys physical.Backend) bool {
+	return !isCacheInvalidationBackend(phys) && isReplicationIndexBackend(phys)
+}
+
+func (c *Core) standbyReadsAllowed() bool {
+	if conf := c.rawConfig.Load(); conf != nil {
+		return !conf.DisableStandbyReads
 	}
-	return !conf.DisableStandbyReads
+	return false
+}
+
+func (c *Core) shouldHookInvalidate(phys physical.Backend) bool {
+	return c.standbyReadsAllowed() && isCacheInvalidationBackend(c.underlyingPhysical)
+}
+
+// StandbyReadsEnabled returns true iff standby read are enabled, supported,
+// and likely immediately usable by the physical backend.
+func (c *Core) StandbyReadsEnabled() bool {
+	return c.standbyReadsAllowed() && !c.activeContext.Load().IsNil() &&
+		(isCacheInvalidationBackend(c.underlyingPhysical) ||
+			isReplicationIndexBackend(c.underlyingPhysical))
+}
+
+// MaybeStandbyReadsEnabled is like StandbyReadsEnabled but returns true in
+// the case of a disconnected GRPC forwarding client when GRPC invalidations
+// are in use or when read-request handling is not yet set up.
+//
+// In the context of runHALoop, we want runReadStandby to execute if the GRPC
+// forwarding client is not connected because it will opportunistically
+// attempt to set it up if its missing and we need it.
+func (c *Core) MaybeStandbyReadsEnabled() bool {
+	return c.standbyReadsAllowed() &&
+		(isCacheInvalidationBackend(c.underlyingPhysical) ||
+			isReplicationIndexBackend(c.underlyingPhysical))
 }

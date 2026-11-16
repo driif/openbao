@@ -16,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	celgo "github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/types"
+	celgo "cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/types"
 	"github.com/openbao/openbao/sdk/v2/framework"
 	celhelper "github.com/openbao/openbao/sdk/v2/helper/cel"
 	"github.com/openbao/openbao/sdk/v2/helper/certutil"
@@ -50,7 +50,7 @@ func pathCelIssue(b *backend) *framework.Path {
 		Description: `The number of bits to use. Allowed values are
 0 (universal default); with rsa key_type: 2048 (default), 3072, or
 4096; with ec key_type: 224, 256 (default), 384, or 521; ignored with
-ed25519; with mldsa key_type: 44, 65 (default), or 87.`,
+ed25519; with mldsa key_type: 44 (default), 65, or 87.`,
 		DisplayAttrs: &framework.DisplayAttributes{
 			Value: 0,
 		},
@@ -90,6 +90,9 @@ are the only valid values outside of the empty string.`,
 		TakesArbitraryInput: true,
 
 		Operations: map[logical.Operation]framework.OperationHandler{
+			logical.ResolvePathOperation: &framework.PathOperation{
+				Callback: b.resolvePathIssuerKey,
+			},
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathCelIssue,
 				Responses: map[int][]framework.Response{
@@ -165,6 +168,9 @@ func buildPathIssue(b *backend, pattern string, displayAttrs *framework.DisplayA
 		DisplayAttrs: displayAttrs,
 
 		Operations: map[logical.Operation]framework.OperationHandler{
+			logical.ResolvePathOperation: &framework.PathOperation{
+				Callback: b.resolvePathIssuerKey,
+			},
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.metricsWrap("issue", roleRequired, b.pathIssue),
 				Responses: map[int][]framework.Response{
@@ -229,7 +235,7 @@ func buildPathIssue(b *backend, pattern string, displayAttrs *framework.DisplayA
 		Description: `The number of bits to use. Allowed values are
 0 (universal default); with rsa key_type: 2048 (default), 3072, or
 4096; with ec key_type: 224, 256 (default), 384, or 521; ignored with
-ed25519; with mldsa key_type: 44, 65 (default), or 87.`,
+ed25519; with mldsa key_type: 44 (default), 65, or 87.`,
 		DisplayAttrs: &framework.DisplayAttributes{
 			Value: 0,
 		},
@@ -295,6 +301,9 @@ basic constraints.`,
 		TakesArbitraryInput: true,
 
 		Operations: map[logical.Operation]framework.OperationHandler{
+			logical.ResolvePathOperation: &framework.PathOperation{
+				Callback: b.resolvePathIssuerKey,
+			},
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathCelSign,
 				Responses: map[int][]framework.Response{
@@ -370,6 +379,9 @@ func buildPathSign(b *backend, pattern string, displayAttrs *framework.DisplayAt
 		DisplayAttrs: displayAttrs,
 
 		Operations: map[logical.Operation]framework.OperationHandler{
+			logical.ResolvePathOperation: &framework.PathOperation{
+				Callback: b.resolvePathIssuerKey,
+			},
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.metricsWrap("sign", roleRequired, b.pathSign),
 				Responses: map[int][]framework.Response{
@@ -468,6 +480,9 @@ func buildPathIssuerSignVerbatim(b *backend, pattern string, displayAttrs *frame
 		Fields:       getCsrSignVerbatimSchemaFields(),
 
 		Operations: map[logical.Operation]framework.OperationHandler{
+			logical.ResolvePathOperation: &framework.PathOperation{
+				Callback: b.resolvePathIssuerKey,
+			},
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.metricsWrap("sign-verbatim", roleOptional, b.pathSignVerbatim),
 				Responses: map[int][]framework.Response{

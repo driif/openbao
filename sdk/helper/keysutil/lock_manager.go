@@ -131,9 +131,13 @@ func (lm *LockManager) InitCache(cacheSize int) error {
 	return nil
 }
 
+// PolicyNameValidator is used to ensure that restored policies comply with
+// the owner's expectations.
+type PolicyNameValidator func(name string) (err error)
+
 // RestorePolicy acquires an exclusive lock on the policy name and restores the
 // given policy along with the archive.
-func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storage, name, backup string, force bool) error {
+func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storage, name, backup string, force bool, nameValidator PolicyNameValidator) error {
 	backupBytes, err := base64.StdEncoding.DecodeString(backup)
 	if err != nil {
 		return err
@@ -151,6 +155,16 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 	}
 
 	name = keyData.Policy.Name
+
+	if nameValidator != nil {
+		if err := nameValidator(name); err != nil {
+			return fmt.Errorf("failed restored policy name validator: %w", err)
+		}
+	}
+
+	// Ensure storage prefix is empty; restoration of policies does not
+	// support non-empty storage prefix values.
+	keyData.Policy.StoragePrefix = ""
 
 	// Grab the exclusive lock as we'll be modifying disk
 	lock := locksutil.LockForKey(lm.keyLocks, name)
@@ -385,6 +399,12 @@ func (lm *LockManager) GetPolicyWithLockType(ctx context.Context, req PolicyRequ
 			if req.Derived || req.Convergent {
 				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
 			}
+
+		case KeyType_MLDSA44, KeyType_MLDSA65, KeyType_MLDSA87:
+			if req.Derived || req.Convergent {
+				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)
+			}
+
 		case KeyType_HMAC:
 			if req.Derived || req.Convergent {
 				return nil, false, fmt.Errorf("key derivation and convergent encryption not supported for keys of type %v", req.KeyType)

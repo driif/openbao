@@ -1,5 +1,5 @@
 ---
-sidebar_label: Shared Listener Config
+sidebar_label: Shared
 description: |-
   Shared config options for every listener type.
 ---
@@ -7,6 +7,27 @@ description: |-
 # Shared listener parameters
 
 There is config that is common between all listeners.
+
+## Consistency behavior
+
+For more information on consistency, refer to the [concepts section](../../concepts/consistency.mdx)
+of the documentation.
+
+- `consistency_fallback_behavior` `(string: "fail")` - specifies the fallback
+  behavior when a client only specifies `X-Vault-Inconsistent: await-state`.
+  This defines whether the client should receive an error and retry (`fail` or
+  elided) or whether the request should be forwarded to the active node
+  (`forward-active-node`). `await-state` is not supported here.
+- `consistency_missing_header_forward` `(bool: false)` - when set to true, any
+  requests from a client without `X-Vault-Index` or `X-Vault-Inconsistent` will
+  be forwarded to the active node. This makes an otherwise read-enabled standby
+  node function like one with `disable_standby_reads=true` set, but only for
+  clients which are not aware of eventual consistency.
+- `consistency_max_index_wait` `(string: "0s")` - maximum time the standby
+  will hold requests to catch up to the specified `X-Vault-Index`, before
+  applying the fallback behavior. This requires `X-Vault-Inconsistent: await-state`
+  be set on the request. `25ms` is the minimum and will be added to the value
+  in this configuration parameter.
 
 ## Client certificate header parameters
 
@@ -33,6 +54,7 @@ There is config that is common between all listeners.
   - URL - Urldecode the supplied value
   - PEM - Convert a PEM certificate to base64 encoded DER
   - RFC9440 - Use base64 encoded DER as defined in [RFC 9440 2.1][RFC 9440 2.1]
+  - Envoy - Decode Envoy XFCC header element as defined in [Envoy XFCC][Envoy XFCC]
 
   The result of this processing should end up with a base64 encoded DER certificate.
   If the header value is already base64 encoded DER then no value needs to be set.
@@ -82,7 +104,32 @@ location / {
 }
 ```
 
+#### Envoy proxy
+
+OpenBao config
+```hcl
+listener "tcp" {
+  address = "127.0.0.1:8200"
+  x_forwarded_for_reject_not_authorized = true
+  x_forwarded_for_reject_not_present = true
+  x_forwarded_for_authorized_addrs = "127.0.0.1"
+  x_forwarded_for_client_cert_header = "X-Forwarded-Client-Cert"
+  x_forwarded_for_client_cert_decoders = ["Envoy", "PEM"]
+}
+```
+
+Envoy config snippet
+```yaml
+- name: envoy.http_connection_manager
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+    use_remote_address: true
+    forward_client_cert_details: SANITIZE_SET
+    set_current_client_cert_details:
+      cert: true
+```
 
 
 [RFC 9440 2.1]: https://www.rfc-editor.org/rfc/rfc9440.html#section-2.1
 [tcp-listener]: tcp.mdx#tcp-listener-parameters
+[Envoy XFCC]: https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_conn_man/headers#x-forwarded-client-cert

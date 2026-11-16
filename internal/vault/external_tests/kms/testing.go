@@ -63,6 +63,18 @@ func knownTransitKeyTypes() []transitKeyType {
 			SignVerify: true,
 		},
 		{
+			Type:       "mldsa-44",
+			SignVerify: true,
+		},
+		{
+			Type:       "mldsa-65",
+			SignVerify: true,
+		},
+		{
+			Type:       "mldsa-87",
+			SignVerify: true,
+		},
+		{
 			Type:           "rsa-2048",
 			EncryptDecrypt: true,
 			SignVerify:     true,
@@ -298,8 +310,15 @@ func ExercisePKIRootCA(t *testing.T, client *api.Client, mountName string, keyNa
 	keyId := resp.Data["key_id"]
 	require.NotEmpty(t, keyId)
 
-	// Update the key's name.
 	keyPath := fmt.Sprintf("%v/key/%v", mountName, keyId)
+
+	// Sanity check the key type.
+	resp, err = client.Logical().Read(keyPath)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, "external-key", resp.Data["key_type"])
+
+	// Update the key's name.
 	_, err = client.Logical().Write(keyPath, map[string]any{
 		"key_name": keyName,
 	})
@@ -355,8 +374,15 @@ func ExercisePKIIntermediateCA(t *testing.T, client *api.Client, mountName strin
 	csr := resp.Data["csr"]
 	require.NotEmpty(t, csr)
 
-	// Update the intermediate key's name.
 	keyPath = fmt.Sprintf("%v/key/%v", mountName, keyId)
+
+	// Sanity check the key type.
+	resp, err = client.Logical().Read(keyPath)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, "external-key", resp.Data["key_type"])
+
+	// Update the intermediate key's name.
 	_, err = client.Logical().Write(keyPath, map[string]any{
 		"key_name": keyName,
 	})

@@ -81,6 +81,11 @@ func (c *Core) Cluster(ctx context.Context) (*Cluster, error) {
 		cluster.Name = c.clusterName
 	}
 
+	// Set cluster ID as well.
+	if cluster.ID != "" {
+		c.clusterID.CompareAndSwap(nil, cluster.ID)
+	}
+
 	return &cluster, nil
 }
 
@@ -93,9 +98,7 @@ func (c *Core) loadLocalClusterTLS(adv activeAdvertisement) (retErr error) {
 			c.localClusterParsedCert.Store(nil)
 			c.localClusterPrivateKey.Store(nil)
 
-			c.requestForwardingConnectionLock.Lock()
 			c.clearForwardingClients()
-			c.requestForwardingConnectionLock.Unlock()
 		}
 	}()
 
@@ -374,7 +377,12 @@ func (c *Core) SetClusterHandler(handler http.Handler) {
 }
 
 func (c *Core) ClusterID() string {
-	return c.clusterID.Load().(string)
+	idRaw := c.clusterID.Load()
+	id, ok := idRaw.(string)
+	if !ok {
+		id = ""
+	}
+	return id
 }
 
 type contextKeyOriginalRequestPath struct{}

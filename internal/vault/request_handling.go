@@ -383,7 +383,16 @@ func (c *Core) fetchACLTokenEntryAndEntity(ctx context.Context, req *logical.Req
 	acl, err := c.policyStore.ACL(tokenCtx, entity, policyNames, policies...)
 	if err != nil {
 		c.logger.Error("failed to construct ACL", "error", err)
-		return nil, nil, nil, nil, ErrInternalError
+		retErr := ErrInternalError
+
+		// If we have a coded error, prefer its generic text over the
+		// incorrect "internal error" text. We don't want to share err's
+		// message verbatim, though.
+		if coded := logical.HTTPCodedError(nil); errors.As(err, &coded) {
+			retErr = logical.CodedError(coded.Code(), http.StatusText(coded.Code()))
+		}
+
+		return nil, nil, nil, nil, retErr
 	}
 
 	return acl, te, entity, identityPolicies, nil
@@ -864,6 +873,13 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
 	// as it is depended on by some functionality (e.g. quotas)
 	req.MountPoint = c.router.MatchingMount(ctx, req.Path)
 
+	// Resolve the path suffix after the mount point. This ensures we use the
+	// canonical URL for any ACL resolution.
+	req.Path, err = c.router.ResolvePath(ctx, req.MountPoint, req.Path, req.Data)
+	if err != nil {
+		return nil, err
+	}
+
 	err = c.PopulateTokenEntry(ctx, req)
 	if err != nil {
 		return nil, err
@@ -1340,7 +1356,15 @@ func (c *Core) handleRequest(ctx context.Context, req *logical.Request) (retResp
 				nsActiveCtx := namespace.ContextWithNamespace(c.activeContext.Load(), ns)
 				leaseID, err := c.expiration.CreateOrFetchRevocationLeaseByToken(nsActiveCtx, te)
 				if err == nil {
-					err = c.expiration.LazyRevoke(ctx, leaseID)
+					if req.Path == "auth/token/revoke-self" {
+						// UseToken() above will make the revoke-self handler
+						// not see the token and skip revocation silently. To be
+						// consistent with revoke-self's behavior, don't lazily
+						// revoke here.
+						err = c.expiration.Revoke(ctx, leaseID)
+					} else {
+						err = c.expiration.LazyRevoke(ctx, leaseID)
+					}
 				}
 				if err != nil {
 					c.logger.Error("failed to revoke token", "error", err)
@@ -2042,7 +2066,7 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 		// for new role-based quotas upon creation, rather than counting old leases toward
 		// the total.
 		if reqRole == nil && requiresLease && !c.impreciseLeaseRoleTracking {
-			role = c.DetermineRoleFromLoginRequest(ctx, req.MountPoint, req.Data)
+			role = c.DetermineRoleFromLoginRequest(ctx, req.MountPoint, req.Data, req.Connection)
 		}
 
 		_, respTokenCreate, errCreateToken := c.LoginCreateToken(ctx, ns, req.Path, source, role, resp, req.IsInlineAuth, userLockoutInfo)
@@ -2752,6 +2776,17 @@ func (c *Core) checkSSCTokenInternal(ctx context.Context, token string) (string,
 	ep := int(plainToken.IndexEpoch)
 	if ep < c.tokenStore.GetSSCTokensGenerationCounter() {
 		return plainToken.Random, nil
+	}
+
+	if plainToken.LocalIndex != "" {
+		seen, err := c.HaveSeenStorageIndex(ctx, plainToken.LocalIndex)
+		if err != nil {
+			return "", err
+		}
+
+		if !seen {
+			return "", logical.CodedError(http.StatusPreconditionFailed, "SSCT token referenced a newer index than present locally")
+		}
 	}
 
 	return plainToken.Random, nil

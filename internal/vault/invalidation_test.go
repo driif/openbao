@@ -18,11 +18,11 @@ import (
 	"github.com/openbao/openbao/sdk/v2/framework"
 	"github.com/openbao/openbao/sdk/v2/helper/jsonutil"
 	"github.com/openbao/openbao/sdk/v2/logical"
-	"github.com/openbao/openbao/sdk/v2/physical/inmem"
 	"github.com/openbao/openbao/v2/internal/audit"
 	"github.com/openbao/openbao/v2/internal/command/server"
 	"github.com/openbao/openbao/v2/internal/helper/namespace"
 	"github.com/openbao/openbao/v2/internal/helper/testhelpers/corehelpers"
+	"github.com/openbao/openbao/v2/internal/physical/inmem"
 	"github.com/openbao/openbao/v2/internal/vault/barrier"
 	ek "github.com/openbao/openbao/v2/internal/vault/external_keys"
 	"github.com/openbao/openbao/v2/internal/vault/policy"
@@ -917,6 +917,7 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 				require.Equal(collect, map[string][]string{
 					"Test-Header": {"test-value"},
 				}, resp.Headers)
+				require.EqualValues(collect, 3, factoryCallCount.Load(), "checking factory call count")
 			}, 10*time.Second, 10*time.Millisecond)
 
 			// 13. Manipulate mount table in storage: change kv version
@@ -934,7 +935,7 @@ func TestCore_Invalidate_SecretMount(t *testing.T) {
 			require.NoError(t, c.invalidateSynchronous(view.Prefix()+entryPath))
 
 			require.EventuallyWithT(t, func(collect *assert.CollectT) {
-				require.EqualValues(collect, 3, factoryCallCount.Load(), "expected factory to be called exactly thrice")
+				require.EqualValues(collect, 4, factoryCallCount.Load(), "checking factory call count")
 				triggerReadCall(collect)
 			}, 10*time.Second, 10*time.Millisecond)
 		})

@@ -21,6 +21,8 @@ import (
 	"github.com/openbao/openbao/v2/internal/helper/forwarding"
 	"github.com/openbao/openbao/v2/internal/physical/raft"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type forwardedRequestRPCServer struct {
@@ -198,7 +200,9 @@ func (s *forwardedRequestRPCServer) GetNamespaceKeys(ctx context.Context, in *Ge
 
 type Client struct {
 	RequestForwardingClient
+
 	core         core
+	conn         *grpc.ClientConn
 	taskContext  context.Context
 	echoTicker   *time.Ticker
 	nsSyncTicker *time.Ticker
@@ -208,9 +212,10 @@ type Client struct {
 	peerUUID                   atomic.Pointer[string]
 }
 
-func NewClient(core core, requestForwardingClient RequestForwardingClient, taskContext context.Context, echoTicker *time.Ticker, nsSyncTicker *time.Ticker) *Client {
+func NewClient(core core, rpcConn *grpc.ClientConn, taskContext context.Context, echoTicker *time.Ticker, nsSyncTicker *time.Ticker) *Client {
 	return &Client{
-		RequestForwardingClient: requestForwardingClient,
+		conn:                    rpcConn,
+		RequestForwardingClient: NewRequestForwardingClient(rpcConn),
 		core:                    core,
 		taskContext:             taskContext,
 		echoTicker:              echoTicker,
@@ -517,10 +522,42 @@ func (c *Client) StreamInvalidations(ctx context.Context) error {
 	return nil
 }
 
+func (c *Client) Stop() error {
+	if c == nil {
+		return nil
+	}
+
+	c.StopInvalidations()
+	return c.conn.Close()
+}
+
 func (c *Client) StopInvalidations() {
-	if c == nil || c.invalidationsContextCancel == nil {
+	if c.invalidationsContextCancel == nil {
 		return
 	}
 
 	c.invalidationsContextCancel()
+}
+
+// LegacyPackageFallback is a [grpc.UnaryClientInterceptor] that ensures
+// backwards-compatibility between OpenBao <= v2.5 and >= 2.6, which changed
+// the Protobuf package name from "vault" to "forwarding". This is achieved by
+// retrying calls with the original method name if the server does not implement
+// the newer one.
+func LegacyPackageFallback(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	err := invoker(ctx, method, req, reply, cc, opts...)
+	if status.Code(err) != codes.Unimplemented {
+		return err
+	}
+
+	switch method {
+	case "/forwarding.RequestForwarding/Echo":
+		method = "/vault.RequestForwarding/Echo"
+	case "/forwarding.RequestForwarding/ForwardRequest":
+		method = "/vault.RequestForwarding/ForwardRequest"
+	default:
+		return err
+	}
+
+	return invoker(ctx, method, req, reply, cc, opts...)
 }

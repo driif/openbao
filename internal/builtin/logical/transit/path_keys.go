@@ -390,12 +390,7 @@ func (b *backend) pathPolicyRead(ctx context.Context, req *logical.Request, d *f
 		}
 	}
 
-	resp, err := b.formatKeyPolicy(p, context)
-	if err != nil {
-		return nil, err
-	}
-
-	return resp, nil
+	return b.formatKeyPolicy(p, context)
 }
 
 func (b *backend) formatKeyPolicy(p *keysutil.Policy, context []byte) (*logical.Response, error) {

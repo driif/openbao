@@ -5,6 +5,8 @@ package kmip
 
 import (
 	"context"
+	"maps"
+	"slices"
 
 	kmiplib "github.com/ovh/kmip-go"
 	"github.com/ovh/kmip-go/kmipserver"
@@ -12,62 +14,117 @@ import (
 	"github.com/ovh/kmip-go/ttlv"
 )
 
+const vendorIdentification = "OpenBao Transit KMIP"
+
 func routes() map[kmiplib.Operation]kmipserver.OperationHandler {
 	return map[kmiplib.Operation]kmipserver.OperationHandler{
-		kmiplib.OperationRegister:         kmipserver.HandleFunc(handleRegister),
-		kmiplib.OperationCreate:           kmipserver.HandleFunc(handleCreate),
-		kmiplib.OperationGet:              kmipserver.HandleFunc(handleGet),
-		kmiplib.OperationGetAttributes:    kmipserver.HandleFunc(handleGetAttributes),
-		kmiplib.OperationGetAttributeList: kmipserver.HandleFunc(handleGetAttributeList),
-		kmiplib.OperationAddAttribute:     kmipserver.HandleFunc(handleAddAttribute),
-		kmiplib.OperationModifyAttribute:  kmipserver.HandleFunc(handleModifyAttribute),
-		kmiplib.OperationDeleteAttribute:  kmipserver.HandleFunc(handleDeleteAttribute),
-		kmiplib.OperationReKey:            kmipserver.HandleFunc(handleRekey),
-		kmiplib.OperationLocate:           kmipserver.HandleFunc(handleLocate),
-		kmiplib.OperationActivate:         kmipserver.HandleFunc(handleActivate),
-		kmiplib.OperationRevoke:           kmipserver.HandleFunc(handleRevoke),
-		kmiplib.OperationDestroy:          kmipserver.HandleFunc(handleDestroy),
-		kmiplib.OperationQuery:            kmipserver.HandleFunc(handleQuery),
-		kmiplib.OperationEncrypt:          kmipserver.HandleFunc(handleEncrypt),
-		kmiplib.OperationDecrypt:          kmipserver.HandleFunc(handleDecrypt),
-		kmiplib.OperationSign:             kmipserver.HandleFunc(handleSign),
-		kmiplib.OperationSignatureVerify:  kmipserver.HandleFunc(handleVerify),
+		kmiplib.OperationRegister:         handle(handleRegister),
+		kmiplib.OperationCreate:           handle(handleCreate),
+		kmiplib.OperationGet:              handle(handleGet),
+		kmiplib.OperationGetAttributes:    handle(handleGetAttributes),
+		kmiplib.OperationGetAttributeList: handle(handleGetAttributeList),
+		kmiplib.OperationAddAttribute:     handle(handleAddAttribute),
+		kmiplib.OperationModifyAttribute:  handle(handleModifyAttribute),
+		kmiplib.OperationDeleteAttribute:  handle(handleDeleteAttribute),
+		kmiplib.OperationReKey:            handle(handleRekey),
+		kmiplib.OperationLocate:           handle(handleLocate),
+		kmiplib.OperationActivate:         handle(handleActivate),
+		kmiplib.OperationRevoke:           handle(handleRevoke),
+		kmiplib.OperationDestroy:          handle(handleDestroy),
+		kmiplib.OperationQuery:            handle(handleQuery),
+		kmiplib.OperationEncrypt:          handle(handleEncrypt),
+		kmiplib.OperationDecrypt:          handle(handleDecrypt),
+		kmiplib.OperationSign:             handle(handleSign),
+		kmiplib.OperationSignatureVerify:  handle(handleVerify),
 	}
 }
 
-// handleQuery used by the client to interrogate the server to determine its capabilities and/or protocol mechanisms.
-// Per spec, Query is invocable by unauthenticated clients, so it is answered here without logging in.
-func handleQuery(ctx context.Context, req *payloads.QueryRequestPayload) (*payloads.QueryResponsePayload, error) {
-	resp := &payloads.QueryResponsePayload{}
+// handle routes h. An error that h did not classify reaches the client as a
+// General Failure with fixed text.
+func handle[Req, Resp kmiplib.OperationPayload](h func(context.Context, Req) (Resp, error)) kmipserver.OperationHandler {
+	return kmipserver.HandleFunc(func(ctx context.Context, req Req) (Resp, error) {
+		resp, err := h(ctx, req)
+		return resp, mapError(err)
+	})
+}
 
-	for _, qf := range req.QueryFunction {
-		switch qf {
-		case kmiplib.QueryFunctionOperations:
-			resp.Operations = append(resp.Operations, SupportedOperations...)
-		case kmiplib.QueryFunctionObjects:
-			resp.ObjectType = append(resp.ObjectType, SupportedObjectTypes...)
-		case kmiplib.QueryFunctionServerInformation:
-			resp.VendorIdentification = "OpenBao Transit KMIP"
+// supportedOperations is what Query advertises: every route, and
+// DiscoverVersions, which the listener's router answers itself.
+func supportedOperations() []kmiplib.Operation {
+	ops := append(slices.Collect(maps.Keys(routes())), kmiplib.OperationDiscoverVersions)
+	slices.Sort(ops)
+	return ops
+}
+
+// beginOn starts an operation on the object that reqID names, or else the
+// ID Placeholder.
+func beginOn(ctx context.Context, reqID string) (*call, string, error) {
+	uid, err := kmipserver.GetIdOrPlaceholder(ctx, reqID)
+	if err != nil {
+		return nil, "", operationErrorf(
+			kmiplib.ResultReasonInvalidField,
+			"UniqueIdentifier omitted and ID Placeholder is empty",
+		)
+	}
+	c, err := begin(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	return c, uid, nil
+}
+
+// refuseMultiPart refuses a multi-part request.
+func refuseMultiPart(op string, correlation []byte, init, final *bool) error {
+	if len(correlation) > 0 || init != nil || final != nil {
+		return operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "multi-part %s is not supported", op)
+	}
+	return nil
+}
+
+// refuseCipherOptions refuses the request fields that select a mode, a nonce
+// or additional data: transit takes all three from the key type.
+func refuseCipherOptions(op string, params *kmiplib.CryptographicParameters, iv, aad []byte) error {
+	switch {
+	case params != nil:
+		return operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for %s", op)
+	case len(iv) > 0:
+		return operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "IVCounterNonce is not supported")
+	case len(aad) > 0:
+		return operationErrorf(
+			kmiplib.ResultReasonFeatureNotSupported,
+			"AuthenticatedEncryptionAdditionalData for %s is not supported by this implementation", op,
+		)
+	}
+	return nil
+}
+
+// handleQuery reports the supported operations and object types. It sends no
+// request to OpenBao, so it does not log in. KMIP 1.4 requires an answer to
+// Query RNGs; the remaining Query functions have nothing to report.
+func handleQuery(ctx context.Context, req *payloads.QueryRequestPayload) (*payloads.QueryResponsePayload, error) {
+	functions := req.QueryFunction
+	if len(functions) == 0 {
+		functions = []kmiplib.QueryFunction{
+			kmiplib.QueryFunctionOperations,
+			kmiplib.QueryFunctionObjects,
+			kmiplib.QueryFunctionServerInformation,
 		}
 	}
 
-	if len(req.QueryFunction) == 0 {
-		resp.Operations = append(resp.Operations, SupportedOperations...)
-		resp.ObjectType = append(resp.ObjectType, SupportedObjectTypes...)
-		resp.VendorIdentification = "OpenBao Transit KMIP"
+	resp := &payloads.QueryResponsePayload{}
+	for _, qf := range functions {
+		switch qf {
+		case kmiplib.QueryFunctionOperations:
+			resp.Operations = append(resp.Operations, supportedOperations()...)
+		case kmiplib.QueryFunctionObjects:
+			resp.ObjectType = append(resp.ObjectType,
+				kmiplib.ObjectTypeSymmetricKey, kmiplib.ObjectTypePrivateKey, kmiplib.ObjectTypePublicKey)
+		case kmiplib.QueryFunctionServerInformation:
+			resp.VendorIdentification = vendorIdentification
+		case kmiplib.QueryFunctionRNGs:
+			resp.RNGParameters = []kmiplib.RNGParameters{{RNGAlgorithm: kmiplib.RNGAlgorithmUnspecified}}
+		}
 	}
-
-	// TODO: Check if needed
-	// Query Application Namespaces
-	// Query Extension List
-	// Query Extension Map
-	// Query Attestation Types
-	// Query RNGs
-	// Query Validations
-	// Query Profiles
-	// Query Capabilities
-	// Query Client Registration Methods
-
 	return resp, nil
 }
 
@@ -103,10 +160,11 @@ func handleRegister(ctx context.Context, req *payloads.RegisterRequestPayload) (
 		)
 	}
 
-	alg, bitlen := AlgAndBitLenFromTemplateAttribute(req.TemplateAttribute)
+	alg := templateValue[kmiplib.CryptographicAlgorithm](req.TemplateAttribute, kmiplib.AttributeNameCryptographicAlgorithm)
 	if alg == 0 {
 		alg = keyBlock.CryptographicAlgorithm
 	}
+	bitlen := templateValue[int32](req.TemplateAttribute, kmiplib.AttributeNameCryptographicLength)
 	if bitlen == 0 {
 		bitlen = keyBlock.CryptographicLength
 	}
@@ -127,23 +185,25 @@ func handleRegister(ctx context.Context, req *payloads.RegisterRequestPayload) (
 	if err != nil {
 		return nil, err
 	}
-	name := NameFromTemplateAttribute(req.TemplateAttribute)
+	name := templateValue[kmiplib.Name](req.TemplateAttribute, kmiplib.AttributeNameName).NameValue
 	id, err := c.register(ctx, name, alg, bitlen, material, &req.TemplateAttribute)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
+	kmipserver.SetIdPlaceholder(ctx, id)
 
 	return &payloads.RegisterResponsePayload{
 		UniqueIdentifier: id,
 	}, nil
 }
 
-// handleCreateKey implements the KMIP CreateKey operation by creating a new key in transit.
+// handleCreate implements the KMIP Create operation by creating a new key in transit.
 func handleCreate(ctx context.Context, req *payloads.CreateRequestPayload) (*payloads.CreateResponsePayload, error) {
-	alg, bitlen := AlgAndBitLenFromTemplateAttribute(req.TemplateAttribute)
+	alg := templateValue[kmiplib.CryptographicAlgorithm](req.TemplateAttribute, kmiplib.AttributeNameCryptographicAlgorithm)
 	if alg == 0 {
 		return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Cryptographic algorithm is required")
 	}
+	bitlen := templateValue[int32](req.TemplateAttribute, kmiplib.AttributeNameCryptographicLength)
 	if bitlen == 0 {
 		return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Cryptographic length is required")
 	}
@@ -152,11 +212,12 @@ func handleCreate(ctx context.Context, req *payloads.CreateRequestPayload) (*pay
 	if err != nil {
 		return nil, err
 	}
-	name := NameFromTemplateAttribute(req.TemplateAttribute)
+	name := templateValue[kmiplib.Name](req.TemplateAttribute, kmiplib.AttributeNameName).NameValue
 	id, err := c.create(ctx, name, alg, bitlen, &req.TemplateAttribute)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
+	kmipserver.SetIdPlaceholder(ctx, id)
 
 	return &payloads.CreateResponsePayload{
 		ObjectType:       req.ObjectType,
@@ -164,23 +225,34 @@ func handleCreate(ctx context.Context, req *payloads.CreateRequestPayload) (*pay
 	}, nil
 }
 
-// handleGet implements the KMIP Get for Managed Object specified by it's Unique Identifier
+// handleGet returns the object that the Unique Identifier or the ID
+// Placeholder selects. The key is never wrapped or compressed, and has one
+// format per object type; a request for anything else is refused.
 func handleGet(ctx context.Context, req *payloads.GetRequestPayload) (*payloads.GetResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
+
+	if req.KeyWrappingSpecification != nil {
+		return nil, operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "Key Wrapping Specification is not supported")
+	}
+	if req.KeyCompressionType != 0 && req.KeyCompressionType != kmiplib.KeyCompressionTypeECPublicKeyTypeUncompressed {
+		return nil, operationErrorf(
+			kmiplib.ResultReasonKeyCompressionTypeNotSupported,
+			"Key Compression Type %s is not supported", ttlv.EnumStr(req.KeyCompressionType),
+		)
+	}
+
 	obj, err := c.get(ctx, uid)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
+	}
+	if format := keyFormat(obj); req.KeyFormatType != 0 && req.KeyFormatType != format {
+		return nil, operationErrorf(
+			kmiplib.ResultReasonKeyFormatTypeNotSupported,
+			"object %q is returned as %s, not %s", uid, ttlv.EnumStr(format), ttlv.EnumStr(req.KeyFormatType),
+		)
 	}
 
 	return &payloads.GetResponsePayload{
@@ -190,18 +262,22 @@ func handleGet(ctx context.Context, req *payloads.GetRequestPayload) (*payloads.
 	}, nil
 }
 
-// handleLocate - this operation requests that the server search for one or more Managed Objects,
-// depending on the attributes specified in the request.
+// handleLocate returns the Unique Identifiers of the objects that match the
+// request's attributes. When it returns one identifier, that becomes the ID
+// Placeholder; any other number returned empties it.
 func handleLocate(ctx context.Context, req *payloads.LocateRequestPayload) (*payloads.LocateResponsePayload, error) {
 	c, err := begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO: Storage Status Mask and Object Group Member are skipped initially
-	ids, err := c.locate(ctx, req.Attribute)
-	if err != nil {
-		return nil, mapError(err)
+	// No object is in archival storage, so only a search of on-line storage
+	// can match. Object Group Member is ignored.
+	var ids []string
+	if req.StorageStatusMask == 0 || req.StorageStatusMask&kmiplib.StorageStatusOnlineStorage != 0 {
+		if ids, err = c.locate(ctx, req.Attribute); err != nil {
+			return nil, err
+		}
 	}
 
 	// Total number of matches, reported back via Located Items
@@ -219,30 +295,28 @@ func handleLocate(ctx context.Context, req *payloads.LocateRequestPayload) (*pay
 		ids = ids[:req.MaximumItems]
 	}
 
+	if len(ids) == 1 {
+		kmipserver.SetIdPlaceholder(ctx, ids[0])
+	} else {
+		kmipserver.ClearIdPlaceholder(ctx)
+	}
+
 	return &payloads.LocateResponsePayload{
 		LocatedItems:     &located,
 		UniqueIdentifier: ids,
 	}, nil
 }
 
-// handleGetAttributes requests attributes associated with a ManagedObject. Object specified by it's Unique Identifier
-// and the attributes by their name in the request.
+// handleGetAttributes returns the requested attributes of an object, or all
+// of them when the request names none.
 func handleGetAttributes(ctx context.Context, req *payloads.GetAttributesRequestPayload) (*payloads.GetAttributesResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
 	attrs, err := c.getAttributes(ctx, uid, req.AttributeName)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.GetAttributesResponsePayload{
@@ -253,21 +327,13 @@ func handleGetAttributes(ctx context.Context, req *payloads.GetAttributesRequest
 
 // handleGetAttributeList returns the names of every attribute the object has.
 func handleGetAttributeList(ctx context.Context, req *payloads.GetAttributeListRequestPayload) (*payloads.GetAttributeListResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
 	names, err := c.getAttributeList(ctx, uid)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.GetAttributeListResponsePayload{
@@ -280,15 +346,7 @@ func handleGetAttributeList(ctx context.Context, req *payloads.GetAttributeListR
 // derived from the transit key cannot be added, and Name only as the
 // object's Name already.
 func handleAddAttribute(ctx context.Context, req *payloads.AddAttributeRequestPayload) (*payloads.AddAttributeResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +354,7 @@ func handleAddAttribute(ctx context.Context, req *payloads.AddAttributeRequestPa
 	attr.AttributeIndex = nil
 	idx, err := c.addAttributeAt(ctx, uid, attr)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 	// KMIP lets a response omit the Attribute Index only when it is 0.
 	if idx > 0 {
@@ -312,21 +370,13 @@ func handleAddAttribute(ctx context.Context, req *payloads.AddAttributeRequestPa
 // handleModifyAttribute replaces the value of one attribute instance, with
 // the refusals of AddAttribute, and Name refused.
 func handleModifyAttribute(ctx context.Context, req *payloads.ModifyAttributeRequestPayload) (*payloads.ModifyAttributeResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
 	attr, err := c.modifyAttribute(ctx, uid, req.Attribute)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.ModifyAttributeResponsePayload{
@@ -338,21 +388,13 @@ func handleModifyAttribute(ctx context.Context, req *payloads.ModifyAttributeReq
 // handleDeleteAttribute deletes one attribute instance, with the refusals of
 // ModifyAttribute.
 func handleDeleteAttribute(ctx context.Context, req *payloads.DeleteAttributeRequestPayload) (*payloads.DeleteAttributeResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
 	attr, err := c.deleteAttribute(ctx, uid, req.AttributeName, req.AttributeIndex)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.DeleteAttributeResponsePayload{
@@ -364,133 +406,78 @@ func handleDeleteAttribute(ctx context.Context, req *payloads.DeleteAttributeReq
 // handleRekey replaces a symmetric key with a new object that takes over its
 // Name, and makes the replacement the ID Placeholder.
 func handleRekey(ctx context.Context, req *payloads.RekeyRequestPayload) (*payloads.RekeyResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
 	id, err := c.rekey(ctx, uid, req.Offset, req.TemplateAttribute)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 	kmipserver.SetIdPlaceholder(ctx, id)
 
 	return &payloads.RekeyResponsePayload{UniqueIdentifier: id}, nil
 }
 
-// handleActivate - This operation requests the server to activate a Managed Cryptographic Object.
+// handleActivate makes a Pre-Active object Active.
 func handleActivate(ctx context.Context, req *payloads.ActivateRequestPayload) (*payloads.ActivateResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
 	if err = c.activate(ctx, uid); err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.ActivateResponsePayload{UniqueIdentifier: uid}, nil
 }
 
-// handleRevoke - This operation requests the server to revoke a Managed Cryptographic Object or an Opaque Object.
+// handleRevoke revokes an object with the Revocation Reason of the request.
 func handleRevoke(ctx context.Context, req *payloads.RevokeRequestPayload) (*payloads.RevokeResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
 	if err = c.revoke(ctx, uid, req.RevocationReason, req.CompromiseOccurrenceDate); err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.RevokeResponsePayload{UniqueIdentifier: uid}, nil
 }
 
-// handleDestroy - This operation is used to indicate to the server that
-// the key material for the specified Managed Object SHALL be destroyed.
+// handleDestroy marks an object Destroyed. It soft-deletes the transit key
+// and does not purge it.
 func handleDestroy(ctx context.Context, req *payloads.DestroyRequestPayload) (*payloads.DestroyResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
 	if err = c.destroy(ctx, uid); err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.DestroyResponsePayload{UniqueIdentifier: uid}, nil
 }
 
-// === CRYPTO OPERATIONS === //
-
-// handleEncrypt implement single-part only
+// handleEncrypt encrypts in one part. Multi-part requests are refused.
 func handleEncrypt(ctx context.Context, req *payloads.EncryptRequestPayload) (*payloads.EncryptResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	if len(req.CorrelationValue) > 0 || req.InitIndicator != nil || req.FinalIndicator != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonFeatureNotSupported,
-			"multi-part Encrypt is not supported",
-		)
-	}
-
-	if len(req.Data) == 0 {
-		return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Data (plaintext) is required")
-	}
-	if req.CryptographicParameters != nil {
-		return nil, operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for Encrypt")
-	}
-	if len(req.IVCounterNonce) > 0 {
-		return nil, operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "IVCounterNonce is not supported")
-	}
-	if len(req.AuthenticatedEncryptionAdditionalData) > 0 {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonFeatureNotSupported,
-			"AuthenticatedEncryptionAdditionalData for Encrypt is not supported by this implementation",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseMultiPart("Encrypt", req.CorrelationValue, req.InitIndicator, req.FinalIndicator); err != nil {
+		return nil, err
+	}
+	if len(req.Data) == 0 {
+		return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Data (plaintext) is required")
+	}
+	if err := refuseCipherOptions("Encrypt", req.CryptographicParameters, req.IVCounterNonce, req.AuthenticatedEncryptionAdditionalData); err != nil {
+		return nil, err
+	}
+
 	ct, err := c.encrypt(ctx, uid, req.Data)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.EncryptResponsePayload{
@@ -499,48 +486,25 @@ func handleEncrypt(ctx context.Context, req *payloads.EncryptRequestPayload) (*p
 	}, nil
 }
 
-// handleDecrypt support only single-part Decrypt
+// handleDecrypt decrypts in one part. Multi-part requests are refused.
 func handleDecrypt(ctx context.Context, req *payloads.DecryptRequestPayload) (*payloads.DecryptResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
-	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
-	}
-
-	// Current implementation is single-part only.
-	if len(req.CorrelationValue) > 0 || req.InitIndicator != nil || req.FinalIndicator != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonFeatureNotSupported,
-			"multi-part Decrypt is not supported",
-		)
-	}
-
-	if len(req.Data) == 0 {
-		return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Data (ciphertext) is required")
-	}
-
-	if req.CryptographicParameters != nil {
-		return nil, operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for Decrypt")
-	}
-	if len(req.IVCounterNonce) > 0 {
-		return nil, operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "IVCounterNonce is not supported")
-	}
-	if len(req.AuthenticatedEncryptionAdditionalData) > 0 {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonFeatureNotSupported,
-			"AuthenticatedEncryptionAdditionalData for Decrypt is not supported by this implementation",
-		)
-	}
-
-	c, err := begin(ctx)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseMultiPart("Decrypt", req.CorrelationValue, req.InitIndicator, req.FinalIndicator); err != nil {
+		return nil, err
+	}
+	if len(req.Data) == 0 {
+		return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Data (ciphertext) is required")
+	}
+	if err := refuseCipherOptions("Decrypt", req.CryptographicParameters, req.IVCounterNonce, req.AuthenticatedEncryptionAdditionalData); err != nil {
+		return nil, err
+	}
+
 	pt, err := c.decrypt(ctx, uid, req.Data)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.DecryptResponsePayload{
@@ -550,23 +514,14 @@ func handleDecrypt(ctx context.Context, req *payloads.DecryptRequestPayload) (*p
 }
 
 func handleSign(ctx context.Context, req *payloads.SignRequestPayload) (*payloads.SignResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
+		return nil, err
 	}
-
-	// Current implementation is single-part only.
-	if len(req.CorrelationValue) > 0 || req.InitIndicator != nil || req.FinalIndicator != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonFeatureNotSupported,
-			"multi-part Sign is not supported",
-		)
+	if err := refuseMultiPart("Sign", req.CorrelationValue, req.InitIndicator, req.FinalIndicator); err != nil {
+		return nil, err
 	}
-
-	// Current Implemetation supports only raw data input not DigestedData
+	// Only Data is accepted. DigestedData is not supported.
 	if len(req.Data) == 0 {
 		return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Data (input to sign) is required")
 	}
@@ -574,13 +529,9 @@ func handleSign(ctx context.Context, req *payloads.SignRequestPayload) (*payload
 		return nil, operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for Sign")
 	}
 
-	c, err := begin(ctx)
-	if err != nil {
-		return nil, err
-	}
 	sig, err := c.sign(ctx, uid, req.Data)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	return &payloads.SignResponsePayload{
@@ -590,23 +541,14 @@ func handleSign(ctx context.Context, req *payloads.SignRequestPayload) (*payload
 }
 
 func handleVerify(ctx context.Context, req *payloads.SignatureVerifyRequestPayload) (*payloads.SignatureVerifyResponsePayload, error) {
-	uid, err := kmipserver.GetIdOrPlaceholder(ctx, req.UniqueIdentifier)
+	c, uid, err := beginOn(ctx, req.UniqueIdentifier)
 	if err != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonInvalidField,
-			"UniqueIdentifier omitted and ID Placeholder is empty",
-		)
+		return nil, err
 	}
-
-	// Current implementation is single-part only.
-	if len(req.CorrelationValue) > 0 || req.InitIndicator != nil || req.FinalIndicator != nil {
-		return nil, operationErrorf(
-			kmiplib.ResultReasonFeatureNotSupported,
-			"multi-part SignatureVerify is not supported",
-		)
+	if err := refuseMultiPart("SignatureVerify", req.CorrelationValue, req.InitIndicator, req.FinalIndicator); err != nil {
+		return nil, err
 	}
-
-	// Current Implemetation supports only raw data input not DigestedData
+	// Only Data is accepted. DigestedData is not supported.
 	if len(req.Data) == 0 {
 		return nil, operationErrorf(kmiplib.ResultReasonInvalidField, "Data is required")
 	}
@@ -617,13 +559,9 @@ func handleVerify(ctx context.Context, req *payloads.SignatureVerifyRequestPaylo
 		return nil, operationErrorf(kmiplib.ResultReasonFeatureNotSupported, "CryptographicParameters is not supported for SignatureVerify")
 	}
 
-	c, err := begin(ctx)
-	if err != nil {
-		return nil, err
-	}
 	valid, err := c.verify(ctx, uid, req.Data, req.SignatureData)
 	if err != nil {
-		return nil, mapError(err)
+		return nil, err
 	}
 
 	indicator := kmiplib.ValidityIndicatorInvalid
@@ -635,4 +573,16 @@ func handleVerify(ctx context.Context, req *payloads.SignatureVerifyRequestPaylo
 		UniqueIdentifier:  uid,
 		ValidityIndicator: indicator,
 	}, nil
+}
+
+// templateValue returns the value of the template's first attribute name
+// that has the type T, or the zero value.
+func templateValue[T any](ta kmiplib.TemplateAttribute, name kmiplib.AttributeName) T {
+	for _, attr := range ta.Attribute {
+		if v, ok := attr.AttributeValue.(T); ok && attr.AttributeName == name {
+			return v
+		}
+	}
+	var zero T
+	return zero
 }

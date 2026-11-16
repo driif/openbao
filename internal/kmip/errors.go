@@ -79,11 +79,13 @@ func errWrongState(uid string, state kmiplib.State) error {
 	)
 }
 
-// errSoftDeleted reports an operation that a soft-deleted (Deactivated) key
-// does not allow, with the mapping of errWrongState.
+// errSoftDeleted reports an operation that a soft-deleted key does not
+// allow, with the mapping of errWrongState. Revoke, Destroy and ReKey
+// retention soft-delete a key. Get and the cryptographic operations do not
+// read the record that tells which, so the message names no State.
 func errSoftDeleted(uid string) error {
 	return operationErrorf(
 		kmiplib.ResultReasonPermissionDenied,
-		"wrong key lifecycle state: object %q is Deactivated (soft-deleted in transit)", uid,
+		"wrong key lifecycle state: the key of object %q is soft-deleted in transit", uid,
 	)
 }

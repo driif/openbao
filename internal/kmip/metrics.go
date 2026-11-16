@@ -11,8 +11,9 @@ import (
 	"github.com/openbao/openbao/v2/internal/helper/metricsutil"
 )
 
-// listenerMetrics owns the active certificate set. Closed subjects stop being
-// emitted; Prometheus retains the last sample until its configured expiration.
+// listenerMetrics owns the set of client certificates on open connections.
+// A subject with no open connection is not emitted again; Prometheus keeps
+// its last sample until the configured retention expires.
 type listenerMetrics struct {
 	sink        *metricsutil.ClusterMetricSink
 	address     string
@@ -38,7 +39,7 @@ func (m *listenerMetrics) operation(operation, outcome, errorReason string, star
 	m.counter("operations", op, metricsutil.Label{Name: "outcome", Value: outcome})
 	m.sink.MeasureSinceWithLabels([]string{"kmip", "operation_duration"}, started, m.labels(op))
 	if outcome != "success" {
-		m.counter("errors", metricsutil.Label{Name: "reason", Value: errorReason})
+		m.counter("errors", reasonLabel(errorReason))
 	}
 }
 

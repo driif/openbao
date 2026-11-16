@@ -99,7 +99,7 @@ func testMetadataBackupRestoreDelete(t *testing.T, lm *LockManager) {
 	// Restoring under a new name restores no record: the record describes
 	// the key it was backed up from, and would attach that key's relations
 	// to another one.
-	require.NoError(t, lm.RestorePolicy(ctx, storage, "meta-copy", backup, false))
+	require.NoError(t, lm.RestorePolicy(ctx, storage, "meta-copy", backup, false, nil))
 	require.Nil(t, loadMetadata("meta-copy"))
 
 	// Deleting the key deletes its record.
@@ -108,7 +108,7 @@ func testMetadataBackupRestoreDelete(t *testing.T, lm *LockManager) {
 	require.NoError(t, lm.DeletePolicy(ctx, storage, "meta"))
 	require.Nil(t, loadMetadata("meta"))
 
-	require.NoError(t, lm.RestorePolicy(ctx, storage, "", backup, false))
+	require.NoError(t, lm.RestorePolicy(ctx, storage, "", backup, false, nil))
 	require.Equal(t, uint64(4), loadMetadata("meta").Version)
 	require.Equal(t, record.Data, loadMetadata("meta").Data)
 
@@ -123,22 +123,22 @@ func testMetadataBackupRestoreDelete(t *testing.T, lm *LockManager) {
 	// A backup without the field, such as one taken before metadata
 	// existed, writes no record, and a forced restore of it keeps the
 	// record already there.
-	require.NoError(t, lm.RestorePolicy(ctx, storage, "legacy", withoutMetadata(backup), false))
+	require.NoError(t, lm.RestorePolicy(ctx, storage, "legacy", withoutMetadata(backup), false, nil))
 	require.Nil(t, loadMetadata("legacy"))
-	require.NoError(t, lm.RestorePolicy(ctx, storage, "", withoutMetadata(backup), true))
+	require.NoError(t, lm.RestorePolicy(ctx, storage, "", withoutMetadata(backup), true, nil))
 	require.Equal(t, &MetadataRecord{Version: 4, Data: record.Data}, loadMetadata("meta"))
 
 	// A forced restore under the backup's own name replaces the record
 	// above both the existing version and the backup version.
 	other := &MetadataRecord{Version: 9, Data: map[string]string{"other": "9"}}
 	require.NoError(t, (&Policy{Name: "meta"}).StoreMetadata(ctx, storage, other))
-	require.NoError(t, lm.RestorePolicy(ctx, storage, "", backup, true))
+	require.NoError(t, lm.RestorePolicy(ctx, storage, "", backup, true, nil))
 	require.Equal(t, uint64(10), loadMetadata("meta").Version)
 	require.Equal(t, record.Data, loadMetadata("meta").Data)
 
 	// A forced restore under a new name leaves the target's record alone.
 	require.NoError(t, (&Policy{Name: "legacy"}).StoreMetadata(ctx, storage, other))
-	require.NoError(t, lm.RestorePolicy(ctx, storage, "legacy", backup, true))
+	require.NoError(t, lm.RestorePolicy(ctx, storage, "legacy", backup, true, nil))
 	require.Equal(t, other, loadMetadata("legacy"))
 }
 
@@ -209,7 +209,7 @@ func TestLockManager_RestoreRejectedKeepsMetadata(t *testing.T) {
 	raw, err = json.Marshal(fields)
 	require.NoError(t, err)
 
-	err = lm.RestorePolicy(ctx, storage, "target", base64.StdEncoding.EncodeToString(raw), true)
+	err = lm.RestorePolicy(ctx, storage, "target", base64.StdEncoding.EncodeToString(raw), true, nil)
 	require.Error(t, err)
 
 	got, err := (&Policy{Name: "target"}).LoadMetadata(ctx, storage)
@@ -234,7 +234,7 @@ func TestLockManager_RestoreEmptyMetadata(t *testing.T) {
 		require.NoError(t, err)
 		for _, version := range []uint64{3, 20} {
 			require.NoError(t, p.StoreMetadata(t.Context(), storage, &MetadataRecord{Version: version, Data: map[string]string{"x": "y"}}))
-			require.NoError(t, lm.RestorePolicy(t.Context(), storage, "", backup, true))
+			require.NoError(t, lm.RestorePolicy(t.Context(), storage, "", backup, true, nil))
 			record, err := p.LoadMetadata(t.Context(), storage)
 			require.NoError(t, err)
 			require.NotNil(t, record)
@@ -242,7 +242,7 @@ func TestLockManager_RestoreEmptyMetadata(t *testing.T) {
 			require.Equal(t, max(uint64(7), version)+1, record.Version)
 		}
 		require.NoError(t, p.StoreMetadata(t.Context(), storage, &MetadataRecord{Version: math.MaxUint64}))
-		require.ErrorContains(t, lm.RestorePolicy(t.Context(), storage, "", backup, true), "version overflow")
+		require.ErrorContains(t, lm.RestorePolicy(t.Context(), storage, "", backup, true, nil), "version overflow")
 	}
 }
 
@@ -311,7 +311,7 @@ func TestLockManager_RestoreMetadataConcurrentWriter(t *testing.T) {
 			<-writerStarted
 		})
 	}
-	require.NoError(t, lm.RestorePolicy(t.Context(), s, "", backup, true))
+	require.NoError(t, lm.RestorePolicy(t.Context(), s, "", backup, true, nil))
 	require.NoError(t, <-writerDone)
 	record, err := p.LoadMetadata(t.Context(), s)
 	require.NoError(t, err)
@@ -341,7 +341,7 @@ func TestLockManager_RestoreKeepsPolicyMutex(t *testing.T) {
 
 	backup, err := lm.BackupPolicy(ctx, storage, "k")
 	require.NoError(t, err)
-	require.NoError(t, lm.RestorePolicy(ctx, storage, "k", backup, true))
+	require.NoError(t, lm.RestorePolicy(ctx, storage, "k", backup, true, nil))
 
 	restored, _, err := lm.GetPolicy(ctx, PolicyRequest{Storage: storage, Name: "k"}, rand.Reader)
 	require.NoError(t, err)

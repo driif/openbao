@@ -114,8 +114,9 @@ role changes.
 
 OpenBao answers an expired token and a policy denial with the same error. When
 a request is denied, the listener therefore logs in again and retries the
-request once, so a denied operation is audited twice, with a new login in
-between.
+request, once per KMIP operation, so a denied operation is audited twice, with
+a new login in between. A Locate without an exact Name or Unique Identifier
+reads every key in the mount; a denied read there is not retried.
 
 The listener answers Query and DiscoverVersions itself, without logging in.
 
@@ -151,6 +152,13 @@ DiscoverVersions, with these key types:
   imports it.
 - Get returns the material of the key's latest version: a Raw SymmetricKey for
   AES, ChaCha20, and HMAC keys, and a PKCS#8 PrivateKey for RSA and ECDSA keys.
+  The key is never wrapped or compressed. Get refuses a Key Wrapping
+  Specification with Feature Not Supported, and a Key Format Type or Key
+  Compression Type other than the one it returns with Key Format Type Not
+  Supported or Key Compression Type Not Supported.
+- Create, Register, and ReKey set the ID Placeholder to the new object. A
+  Locate that returns one object sets it to that object; a Locate that returns
+  any other number empties it.
 - Activate, Revoke, and Destroy follow the KMIP lifecycle; see
   [Lifecycle](#lifecycle). Destroy never deletes the transit key.
 - Encrypt, Decrypt, Sign, and SignatureVerify are single-part only and accept
@@ -163,6 +171,17 @@ DiscoverVersions, with these key types:
   Any other filter lists the mount and reads every key, one read per key, plus
   the comparison of each filter attribute with the key's attributes. There is
   no attribute index, so the cost grows with the number of keys in the mount.
+- Locate leaves out an object whose key is soft-deleted: a revoked or
+  destroyed object, or a generation that ReKey retention retired. Such an
+  object is returned only when the request names its State. This follows KMIP
+  2.x, where a Locate returns no destroyed object unless the request asks for
+  destroyed storage; KMIP 1.4 leaves it open. A client that locates every
+  object and then gets each one therefore meets no revoked or destroyed
+  object. Get still needs an exportable key and `read` on
+  `<mount>/export/*`.
+- A Cryptographic Usage Mask in a Locate matches an object whose mask has
+  every requested bit. No object is in archival storage, so a Storage Status
+  Mask without On-line Storage matches nothing.
 
 ### Attributes
 
@@ -201,19 +220,15 @@ ReKey replacement that is still being created, as AddAttribute does.
 Create and Register store the stored attributes of their template, by the
 rules a ReKey template follows. A template with none, such as only
 Cryptographic Algorithm, Cryptographic Length, and Name, sends no metadata
-request. If that write fails, transit has already made the key, and the
-operation fails with General Failure, naming the key. Transit answers a create
-of an existing key with that key, so the listener soft-deletes the key, best
-effort, only when no other client can hold it: after a Register, since
-transit's import refuses an existing key, and after a Create without a Name,
-whose generated name is a fresh UUID. A Create with a Name leaves the key
-Active without its attributes, because another client can create the same
-Name between the listener's read and its create, and both then hold the one
-key. If the soft-delete fails, the key also stays Active, and the error says
-so. Create with stored attributes reads the key first and refuses one that
-exists, including a soft-deleted one, and a template write refuses a record
-that already holds KMIP entries. A retry with the same Name therefore fails
-until an operator restores, purges, or keeps the key.
+request. A Create or Register with the Name of an existing key, including a
+soft-deleted one, fails with Invalid Field, as KMIP 1.4 requires: transit
+refuses an import over an existing key and marks a create of one with a
+warning. So a key that a Create or Register made is its own. If the template
+write then fails, the operation fails with General Failure, naming the key,
+and the listener soft-deletes the key, best effort. If the soft-delete fails
+too, the key stays Active without its attributes, and the error says so. A
+template write refuses a record that already holds KMIP entries. A retry with
+the same Name fails until an operator restores, purges, or keeps the key.
 
 Single-instance attributes, such as Cryptographic Usage Mask and the dates,
 take one value: a second AddAttribute with a different value fails. The record
@@ -243,8 +258,8 @@ record. They are not attributes, and only Revoke and Destroy set them. The
 dates change only the reported State: Encrypt, Decrypt, Sign, and
 SignatureVerify read neither, and a key past its Deactivation Date still
 works until it is soft-deleted. A refusal for the wrong State fails with
-Permission Denied and a message that names the State, since KMIP 1.x has no
-Wrong Key Lifecycle State reason.
+Permission Denied and a message that names the State, or says that the key is
+soft-deleted, since KMIP 1.x has no Wrong Key Lifecycle State reason.
 
 - **Create and Register** make an Active object, unless the template holds an
   Activation Date in the future: the object is then Pre-Active until that date
@@ -257,15 +272,18 @@ Wrong Key Lifecycle State reason.
   mark, the Compromise Date (now), and the Compromise Occurrence Date: the
   request's, or else the Initial Date. A second compromise Revoke keeps the
   first dates. Any other reason sets the Deactivation Date to now, unless one
-  at or before now is stored. Both store the Revocation Reason, then
-  soft-delete the key, so transit refuses it for every cryptographic
-  operation. Revoke refuses a Destroyed object; a Revoke with a reason other
-  than a compromise also refuses a Pre-Active or Compromised object, as KMIP
-  1.4 has no such transition. Revoke writes the record first: if the
-  soft-delete then fails, the object already reports Compromised or
-  Deactivated, and a retry soft-deletes the key and keeps the first dates.
-- **Destroy** is soft. It refuses an Active object and succeeds without a
-  write on a Destroyed one. On a Pre-Active, Deactivated, or Compromised object
+  at or before now is stored. Both store the Revocation Reason. Revoke
+  refuses a Destroyed object; a Revoke with a reason other than a compromise
+  also refuses a Pre-Active or Compromised object, as KMIP 1.4 has no such
+  transition. Revoke soft-deletes the key first, so transit refuses it for
+  every cryptographic operation, then writes the record. It sends the
+  soft-delete for a key that is soft-deleted already, so `delete` on
+  `<mount>/keys/<name>/soft-delete` is the permission to Revoke: without it a
+  Revoke changes nothing. If the record write fails after the soft-delete, the
+  object reports Deactivated without a Revocation Reason, and a retry
+  finishes the Revoke.
+- **Destroy** is soft. It refuses an Active object and, as KMIP 1.4 requires,
+  a Destroyed one. On a Pre-Active, Deactivated, or Compromised object
   it soft-deletes the key unless it is soft-deleted already, then sets the
   destroy mark and the Destroy Date. It never deletes the key, so
   `deletion_allowed` has no effect on it. The soft-delete goes first, so Get
@@ -299,8 +317,8 @@ the lookup. If a concurrent ReKey moves it, Locate resolves the anchor again.
   reports State Deactivated. It is not soft-deleted, so Get still returns its
   material until retention removes it.
 - ReKey sets the ID Placeholder to the replacement.
-- ReKey refuses an Offset, a Compromised or Destroyed object, a key it already
-  replaced, a soft-deleted key, and a template that changes the Name,
+- ReKey refuses a non-zero Offset, a Compromised or Destroyed object, a key it
+  already replaced, a soft-deleted key, and a template that changes the Name,
   algorithm, length, or object type, or that carries any other derived or
   server-set attribute, even one equal to the key's own.
 
@@ -344,11 +362,10 @@ With `<mount>` the transit mount, the operations need:
 
 | Operation               | Method   | Path                                     | Capability                                  |
 | :---------------------- | :------- | :--------------------------------------- | :------------------------------------------ |
-| Create                  | `GET`    | `<mount>/keys/<name>`                    | `read` (a template with stored attributes)  |
-|                         | `POST`   | `<mount>/keys/<name>`                    | `update`                                    |
+| Create                  | `POST`   | `<mount>/keys/<name>`                    | `update`                                    |
 |                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (a template with stored attributes)  |
 |                         | `POST`   | `<mount>/keys/<name>/metadata`           | `update` (a template with stored attributes) |
-|                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (that write failed, no Name given) |
+|                         | `DELETE` | `<mount>/keys/<name>/soft-delete`        | `delete` (that write failed)                |
 | Register                | `GET`    | `<mount>/wrapping_key`                   | `read`                                      |
 |                         | `POST`   | `<mount>/keys/<name>/import`             | `update`                                    |
 |                         | `GET`    | `<mount>/keys/<name>/metadata`           | `read` (a template with stored attributes)  |
@@ -404,13 +421,11 @@ When writing a policy, keep in mind:
 - **Revoke and Destroy need the soft-delete path and the metadata.** Both
   read `<mount>/keys/<name>`, read and update its metadata, and delete
   `<mount>/keys/<name>/soft-delete`. Neither sends a `DELETE` to
-  `<mount>/keys/<name>`, so `delete` on that path is no longer needed. Denying
+  `<mount>/keys/<name>`. Denying
   `delete` on `<mount>/keys/<name>/soft-delete` denies Revoke and Destroy: each
-  fails at the soft-delete, which Destroy skips only for a key soft-deleted
-  already. Revoke has written the record by then, so the object reports
-  Compromised or Deactivated while transit still serves the key. Activate
-  reads the metadata, and updates it for a Pre-Active object. Policies with
-  exact grants for these operations need the new paths.
+  fails at the soft-delete, before it writes the record. Destroy skips the
+  soft-delete only for a key that is soft-deleted already. Activate reads the
+  metadata, and updates it for a Pre-Active object.
 
 - **Grant `update`, not `create`, on `<mount>/encrypt/*`.** Transit's encrypt
   endpoint creates a missing key for a caller that holds `create`, so that
@@ -538,6 +553,14 @@ If request auditing fails, no item executes. If response auditing fails, the
 client receives General Failure and the operation may already have completed.
 Inspect transit records before retrying a write. A sealed store refuses every
 operation with a sealed message. Unsealing restores service on the same listener.
+
+## Server log
+
+The listener writes to the server log under the name `kmip`, with the
+server's `log_level` and `log_format`. Connection events, such as a new or a
+closed connection and a client that resets it, are logged at the debug level.
+Each KMIP operation and each refusal is in the audit log, not in the server
+log.
 
 ## Metrics and alerts
 

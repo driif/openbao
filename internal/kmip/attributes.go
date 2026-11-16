@@ -79,8 +79,6 @@ func linkOp(entry, uid string) metadataOp {
 }
 
 // replaceOps sets entry to exactly values: a delete, then an add per value.
-// Repeating them leaves the same entry, so an interrupted write is safe to
-// write again.
 func replaceOps(entry string, values ...string) []metadataOp {
 	ops := []metadataOp{deleteOp(entry)}
 	for _, v := range values {
@@ -208,8 +206,6 @@ func (c *call) loadMetadata(ctx context.Context, uid string, info *keyInfo, opti
 	return err == nil, err
 }
 
-// writeMetadata applies ops with a version check. A concurrent writer makes
-// the adapter read and apply again, preserving unrelated custom metadata.
 // Bounds on writeMetadata's retries after a lost check-and-set.
 const (
 	metadataWriteAttempts = 8
@@ -217,6 +213,8 @@ const (
 	metadataBackoffMax    = 100 * time.Millisecond
 )
 
+// writeMetadata applies ops with a version check. A concurrent writer makes
+// it read and apply again, preserving unrelated custom metadata.
 func (c *call) writeMetadata(ctx context.Context, uid string, ops ...metadataOp) (*reply, error) {
 	return c.writeMetadataFunc(ctx, uid, func(record metadataRecord) error {
 		for _, op := range ops {
@@ -324,12 +322,13 @@ var rekeyLinks = []kmiplib.LinkType{kmiplib.LinkTypeReplacementObjectLink, kmipl
 type attrClass int
 
 const (
-	// attrStored attributes are kept verbatim and returned; they change
-	// nothing.
+	// attrStored attributes are kept verbatim and returned. Only Activation
+	// Date and Deactivation Date have an effect: the reported State.
 	attrStored attrClass = iota
-	// attrDerived attributes are read from the transit key.
+	// attrDerived attributes are computed from the transit key and the
+	// record.
 	attrDerived
-	// attrHonoured attributes are stored and change behaviour.
+	// attrHonoured is Name: the UID of the object's first generation.
 	attrHonoured
 	// attrServerSet attributes are stored by Revoke and Destroy only.
 	attrServerSet
@@ -462,8 +461,8 @@ func objectAttrs(uid string, info *keyInfo) ([]kmiplib.Attribute, error) {
 
 	if created, ok := info.initialDate(); ok {
 		attrs = append(attrs, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameInitialDate, AttributeValue: created})
-		// State=Active is only consistent with an ActivationDate set → supply
-		// it, unless the client stored its own.
+		// An Active object must have an Activation Date: report the creation
+		// time unless the client stored one.
 		if len(info.entry(attrEntry(kmiplib.AttributeNameActivationDate))) == 0 {
 			attrs = append(attrs, kmiplib.Attribute{AttributeName: kmiplib.AttributeNameActivationDate, AttributeValue: created})
 		}
@@ -909,10 +908,9 @@ func templateEntries(uid string, info *keyInfo, template *kmiplib.TemplateAttrib
 	)
 }
 
-// newObjectEntries sorts the attributes of a Create or Register template,
-// by the rules of templateEntries: the object's Name, and the algorithm,
-// length and object type the operation makes, are accepted and change
-// nothing; any other value of them is refused.
+// newObjectEntries sorts the attributes of a Create or Register template by
+// the rules of templateEntries, against the Name, algorithm, length and
+// object type that the operation makes.
 func newObjectEntries(op, name string, alg kmiplib.CryptographicAlgorithm, bitlen int32, keyType string, keySize int, template *kmiplib.TemplateAttribute) (map[string][]string, error) {
 	if template == nil {
 		return map[string][]string{}, nil

@@ -357,6 +357,73 @@ func TestTranslator_LoginFailure(t *testing.T) {
 	require.Len(t, bao.all(), 1)
 }
 
+// Only a refusal of the certificate is Permission Denied. A redirect from a
+// standby or a rate limit says nothing about the client, so a client must
+// not read it as a final denial.
+func TestTranslator_LoginFailureReason(t *testing.T) {
+	for status, want := range map[int]kmiplib.ResultReason{
+		http.StatusBadRequest:         kmiplib.ResultReasonPermissionDenied,
+		http.StatusForbidden:          kmiplib.ResultReasonPermissionDenied,
+		http.StatusTemporaryRedirect:  kmiplib.ResultReasonGeneralFailure,
+		http.StatusTooManyRequests:    kmiplib.ResultReasonGeneralFailure,
+		http.StatusServiceUnavailable: kmiplib.ResultReasonGeneralFailure,
+	} {
+		bao := newFakeBao(t)
+		bao.route(http.MethodPost, testLoginPath, respond(status, withErrors("refused")))
+		ctx, _ := newTestSession(t, bao, Config{})
+
+		_, err := op(t, ctx).readKey(ctx, "k")
+		e, ok := errors.AsType[operationError](err)
+		require.True(t, ok, "status %d: %v", status, err)
+		require.Equal(t, want, e.detail.Reason, "status %d", status)
+	}
+}
+
+// Transit refuses to use a soft-deleted key. That is the object's State, not
+// a fault in the request.
+func TestTranslator_CryptoOnRevokedObject(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	m.createKey("app-a")
+	ct, err := op(t, ctx).encrypt(ctx, "app-a", []byte("data"))
+	require.NoError(t, err)
+	require.NoError(t, op(t, ctx).revoke(ctx, "app-a", unspecified, nil))
+
+	_, err = op(t, ctx).encrypt(ctx, "app-a", []byte("data"))
+	require.ErrorContains(t, err, `wrong key lifecycle state: the key of object "app-a" is soft-deleted in transit`)
+	_, err = op(t, ctx).decrypt(ctx, "app-a", ct)
+	require.ErrorContains(t, err, `wrong key lifecycle state: the key of object "app-a" is soft-deleted in transit`)
+}
+
+// A Locate by Cryptographic Usage Mask matches an object whose mask has
+// every requested bit; the object may have more.
+func TestTranslator_LocateByUsageMask(t *testing.T) {
+	bao, _ := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	mask := func(m kmiplib.CryptographicUsageMask) kmiplib.Attribute {
+		return kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: m}
+	}
+	_, err := op(t, ctx).create(ctx, "app-both", kmiplib.CryptographicAlgorithmAES, 256,
+		templateOf(mask(kmiplib.CryptographicUsageEncrypt|kmiplib.CryptographicUsageDecrypt)))
+	require.NoError(t, err)
+	_, err = op(t, ctx).create(ctx, "app-enc", kmiplib.CryptographicAlgorithmAES, 256,
+		templateOf(mask(kmiplib.CryptographicUsageEncrypt)))
+	require.NoError(t, err)
+
+	for name, tc := range map[string]struct {
+		mask kmiplib.CryptographicUsageMask
+		want []string
+	}{
+		"subset": {kmiplib.CryptographicUsageEncrypt, []string{"app-both", "app-enc"}},
+		"equal":  {kmiplib.CryptographicUsageEncrypt | kmiplib.CryptographicUsageDecrypt, []string{"app-both"}},
+		"more":   {kmiplib.CryptographicUsageEncrypt | kmiplib.CryptographicUsageSign, nil},
+	} {
+		ids, err := op(t, ctx).locate(ctx, []kmiplib.Attribute{mask(tc.mask)})
+		require.NoError(t, err, name)
+		require.ElementsMatch(t, tc.want, ids, name)
+	}
+}
+
 func TestTranslator_RetriesOnceAfterForbidden(t *testing.T) {
 	bao := newFakeBao(t)
 	bao.route(http.MethodGet, "transit/keys/k", respond(http.StatusForbidden, withErrors("permission denied")))
@@ -701,14 +768,12 @@ func TestHandleLocate_Pages(t *testing.T) {
 	bao := newLocateBao(t)
 	ctx, _ := newTestSession(t, bao, Config{})
 
-	resp, err := handleLocate(ctx, &payloads.LocateRequestPayload{OffsetItems: 1, MaximumItems: 1})
-	require.NoError(t, err)
+	resp := locateBatch(t, ctx, &payloads.LocateRequestPayload{OffsetItems: 1, MaximumItems: 1})
 	require.Equal(t, []string{"rsa"}, resp.UniqueIdentifier)
 	require.NotNil(t, resp.LocatedItems)
 	require.Equal(t, int32(3), *resp.LocatedItems)
 
-	resp, err = handleLocate(ctx, &payloads.LocateRequestPayload{OffsetItems: 5})
-	require.NoError(t, err)
+	resp = locateBatch(t, ctx, &payloads.LocateRequestPayload{OffsetItems: 5})
 	require.Empty(t, resp.UniqueIdentifier)
 	require.Equal(t, int32(3), *resp.LocatedItems)
 }
@@ -723,13 +788,13 @@ func TestTranslator_Lifecycle(t *testing.T) {
 	require.NoError(t, op(t, ctx).activate(ctx, "active"))
 	require.Equal(t, []string{"GET transit/keys/active", "GET transit/keys/active/metadata"}, since(bao, start))
 
-	// Revoke writes the record, then soft-deletes the key.
+	// Revoke soft-deletes the key, then writes the record.
 	start = len(bao.all())
 	require.NoError(t, op(t, ctx).revoke(ctx, "active", unspecified, nil))
 	require.Equal(t, []string{
 		"GET transit/keys/active", "GET transit/keys/active/metadata",
-		"GET transit/keys/active/metadata", "POST transit/keys/active/metadata",
 		"DELETE transit/keys/active/soft-delete",
+		"GET transit/keys/active/metadata", "POST transit/keys/active/metadata",
 	}, since(bao, start))
 	require.True(t, m.key("active").SoftDeleted)
 	requireReason(t, op(t, ctx).activate(ctx, "active"), kmiplib.ResultReasonPermissionDenied, "wrong key lifecycle state")
@@ -756,7 +821,7 @@ func TestHandleQuery_AnsweredLocally(t *testing.T) {
 
 	resp, err := handleQuery(ctx, &payloads.QueryRequestPayload{})
 	require.NoError(t, err)
-	require.ElementsMatch(t, SupportedOperations, resp.Operations)
+	require.Equal(t, supportedOperations(), resp.Operations)
 	require.NotEmpty(t, resp.VendorIdentification)
 	require.Empty(t, bao.all())
 }
@@ -1362,7 +1427,7 @@ func TestTranslator_UsageMaskIsNotEnforced(t *testing.T) {
 	// A revoked key is refused by transit itself.
 	require.NoError(t, op(t, ctx).revoke(ctx, "app-a", unspecified, nil))
 	_, err = op(t, ctx).encrypt(ctx, "app-a", []byte("refused"))
-	require.ErrorContains(t, err, "invalid request")
+	require.ErrorContains(t, err, "soft-deleted in transit")
 }
 
 // The crypto operations send one request each, as before attributes
@@ -1772,20 +1837,22 @@ func TestTranslator_RekeySuccessorExists(t *testing.T) {
 	})
 }
 
-// Transit answers a create of an existing key with that key and no
-// warning: backend.go getPolicy reports every policy as upserted. ReKey
-// therefore detects an existing successor by reading it, never by the
-// warning.
-func TestTranslator_TransitCreateOfExistingKeyHasNoWarning(t *testing.T) {
-	_, m := transitBao(t)
-	m.createKey("dup")
-	status, raw := m.do(http.MethodPost, "keys/dup", map[string]any{"type": "aes256-gcm96"})
-	require.Equal(t, http.StatusOK, status)
-	var out struct {
-		Warnings []string `json:"warnings"`
-	}
-	require.NoError(t, json.Unmarshal(raw, &out))
-	require.Empty(t, out.Warnings)
+// Transit answers a create of an existing key with that key and a warning.
+// KMIP Create must make a new object, so a Create with the Name of an
+// existing object fails, with or without stored attributes in its template.
+func TestTranslator_CreateOfExistingNameFails(t *testing.T) {
+	bao, m := transitBao(t)
+	ctx, _ := newTestSession(t, bao, Config{})
+	_, err := op(t, ctx).create(ctx, "dup", kmiplib.CryptographicAlgorithmAES, 256, nil)
+	require.NoError(t, err)
+	before := m.key("dup")
+
+	_, err = op(t, ctx).create(ctx, "dup", kmiplib.CryptographicAlgorithmAES, 256, nil)
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, `key "dup" already exists`)
+	_, err = op(t, ctx).create(ctx, "dup", kmiplib.CryptographicAlgorithmAES, 256, templateOf(customAttr("x-tag", "blue")))
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, `key "dup" already exists`)
+	require.Equal(t, before, m.key("dup"))
+	require.Empty(t, m.record("dup"))
 }
 
 // A ReKey interrupted at any step completes when the client retries it,
@@ -2811,7 +2878,7 @@ func TestTranslator_CreateTemplate(t *testing.T) {
 	))
 	require.NoError(t, err)
 	require.Equal(t, []string{
-		"GET transit/keys/app-a", "POST transit/keys/app-a",
+		"POST transit/keys/app-a",
 		"GET transit/keys/app-a/metadata", "POST transit/keys/app-a/metadata",
 	}, since(bao, start))
 	attrs, err := op(t, ctx).getAttributes(ctx, "app-a", nil)
@@ -2880,7 +2947,8 @@ func TestTranslator_CreateTemplateRefusals(t *testing.T) {
 }
 
 // A Create whose metadata write fails after transit made the key does not
-// report success: it soft-deletes the key and names it in the error.
+// report success: it soft-deletes the key and names it in the error. Only
+// this Create made the key, with a client's Name or a generated one.
 func TestTranslator_CreateTemplateWriteFails(t *testing.T) {
 	mask := templateOf(kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageEncrypt})
 	denied := respond(http.StatusForbidden, withErrors("permission denied"))
@@ -2888,18 +2956,15 @@ func TestTranslator_CreateTemplateWriteFails(t *testing.T) {
 		return r.method == http.MethodPost && strings.HasSuffix(r.path, "/metadata")
 	}
 
-	// A Create with a Name cannot prove that no other client holds the key,
-	// so a failed write fails the Create and leaves the key alone.
 	t.Run("named, write denied", func(t *testing.T) {
 		bao, m := transitBao(t)
 		bao.route(http.MethodPost, "transit/keys/app-a/metadata", denied)
 		ctx, _ := newTestSession(t, bao, Config{})
 
 		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
-		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `Create made the key "app-a" but could not store its template attributes; the key was left in place`)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `Create made the key "app-a" but could not store its template attributes, so the key was soft-deleted`)
 		require.ErrorContains(t, err, `POST transit/keys/app-a/metadata requires the "update" capability`)
-		require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
-		require.False(t, m.key("app-a").SoftDeleted)
+		require.True(t, m.key("app-a").SoftDeleted)
 	})
 
 	t.Run("named, metadata read denied", func(t *testing.T) {
@@ -2908,10 +2973,9 @@ func TestTranslator_CreateTemplateWriteFails(t *testing.T) {
 		ctx, _ := newTestSession(t, bao, Config{})
 
 		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
-		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `the key was left in place`)
+		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `so the key was soft-deleted`)
 		require.ErrorContains(t, err, `GET transit/keys/app-a/metadata requires the "read" capability`)
-		require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
-		require.False(t, m.key("app-a").SoftDeleted)
+		require.True(t, m.key("app-a").SoftDeleted)
 	})
 
 	t.Run("named, write fails, then retry", func(t *testing.T) {
@@ -2921,22 +2985,20 @@ func TestTranslator_CreateTemplateWriteFails(t *testing.T) {
 
 		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
 		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, "status 500")
-		require.False(t, m.key("app-a").SoftDeleted)
+		require.True(t, m.key("app-a").SoftDeleted)
 
 		// A retry finds the key and does not take it for new.
 		start := len(bao.all())
 		_, err = op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
-		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `key "app-a" already exists`)
-		require.Equal(t, []string{"GET transit/keys/app-a"}, since(bao, start))
+		requireReason(t, err, kmiplib.ResultReasonInvalidField, `key "app-a" already exists`)
+		require.Equal(t, []string{"POST transit/keys/app-a"}, since(bao, start))
 		require.Empty(t, m.record("app-a"))
 	})
 
-	// Another client creates the same Name between Create's key read and
-	// its create, so transit hands both the one key. Create's failed write
-	// must not soft-delete the other client's key.
+	// Another client creates the same Name first. Transit marks the second
+	// create, so this Create fails and does not touch the other client's key.
 	t.Run("named, key created concurrently", func(t *testing.T) {
 		bao, m := transitBao(t)
-		bao.route(http.MethodPost, "transit/keys/app-a/metadata", denied)
 		ctx, _ := newTestSession(t, bao, Config{})
 		var once sync.Once
 		m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
@@ -2947,13 +3009,12 @@ func TestTranslator_CreateTemplateWriteFails(t *testing.T) {
 		}
 
 		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
-		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `the key was left in place`)
+		requireReason(t, err, kmiplib.ResultReasonInvalidField, `key "app-a" already exists`)
+		require.Empty(t, bao.sent(http.MethodPost, "transit/keys/app-a/metadata"))
 		require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
 		require.False(t, m.key("app-a").SoftDeleted)
 	})
 
-	// A generated name is a fresh UUID: no other client holds the key, so a
-	// failed write soft-deletes it.
 	t.Run("generated name, write fails", func(t *testing.T) {
 		bao, m := transitBao(t)
 		ctx, _ := newTestSession(t, bao, Config{})
@@ -2986,24 +3047,11 @@ func TestTranslator_CreateTemplateWriteFails(t *testing.T) {
 		require.Len(t, m.keys(), 1)
 		require.False(t, m.key(m.keys()[0]).SoftDeleted)
 	})
-
-	// Without the key read, nothing proves the key new: Create fails before
-	// transit makes it.
-	t.Run("key read denied", func(t *testing.T) {
-		bao, m := transitBao(t)
-		bao.route(http.MethodGet, "transit/keys/app-a", denied)
-		ctx, _ := newTestSession(t, bao, Config{})
-
-		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
-		requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `GET transit/keys/app-a requires the "read" capability`)
-		require.Empty(t, bao.sent(http.MethodPost, "transit/keys/app-a"))
-		require.Nil(t, m.key("app-a"))
-	})
 }
 
-// Transit answers a create of an existing key with that key. A Create or
-// Register with stored attributes refuses an existing key before it writes,
-// whatever metadata grant the client holds, and never soft-deletes it.
+// A Create or Register with the Name of an existing key fails with Invalid
+// Field, whatever metadata grant the client holds. It writes no record and
+// never soft-deletes the key.
 func TestTranslator_CreateTemplateKeepsExistingKey(t *testing.T) {
 	mask := templateOf(kmiplib.Attribute{AttributeName: kmiplib.AttributeNameCryptographicUsageMask, AttributeValue: kmiplib.CryptographicUsageEncrypt})
 	denied := respond(http.StatusForbidden, withErrors("permission denied"))
@@ -3025,8 +3073,8 @@ func TestTranslator_CreateTemplateKeepsExistingKey(t *testing.T) {
 
 			start := len(bao.all())
 			_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
-			requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `key "app-a" already exists`)
-			require.Equal(t, []string{"GET transit/keys/app-a"}, since(bao, start))
+			requireReason(t, err, kmiplib.ResultReasonInvalidField, `key "app-a" already exists`)
+			require.Equal(t, []string{"POST transit/keys/app-a"}, since(bao, start))
 			require.False(t, m.key("app-a").SoftDeleted)
 			require.Empty(t, m.record("app-a"))
 		})
@@ -3038,7 +3086,7 @@ func TestTranslator_CreateTemplateKeepsExistingKey(t *testing.T) {
 			ctx, _ := newTestSession(t, bao, Config{})
 
 			_, err := op(t, ctx).register(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, make([]byte, 32), mask)
-			require.ErrorContains(t, err, "status 500")
+			requireReason(t, err, kmiplib.ResultReasonInvalidField, `key "app-a" already exists`)
 			require.Empty(t, bao.sent(http.MethodGet, "transit/keys/app-a/metadata"))
 			require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
 			require.False(t, m.key("app-a").SoftDeleted)
@@ -3046,16 +3094,15 @@ func TestTranslator_CreateTemplateKeepsExistingKey(t *testing.T) {
 		})
 	}
 
-	// A KMIP object made between Create's key read and its create shows in
-	// the record: Create fails and leaves the object alone.
-	t.Run("object made after the key read", func(t *testing.T) {
+	// Another client writes KMIP entries to the key after this Create made
+	// it: Create fails and leaves the key and the record alone.
+	t.Run("record written after the create", func(t *testing.T) {
 		bao, m := transitBao(t)
 		ctx, _ := newTestSession(t, bao, Config{})
 		var once sync.Once
 		m.intercept = func(r fakeRequest, serve func() (int, any)) (int, any) {
-			if r.method == http.MethodPost && r.path == "transit/keys/app-a" {
+			if r.method == http.MethodGet && r.path == "transit/keys/app-a/metadata" {
 				once.Do(func() {
-					m.createKey("app-a")
 					m.write("app-a", addOp(attrEntry("x-tag"), encodeAttr(customAttr("x-tag", "blue"))))
 				})
 			}
@@ -3064,7 +3111,7 @@ func TestTranslator_CreateTemplateKeepsExistingKey(t *testing.T) {
 		before := map[string][]string{attrEntry("x-tag"): {encodeAttr(customAttr("x-tag", "blue"))}}
 
 		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, mask)
-		requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `key "app-a" already exists`)
+		requireReason(t, err, kmiplib.ResultReasonInvalidField, `key "app-a" already exists`)
 		require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a/soft-delete"))
 		require.False(t, m.key("app-a").SoftDeleted)
 		require.Equal(t, before, m.record("app-a"))
@@ -3174,9 +3221,10 @@ func TestTranslator_Revoke(t *testing.T) {
 	})
 }
 
-// Revoke writes the record first. Interrupted after it, the object already
-// reports the revoked State, and a retry finishes the soft-delete with the
-// first dates kept.
+// Revoke soft-deletes the key first, then writes the record. A failed
+// soft-delete changes nothing. A failed record write leaves the key
+// soft-deleted, so the object reports Deactivated, and a retry finishes the
+// Revoke.
 func TestTranslator_RevokeInterrupted(t *testing.T) {
 	isSoftDelete := func(r fakeRequest) bool {
 		return r.method == http.MethodDelete && r.path == "transit/keys/app-a/soft-delete"
@@ -3190,12 +3238,14 @@ func TestTranslator_RevokeInterrupted(t *testing.T) {
 		match  func(fakeRequest) bool
 		// after is the State between the failure and the retry.
 		after kmiplib.State
-		date  kmiplib.AttributeName
+		// done is the State after the retry, and date the date it sets.
+		done kmiplib.State
+		date kmiplib.AttributeName
 	}{
-		{"compromise, soft-delete fails", kmiplib.RevocationReasonCodeKeyCompromise, isSoftDelete, kmiplib.StateCompromised, kmiplib.AttributeNameCompromiseDate},
-		{"cessation, soft-delete fails", kmiplib.RevocationReasonCodeCessationOfOperation, isSoftDelete, kmiplib.StateDeactivated, kmiplib.AttributeNameDeactivationDate},
-		{"compromise, record write fails", kmiplib.RevocationReasonCodeKeyCompromise, isRecordWrite, kmiplib.StateActive, kmiplib.AttributeNameCompromiseDate},
-		{"cessation, record write fails", kmiplib.RevocationReasonCodeCessationOfOperation, isRecordWrite, kmiplib.StateActive, kmiplib.AttributeNameDeactivationDate},
+		{"compromise, soft-delete fails", kmiplib.RevocationReasonCodeKeyCompromise, isSoftDelete, kmiplib.StateActive, kmiplib.StateCompromised, kmiplib.AttributeNameCompromiseDate},
+		{"cessation, soft-delete fails", kmiplib.RevocationReasonCodeCessationOfOperation, isSoftDelete, kmiplib.StateActive, kmiplib.StateDeactivated, kmiplib.AttributeNameDeactivationDate},
+		{"compromise, record write fails", kmiplib.RevocationReasonCodeKeyCompromise, isRecordWrite, kmiplib.StateDeactivated, kmiplib.StateCompromised, kmiplib.AttributeNameCompromiseDate},
+		{"cessation, record write fails", kmiplib.RevocationReasonCodeCessationOfOperation, isRecordWrite, kmiplib.StateDeactivated, kmiplib.StateDeactivated, kmiplib.AttributeNameDeactivationDate},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bao, m := transitBao(t)
@@ -3207,23 +3257,56 @@ func TestTranslator_RevokeInterrupted(t *testing.T) {
 			m.failOnce(tc.match, false)
 			err = op(t, ctx).revoke(ctx, "app-a", reason, nil)
 			require.ErrorContains(t, err, "status 500")
-			require.False(t, m.key("app-a").SoftDeleted)
+			require.Equal(t, tc.after != kmiplib.StateActive, m.key("app-a").SoftDeleted)
 			require.Equal(t, tc.after, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+			require.Empty(t, m.record("app-a"))
 
-			var first time.Time
-			if tc.after != kmiplib.StateActive {
-				first = requireRecent(t, ctx, "app-a", tc.date)
-				time.Sleep(1100 * time.Millisecond)
-			}
 			require.NoError(t, op(t, ctx).revoke(ctx, "app-a", reason, nil))
 			require.True(t, m.key("app-a").SoftDeleted)
-			if tc.after != kmiplib.StateActive {
-				requireDate(t, ctx, "app-a", tc.date, first)
-			} else {
-				requireRecent(t, ctx, "app-a", tc.date)
-			}
+			require.Equal(t, tc.done, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+			requireRecent(t, ctx, "app-a", tc.date)
+			require.Equal(t, reason, attrOf(t, ctx, "app-a", kmiplib.AttributeNameRevocationReason))
 		})
 	}
+}
+
+// The delete capability on keys/<name>/soft-delete is the permission to
+// Revoke. Without it a Revoke changes nothing, in every State, whatever the
+// client may write to the record.
+func TestTranslator_RevokeDeniedChangesNothing(t *testing.T) {
+	keyCompromise := kmiplib.RevocationReason{RevocationReasonCode: kmiplib.RevocationReasonCodeKeyCompromise}
+	denied := respond(http.StatusForbidden, withErrors("permission denied"))
+
+	t.Run("active object", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+		require.NoError(t, err)
+		bao.route(http.MethodDelete, "transit/keys/app-a/soft-delete", denied)
+
+		err = op(t, ctx).revoke(ctx, "app-a", keyCompromise, nil)
+		requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `DELETE transit/keys/app-a/soft-delete requires the "delete" capability`)
+		require.Empty(t, bao.sent(http.MethodPost, "transit/keys/app-a/metadata"))
+		require.Empty(t, m.record("app-a"))
+		require.Equal(t, kmiplib.StateActive, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+	})
+
+	// The key is soft-deleted already, and the Revoke still asks for it: a
+	// client that may not revoke cannot mark a revoked object Compromised.
+	t.Run("deactivated object", func(t *testing.T) {
+		bao, m := transitBao(t)
+		ctx, _ := newTestSession(t, bao, Config{})
+		_, err := op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
+		require.NoError(t, err)
+		require.NoError(t, op(t, ctx).revoke(ctx, "app-a", unspecified, nil))
+		before := m.record("app-a")
+		bao.route(http.MethodDelete, "transit/keys/app-a/soft-delete", denied)
+
+		err = op(t, ctx).revoke(ctx, "app-a", keyCompromise, nil)
+		requireReason(t, err, kmiplib.ResultReasonPermissionDenied, `DELETE transit/keys/app-a/soft-delete requires the "delete" capability`)
+		require.Equal(t, before, m.record("app-a"))
+		require.Equal(t, kmiplib.StateDeactivated, attrOf(t, ctx, "app-a", kmiplib.AttributeNameState))
+	})
 }
 
 func TestTranslator_Destroy(t *testing.T) {
@@ -3251,9 +3334,9 @@ func TestTranslator_Destroy(t *testing.T) {
 	require.True(t, m.key("app-a").SoftDeleted)
 	require.Empty(t, bao.sent(http.MethodDelete, "transit/keys/app-a"))
 
-	// A second Destroy succeeds and writes nothing.
+	// A second Destroy is refused, as KMIP 1.4 requires, and writes nothing.
 	start = len(bao.all())
-	require.NoError(t, op(t, ctx).destroy(ctx, "app-a"))
+	requireReason(t, op(t, ctx).destroy(ctx, "app-a"), kmiplib.ResultReasonPermissionDenied, `wrong key lifecycle state: object "app-a" is Destroyed`)
 	require.Equal(t, []string{"GET transit/keys/app-a", "GET transit/keys/app-a/metadata"}, since(bao, start))
 	requireDate(t, ctx, "app-a", kmiplib.AttributeNameDestroyDate, destroyed)
 
@@ -3268,7 +3351,7 @@ func TestTranslator_Destroy(t *testing.T) {
 	requireReason(t, err, kmiplib.ResultReasonPermissionDenied, "is Destroyed")
 	// The key survives, so its Name is not free for a new Create.
 	_, err = op(t, ctx).create(ctx, "app-a", kmiplib.CryptographicAlgorithmAES, 256, nil)
-	requireReason(t, err, kmiplib.ResultReasonGeneralFailure, `key "app-a" already exists`)
+	requireReason(t, err, kmiplib.ResultReasonInvalidField, `key "app-a" already exists`)
 
 	// A Compromised object is refused by ReKey, and becomes Destroyed
 	// Compromised.

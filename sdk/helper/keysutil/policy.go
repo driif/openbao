@@ -644,10 +644,8 @@ func (p *Policy) LoadMetadata(ctx context.Context, storage logical.Storage) (*Me
 	if err := raw.DecodeJSON(&record); err != nil {
 		return nil, err
 	}
-	// Every record this code stores has version 1 or more. A record with
-	// version 0 was written in an earlier, never released shape and holds
-	// nothing this code reads, so it counts as absent: a cas of 0 can then
-	// replace it, instead of every check-and-set failing against it.
+	// A stored record has version 1 or more. Version 0 counts as absent, so
+	// that a cas of 0 can replace it.
 	if record.Version == 0 {
 		return nil, nil
 	}

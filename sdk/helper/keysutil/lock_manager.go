@@ -278,15 +278,13 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 		lm.cache.Store(name, keyData.Policy)
 	}
 
-	// Restore the metadata record last, once the policy is in place: a
-	// backup that Persist rejects then leaves the existing record alone. It
-	// follows the cache update on purpose: if this write fails, the cache and
-	// storage still agree on the key material, and only the record is
-	// missing. Do not wrap the restore in a transaction while the cache is
-	// updated here, before a commit: a rollback would leave the cache serving
-	// a key that storage no longer holds. A backup without a record leaves
-	// storage as it is, so a backup taken before metadata existed restores
-	// unchanged, and a restore under a new name writes nothing either.
+	// Restore the metadata record last, so that a backup that Persist
+	// rejects leaves the existing record alone. If this write fails, the
+	// cache and storage still agree on the key material and only the record
+	// is missing. Do not wrap the restore in a transaction while the cache
+	// is updated above: a rollback would leave the cache serving a key that
+	// storage no longer holds. A backup without a record, and a restore
+	// under a new name, write nothing.
 	if keyData.Metadata != nil && !renamed {
 		if err := keyData.Policy.StoreMetadata(ctx, storage, keyData.Metadata); err != nil {
 			return fmt.Errorf("failed to restore metadata for key %q: %w", name, err)

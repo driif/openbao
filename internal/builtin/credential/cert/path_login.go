@@ -178,7 +178,7 @@ func (b *backend) pathLogin(ctx context.Context, req *logical.Request, data *fra
 	// with sanitized oids (dash-separated instead of dot-separated) as keys.
 	maps.Copy(metadata, b.certificateExtensionsMetadata(clientCerts[0], matched))
 
-	// A kmip listener reads its routing for this client from the token.
+	// A kmip listener reads this client's settings from the token metadata.
 	if matched.Entry.KMIPTransitMount != "" {
 		metadata["kmip_transit_mount"] = matched.Entry.KMIPTransitMount
 	}

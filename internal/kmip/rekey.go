@@ -35,7 +35,7 @@ import (
 //     record: S may be committed and changed since. When S has no record
 //     and P's marker names it, adopt it: an earlier attempt created it and
 //     stopped. Any other S is a foreign key: fail and write nothing.
-//  4. Unless S has its record, write it in one request, each entry
+//  4. Unless S has its record, write it in one write, each entry
 //     replaced whole. The write changes nothing when another ReKey wrote
 //     the record after step 3.
 //  5. Clear P's marker.
@@ -256,8 +256,8 @@ func (c *call) repairSweptLink(ctx context.Context, uid string, pred *keyInfo) (
 }
 
 // writeSuccessorRecord writes the record of succ, the replacement of uid,
-// in one request. The first operation fails the request when succ already
-// has a record: no generation is 0, so the claim succeeds only on an absent
+// in one write. The first operation stops the write when succ already has
+// a record: no generation is 0, so the claim succeeds only on an absent
 // entry. When a concurrent ReKey wrote the record first, this one keeps
 // that record and the attributes added to it since.
 func (c *call) writeSuccessorRecord(ctx context.Context, uid, succ string, record map[string][]string) error {

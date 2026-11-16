@@ -302,7 +302,7 @@ func (l *handshakeListener) acceptLoop() {
 			continue
 		}
 		if !l.acquire() {
-			l.metrics.counter("connections_refused", metricsutil.Label{Name: "reason", Value: "limit"})
+			l.metrics.counter("connections_refused", reasonLabel("limit"))
 			_ = conn.Close()
 			continue
 		}
@@ -328,7 +328,7 @@ func (l *handshakeListener) handshake(conn net.Conn) {
 		cancel()
 		if err != nil {
 			if l.metrics != nil {
-				l.metrics.counter("connections_refused", metricsutil.Label{Name: "reason", Value: "handshake"})
+				l.metrics.counter("connections_refused", reasonLabel("handshake"))
 			}
 			_ = conn.Close()
 			return

@@ -142,8 +142,10 @@ func (c *wireConn) readFrame() error {
 	return nil
 }
 
-// refuse never passes a decoder error or an untrusted payload to the audit
-// formatter or the reply. Partially decoded messages retain operation IDs only.
+// refuse audits and answers a frame that kmip-go does not get. It drops
+// every payload and never passes a decoder error to the audit record or the
+// reply. A partially decoded message keeps only the Operation and the Unique
+// Batch Item ID of each item.
 func (c *wireConn) refuse(req *kmiplib.RequestMessage, reason kmiplib.ResultReason) {
 	if req == nil {
 		req = &kmiplib.RequestMessage{}

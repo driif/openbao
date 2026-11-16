@@ -59,7 +59,8 @@ type (
 
 // message accounts for every item, including header refusals and items skipped
 // by BatchExecutor after Stop. All request records must succeed before any item
-// executes. The item middleware supplies one collector per operation.
+// executes. Each record has its own request ID collector; the item
+// middleware runs the handler with it.
 func (a *operationAuditor) message(next kmipserver.Next, ctx context.Context, req *kmiplib.RequestMessage) (*kmiplib.ResponseMessage, error) {
 	empty := len(req.BatchItem) == 0
 	if empty {
@@ -232,7 +233,7 @@ func addIdentifiers(data map[string]any, payload kmiplib.OperationPayload) {
 				ids = append(ids, id)
 			}
 		case reflect.Slice:
-			if values, ok := f.Interface().([]string); ok {
+			if values, ok := reflect.TypeAssert[[]string](f); ok {
 				ids = append(ids, values...)
 			}
 		}

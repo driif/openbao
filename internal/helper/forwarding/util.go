@@ -22,7 +22,8 @@ const RequestIDMetadata = "openbao-internal-request-ids"
 
 type requestIDsKey struct{}
 
-// RequestIDs collects server-generated IDs, including calls that return errors.
+// RequestIDs collects the IDs of the requests that the server handles for
+// one caller, including requests that fail.
 type RequestIDs struct {
 	mu  sync.Mutex
 	ids []string

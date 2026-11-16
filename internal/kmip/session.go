@@ -146,9 +146,13 @@ func (s *session) loginLocked(ctx context.Context) error {
 		return err
 	}
 	if !rep.ok() || rep.Auth == nil || rep.Auth.ClientToken == "" {
-		reason := kmiplib.ResultReasonPermissionDenied
-		if rep.status >= http.StatusInternalServerError {
-			reason = kmiplib.ResultReasonGeneralFailure
+		// Only a refusal of the certificate is a denial. Any other status,
+		// such as a standby's redirect or a rate limit, is not about the
+		// client, and a client must not read it as final.
+		reason := kmiplib.ResultReasonGeneralFailure
+		switch rep.status {
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+			reason = kmiplib.ResultReasonPermissionDenied
 		}
 		return operationErrorf(reason, "login through %s failed", rep.path)
 	}

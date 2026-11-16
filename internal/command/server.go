@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -3136,6 +3137,17 @@ func (r *runningServers) close() error {
 // wrapping, so it is handled exactly like an HTTP client's request. Every
 // server is built before any starts, so on error none owns its listener.
 func startKMIPServers(c *ServerCommand, core *vault.Core, lns []listenerutil.Listener) ([]*kmip.Server, error) {
+	if len(lns) > 0 {
+		// kmip-go has no option to set a logger: a server keeps the slog
+		// default that is current when it is made. It reports each
+		// connection at Info and each client reset at Error, so its lines go
+		// to the kmip logger at Debug at most. The server's own logger then
+		// stays the slog default, for a handler panic, which kmip-go reports
+		// through slog directly.
+		slog.SetDefault(slog.New(kmip.SlogHandler(c.logger.Named("kmip"), hclog.Debug)))
+		defer slog.SetDefault(slog.New(kmip.SlogHandler(c.logger, hclog.Error)))
+	}
+
 	servers := make([]*kmip.Server, 0, len(lns))
 	for _, ln := range lns {
 		handlerConfig := *ln.Config
@@ -3333,8 +3345,8 @@ func (g *grpclogFaker) V(l int) bool {
 	return l >= currentLevel
 }
 
-// kmipCertificate reads the certificate served by the listener's reloadable
-// getter, including certificates refreshed by tls_auto_reload.
+// kmipCertificate returns a function that reads the certificate that the
+// listener serves, including certificates refreshed by tls_auto_reload.
 func kmipCertificate(cfg *configutil.Listener) func() *x509.Certificate {
 	getter, ok := cfg.TLSCertGetter.(listenerutil.ReloadableCertGetter)
 	if !ok {

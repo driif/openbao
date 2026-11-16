@@ -146,9 +146,10 @@ type Listener struct {
 	SocketUser  string `hcl:"socket_user"`
 	SocketGroup string `hcl:"socket_group"`
 
-	// AuthMount and DefaultTransitMount configure a kmip listener: the
-	// namespace-qualified cert auth mount KMIP clients log in through, and
-	// the transit mount for clients whose cert role names none.
+	// These settings are valid on a kmip listener only. AuthMount is the
+	// namespace-qualified cert auth mount that KMIP clients log in through.
+	// DefaultTransitMount is the transit mount for clients whose cert role
+	// names none.
 	AuthMount           string        `hcl:"auth_mount"`
 	DefaultTransitMount string        `hcl:"default_transit_mount"`
 	MaxConnections      int           `hcl:"-"`

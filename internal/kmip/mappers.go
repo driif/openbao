@@ -58,8 +58,8 @@ func transitKeyType(alg kmiplib.CryptographicAlgorithm, bitlen int32) (keyType s
 		kmiplib.CryptographicAlgorithmHMACSHA256,
 		kmiplib.CryptographicAlgorithmHMACSHA384,
 		kmiplib.CryptographicAlgorithmHMACSHA512:
-		// transit HMAC accepts 256..4096 bits
-		// see keysutil.HmacMinKeySize and keysutil.HmacMaxKeySize
+		// Transit HMAC keys are 256 to 4096 bits: keysutil.HmacMinKeySize
+		// and keysutil.HmacMaxKeySize.
 		if bitlen >= 256 && bitlen <= 4096 && bitlen%8 == 0 {
 			return "hmac", int(bitlen / 8), nil
 		}
@@ -156,12 +156,10 @@ func (k *keyInfo) kmipAttrs() (kmiplib.CryptographicAlgorithm, int32, kmiplib.Ob
 // Destroyed, or Destroyed Compromised with the compromise mark too; the
 // compromise mark gives Compromised; a key that is soft-deleted, replaced by
 // ReKey, or past a stored Deactivation Date is Deactivated; a key before a
-// stored Activation Date is Pre-Active; any other key is Active. A key is
-// Active from the moment transit creates it unless the client stored a
-// later Activation Date. A replaced key keeps its material until retention
-// soft-deletes it. The dates change only the reported State: no
-// cryptographic operation reads them. A stored date that does not decode
-// counts as absent; checkedState reports it.
+// stored Activation Date is Pre-Active; any other key is Active. The dates
+// change only the reported State: no cryptographic operation reads them. A
+// stored date that does not decode counts as absent; checkedState reports
+// it.
 func (k *keyInfo) state() kmiplib.State {
 	state, _ := k.checkedState()
 	return state
@@ -313,6 +311,19 @@ func (k *keyInfo) publicKey(alg kmiplib.CryptographicAlgorithm, bitlen int32) (k
 			CryptographicLength:    bitlen,
 		},
 	}, nil
+}
+
+// keyFormat returns the Key Format Type of an object that Get returns.
+func keyFormat(obj kmiplib.Object) kmiplib.KeyFormatType {
+	switch o := obj.(type) {
+	case *kmiplib.SymmetricKey:
+		return o.KeyBlock.KeyFormatType
+	case *kmiplib.PrivateKey:
+		return o.KeyBlock.KeyFormatType
+	case *kmiplib.PublicKey:
+		return o.KeyBlock.KeyFormatType
+	}
+	return 0
 }
 
 // kmipObject wraps exported key material: raw bytes for symmetric keys,

@@ -177,11 +177,11 @@ func (b *backend) getPolicy(ctx context.Context, polReq keysutil.PolicyRequest, 
 	} else {
 		b.configMutex.RUnlock()
 	}
-	p, _, err := b.lm.GetPolicyWithLockType(ctx, polReq, rand, exclusive)
+	p, upserted, err := b.lm.GetPolicyWithLockType(ctx, polReq, rand, exclusive)
 	if err != nil {
 		return p, false, err
 	}
-	return p, true, nil
+	return p, upserted, nil
 }
 
 func (b *backend) invalidate(ctx context.Context, key string) {

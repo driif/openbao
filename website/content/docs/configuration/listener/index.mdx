@@ -8,12 +8,14 @@ description: |-
 # `listener` stanza
 
 The `listener` stanza configures the addresses and ports on which OpenBao will
-respond to requests. At this time, there are two listeners:
+respond to requests. At this time, there are three listeners:
 - [TCP][tcp]
 - [Unix Domain Socket][unix]
+- [KMIP][kmip], which serves the KMIP protocol instead of the HTTP API
 
 There is a [shared config][shared] that is common to all listeners.
 
 [tcp]: tcp.mdx
 [unix]: unix.mdx
+[kmip]: kmip.mdx
 [shared]: shared.mdx

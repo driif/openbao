@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"path"
 	"sync"
 	"time"
 
@@ -149,6 +151,11 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 		return err
 	}
 
+	// The metadata record describes the key it was backed up from, including
+	// its relations to other keys by name. Under a new name it would describe
+	// the wrong key, so a rename restores without it.
+	renamed := name != "" && name != keyData.Policy.Name
+
 	// Set a different name if desired
 	if name != "" {
 		keyData.Policy.Name = name
@@ -218,6 +225,21 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 		defer p.l.Unlock()
 	}
 
+	if keyData.Metadata != nil && !renamed {
+		existing, err := keyData.Policy.LoadMetadata(ctx, storage)
+		if err != nil {
+			return err
+		}
+		version := keyData.Metadata.Version
+		if existing != nil {
+			version = max(version, existing.Version)
+		}
+		if version == math.MaxUint64 {
+			return errors.New("metadata version overflow")
+		}
+		keyData.Metadata.Version = version + 1
+	}
+
 	// Restore the archived keys
 	if keyData.ArchivedKeys != nil {
 		err = keyData.Policy.storeArchive(ctx, storage, keyData.ArchivedKeys)
@@ -238,11 +260,35 @@ func (lm *LockManager) RestorePolicy(ctx context.Context, storage logical.Storag
 		return fmt.Errorf("failed to restore the policy %q: %w", name, err)
 	}
 
-	keyData.Policy.l = new(sync.RWMutex)
+	if p != nil {
+		// Keep the replaced policy's mutex. A writer can still hold the old
+		// policy object from the cache; with a fresh mutex it and a writer on
+		// the restored object would run at once, and two metadata writes
+		// could both pass the same check-and-set. The mutex is already held
+		// above, and the deferred unlock there releases it.
+		keyData.Policy.l = p.l
+	} else {
+		keyData.Policy.l = new(sync.RWMutex)
+		keyData.Policy.l.Lock()
+		defer keyData.Policy.l.Unlock()
+	}
 
 	// Update the cache to contain the restored policy
 	if lm.useCache {
 		lm.cache.Store(name, keyData.Policy)
+	}
+
+	// Restore the metadata record last, so that a backup that Persist
+	// rejects leaves the existing record alone. If this write fails, the
+	// cache and storage still agree on the key material and only the record
+	// is missing. Do not wrap the restore in a transaction while the cache
+	// is updated above: a rollback would leave the cache serving a key that
+	// storage no longer holds. A backup without a record, and a restore
+	// under a new name, write nothing.
+	if keyData.Metadata != nil && !renamed {
+		if err := keyData.Policy.StoreMetadata(ctx, storage, keyData.Metadata); err != nil {
+			return fmt.Errorf("failed to restore metadata for key %q: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -590,6 +636,11 @@ func (lm *LockManager) DeletePolicy(ctx context.Context, storage logical.Storage
 	err = storage.Delete(ctx, "archive/"+name)
 	if err != nil {
 		return fmt.Errorf("error deleting key %q archive: %w", name, err)
+	}
+
+	err = storage.Delete(ctx, path.Join(p.StoragePrefix, "metadata", name))
+	if err != nil {
+		return fmt.Errorf("error deleting key %q metadata: %w", name, err)
 	}
 
 	return nil

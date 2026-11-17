@@ -484,3 +484,23 @@ func TestCreateDerivedKey(t *testing.T) {
 		require.Nil(t, resp, algo)
 	}
 }
+
+// A create of a key that exists returns that key with a warning. A caller
+// that must make a new key, such as the KMIP listener, relies on it.
+func TestTransit_CreateExistingKeyWarns(t *testing.T) {
+	b, storage := createBackendWithStorage(t)
+	req := &logical.Request{
+		Storage:   storage,
+		Operation: logical.UpdateOperation,
+		Path:      "keys/dup",
+		Data:      map[string]any{"type": "aes256-gcm96"},
+	}
+
+	resp, err := b.HandleRequest(t.Context(), req)
+	require.NoError(t, err)
+	require.Empty(t, resp.Warnings)
+
+	resp, err = b.HandleRequest(t.Context(), req)
+	require.NoError(t, err)
+	require.Equal(t, []string{"key dup already existed"}, resp.Warnings)
+}

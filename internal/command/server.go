@@ -5,10 +5,13 @@ package command
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -55,6 +58,7 @@ import (
 	"github.com/openbao/openbao/v2/internal/helper/testhelpers/teststorage"
 	"github.com/openbao/openbao/v2/internal/helper/useragent"
 	vaulthttp "github.com/openbao/openbao/v2/internal/http"
+	"github.com/openbao/openbao/v2/internal/kmip"
 	sr "github.com/openbao/openbao/v2/internal/serviceregistration"
 	"github.com/openbao/openbao/v2/internal/vault"
 	vaultseal "github.com/openbao/openbao/v2/internal/vault/seal"
@@ -108,6 +112,7 @@ type ServerCommand struct {
 	reloadFuncs     *map[string][]reloadutil.ReloadFunc
 	startedCh       chan (struct{}) // for tests
 	reloadedCh      chan (struct{}) // for tests
+	kmipServers     map[string]*kmip.Server
 
 	allLoggers []hclog.Logger
 
@@ -543,6 +548,13 @@ func (c *ServerCommand) runRecoveryMode() int {
 	// Initialize the listeners
 	lns := make([]listenerutil.Listener, 0, len(config.Listeners))
 	for _, lnConfig := range config.Listeners {
+		// Recovery mode serves only sys/raw and recovery tokens, so KMIP
+		// has nothing to talk to.
+		if lnConfig.Type == "kmip" {
+			c.UI.Warn(fmt.Sprintf("WARNING! Not starting the kmip listener on %q: KMIP is not served in recovery mode.", lnConfig.Address))
+			continue
+		}
+
 		ln, _, _, err := server.NewListener(lnConfig, c.logger, c.UI)
 		if err != nil {
 			c.UI.Error(fmt.Sprintf("Error initializing listener of type %s: %s", lnConfig.Type, err))
@@ -556,19 +568,10 @@ func (c *ServerCommand) runRecoveryMode() int {
 	}
 
 	// Make sure we close all HTTP servers and listeners from this point on.
-	var servers []*http.Server
+	running := &runningServers{unserved: lns}
 	listenerCloseFunc := func() {
-		var errs error
-		for _, srv := range servers {
-			errs = errors.Join(srv.Close())
-		}
-		// Closing an HTTP server will close the underlying listener, so avoid
-		// double-closing it.
-		for _, ln := range lns[len(servers):] {
-			errs = errors.Join(errs, ln.Close())
-		}
-		if errs != nil {
-			c.UI.Error(fmt.Sprintf("Error closing listeners: %v", errs))
+		if err := running.close(); err != nil {
+			c.UI.Error(fmt.Sprintf("Error closing listeners: %v", err))
 		}
 	}
 
@@ -638,8 +641,9 @@ func (c *ServerCommand) runRecoveryMode() int {
 			}
 		}(ln.Listener)
 
-		servers = append(servers, server)
+		running.http = append(running.http, server)
 	}
+	running.unserved = nil
 
 	if newCoreError != nil {
 		c.UI.Warn(wrapAtLength(
@@ -819,6 +823,11 @@ func (c *ServerCommand) InitListeners(logger hclog.Logger, config *server.Config
 
 		if lnConfig.MaxRequestSize == 0 {
 			lnConfig.MaxRequestSize = vaulthttp.DefaultMaxRequestSize
+			// On a kmip listener the setting bounds KMIP frames, and reload
+			// applies the same default.
+			if lnConfig.Type == "kmip" {
+				lnConfig.MaxRequestSize = kmip.DefaultMaxMessageSize
+			}
 		}
 		props["max_request_size"] = fmt.Sprintf("%d", lnConfig.MaxRequestSize)
 
@@ -1250,20 +1259,11 @@ func (c *ServerCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Make sure we close all HTTP servers and listeners from this point on.
-	var servers []*http.Server
+	// Make sure we close all servers and listeners from this point on.
+	running := &runningServers{unserved: lns}
 	listenerCloseFunc := func() {
-		var errs error
-		for _, srv := range servers {
-			errs = errors.Join(srv.Close())
-		}
-		// Closing an HTTP server will close the underlying listener, so avoid
-		// double-closing it.
-		for _, ln := range lns[len(servers):] {
-			errs = errors.Join(errs, ln.Close())
-		}
-		if errs != nil {
-			c.UI.Error(fmt.Sprintf("Error closing listeners: %v", errs))
+		if err := running.close(); err != nil {
+			c.UI.Error(fmt.Sprintf("Error closing listeners: %v", err))
 		}
 	}
 
@@ -1372,9 +1372,8 @@ func (c *ServerCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Initialize the HTTP servers
-	servers, err = startHttpServers(c, core, config, lns)
-	if err != nil {
+	// Initialize the HTTP and KMIP servers
+	if err = running.start(c, core, config); err != nil {
 		c.UI.Error(err.Error())
 		return 1
 	}
@@ -2387,6 +2386,10 @@ func (c *ServerCommand) Reload(lock *sync.RWMutex, reloadFuncs *map[string][]rel
 		}
 	}
 
+	if err := c.reloadKMIPServers(configPath); err != nil {
+		reloadErrors = multierror.Append(reloadErrors, err)
+	}
+
 	// Set Introspection Endpoint to enabled with new value in the config after reload
 	core.ReloadIntrospectionEndpointEnabled()
 
@@ -3072,6 +3075,120 @@ func startHttpServers(c *ServerCommand, core *vault.Core, config *server.Config,
 	return servers, nil
 }
 
+// kmipShutdownTimeout bounds stopping the KMIP servers, which waits for their
+// connections to revoke their tokens.
+const kmipShutdownTimeout = 10 * time.Second
+
+// runningServers records who closes each listener: a server closes the
+// listener it serves, and close closes the ones no server has taken over.
+type runningServers struct {
+	http     []*http.Server
+	kmip     []*kmip.Server
+	unserved []listenerutil.Listener
+}
+
+// start serves HTTP on every listener but the kmip ones, which serve KMIP.
+func (r *runningServers) start(c *ServerCommand, core *vault.Core, config *server.Config) error {
+	var httpLns, kmipLns []listenerutil.Listener
+	for _, ln := range r.unserved {
+		if ln.Config != nil && ln.Config.Type == "kmip" {
+			kmipLns = append(kmipLns, ln)
+		} else {
+			httpLns = append(httpLns, ln)
+		}
+	}
+
+	servers, err := startHttpServers(c, core, config, httpLns)
+	if err != nil || c.flagTestServerConfig {
+		// Server config tests stop before anything serves.
+		return err
+	}
+	r.http, r.unserved = servers, kmipLns
+
+	kmipServers, err := startKMIPServers(c, core, kmipLns)
+	if err != nil {
+		return err
+	}
+	r.kmip, r.unserved = kmipServers, nil
+	return nil
+}
+
+// close stops the KMIP servers first: a closing KMIP connection revokes its
+// token, which needs the core still unsealed.
+func (r *runningServers) close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), kmipShutdownTimeout)
+	defer cancel()
+
+	var errs error
+	for _, srv := range r.kmip {
+		errs = errors.Join(errs, srv.Shutdown(ctx))
+	}
+	for _, srv := range r.http {
+		errs = errors.Join(errs, srv.Close())
+	}
+	for _, ln := range r.unserved {
+		errs = errors.Join(errs, ln.Close())
+	}
+	return errs
+}
+
+// startKMIPServers serves KMIP on each kmip listener. Each operation becomes
+// requests to the listener's own HTTP handler, without the HTTP server
+// wrapping, so it is handled exactly like an HTTP client's request. Every
+// server is built before any starts, so on error none owns its listener.
+func startKMIPServers(c *ServerCommand, core *vault.Core, lns []listenerutil.Listener) ([]*kmip.Server, error) {
+	if len(lns) > 0 {
+		// kmip-go has no option to set a logger: a server keeps the slog
+		// default that is current when it is made. It reports each
+		// connection at Info and each client reset at Error, so its lines go
+		// to the kmip logger at Debug at most. The server's own logger then
+		// stays the slog default, for a handler panic, which kmip-go reports
+		// through slog directly.
+		slog.SetDefault(slog.New(kmip.SlogHandler(c.logger.Named("kmip"), hclog.Debug)))
+		defer slog.SetDefault(slog.New(kmip.SlogHandler(c.logger, hclog.Error)))
+	}
+
+	servers := make([]*kmip.Server, 0, len(lns))
+	for _, ln := range lns {
+		handlerConfig := *ln.Config
+		// The wire adapter bounds the frame before decoding. JSON expansion
+		// must not impose a second, smaller limit on synthetic requests.
+		handlerConfig.MaxRequestSize = -1
+		handler := vaulthttp.Handler.Handler(&vault.HandlerProperties{
+			Core:           core,
+			ListenerConfig: &handlerConfig,
+		})
+		srv, err := kmip.NewServer(ln.Listener, handler, kmip.Config{
+			AuthMount:           ln.Config.AuthMount,
+			DefaultTransitMount: ln.Config.DefaultTransitMount,
+			Logger:              c.logger.Named("kmip"),
+			Auditor:             core,
+			Metrics:             core.MetricSink(),
+			MaxConnections:      ln.Config.MaxConnections,
+			IdleTimeout:         ln.Config.IdleTimeout,
+			MaxMessageSize:      ln.Config.MaxRequestSize,
+			ServerCertificate:   kmipCertificate(ln.Config),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("error initializing kmip listener on %s: %w", ln.Addr(), err)
+		}
+		servers = append(servers, srv)
+	}
+
+	if c.kmipServers == nil {
+		c.kmipServers = make(map[string]*kmip.Server)
+	}
+	for i, srv := range servers {
+		c.kmipServers[lns[i].Config.Address] = srv
+		go func() {
+			if err := srv.Serve(); err != nil {
+				c.UI.Error(fmt.Sprintf("KMIP server (listening on %s) exited with error: %v", srv.Addr(), err))
+			}
+		}()
+	}
+	return servers, nil
+}
+
 // formatPropts returns a formatted info key/value such as:
 // Listener 1: tcp (addr: "127.0.0.1:8200", cluster address: "127.0.0.1:8201", ...)
 func formatProps(title string, m map[string]string) string {
@@ -3226,4 +3343,59 @@ func (g *grpclogFaker) Fatalln(args ...any) {
 func (g *grpclogFaker) V(l int) bool {
 	currentLevel := int(g.logger.GetLevel())
 	return l >= currentLevel
+}
+
+// kmipCertificate returns a function that reads the certificate that the
+// listener serves, including certificates refreshed by tls_auto_reload.
+func kmipCertificate(cfg *configutil.Listener) func() *x509.Certificate {
+	getter, ok := cfg.TLSCertGetter.(listenerutil.ReloadableCertGetter)
+	if !ok {
+		return nil
+	}
+	return func() *x509.Certificate {
+		cert, err := getter.GetCertificate(&tls.ClientHelloInfo{})
+		if err != nil || cert == nil || len(cert.Certificate) == 0 {
+			return nil
+		}
+		if cert.Leaf != nil {
+			return cert.Leaf
+		}
+		leaf, _ := x509.ParseCertificate(cert.Certificate[0])
+		return leaf
+	}
+}
+
+func (c *ServerCommand) reloadKMIPServers(paths []string) error {
+	if len(c.kmipServers) == 0 {
+		return nil
+	}
+	var config *server.Config
+	for _, path := range paths {
+		current, err := server.LoadConfig(path, paths)
+		if err != nil {
+			return fmt.Errorf("error reloading KMIP limits: %w", err)
+		}
+		if current == nil {
+			continue
+		}
+		if config == nil {
+			config = current
+		} else {
+			config = config.Merge(current)
+		}
+	}
+	if config == nil {
+		return nil
+	}
+	for _, ln := range config.Listeners {
+		if ln.Type != "kmip" {
+			continue
+		}
+		if srv := c.kmipServers[ln.Address]; srv != nil {
+			if err := srv.Reload(kmip.Config{MaxConnections: ln.MaxConnections, IdleTimeout: ln.IdleTimeout, MaxMessageSize: ln.MaxRequestSize}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

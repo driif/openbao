@@ -146,6 +146,17 @@ type Listener struct {
 	SocketUser  string `hcl:"socket_user"`
 	SocketGroup string `hcl:"socket_group"`
 
+	// These settings are valid on a kmip listener only. AuthMount is the
+	// namespace-qualified cert auth mount that KMIP clients log in through.
+	// DefaultTransitMount is the transit mount for clients whose cert role
+	// names none.
+	AuthMount           string        `hcl:"auth_mount"`
+	DefaultTransitMount string        `hcl:"default_transit_mount"`
+	MaxConnections      int           `hcl:"-"`
+	MaxConnectionsRaw   any           `hcl:"max_connections"`
+	IdleTimeout         time.Duration `hcl:"-"`
+	IdleTimeoutRaw      any           `hcl:"idle_timeout"`
+
 	AgentAPI *AgentAPI `hcl:"agent_api"`
 
 	ProxyAPI *ProxyAPI `hcl:"proxy_api"`
@@ -270,7 +281,7 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 
 			l.Type = strings.ToLower(l.Type)
 			switch l.Type {
-			case "tcp", "unix":
+			case "tcp", "unix", "kmip":
 				result.found(l.Type, l.Type)
 			default:
 				return multierror.Prefix(fmt.Errorf("unsupported listener type %q", l.Type), fmt.Sprintf("listeners.%d:", i))
@@ -672,10 +683,84 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 			}
 		}
 
+		if err := validateKMIPListener(&l); err != nil {
+			return multierror.Prefix(err, fmt.Sprintf("listeners.%d", i))
+		}
+
 		result.Listeners = append(result.Listeners, &l)
 	}
 
 	return nil
+}
+
+// validateKMIPListener checks the kmip-only settings, and that a kmip
+// listener has what KMIP needs: TLS with verified client certificates and
+// none of the HTTP listener's clustering or ACME.
+func validateKMIPListener(l *Listener) error {
+	if l.Type != "kmip" {
+		if l.AuthMount != "" || l.DefaultTransitMount != "" || l.MaxConnectionsRaw != nil || l.IdleTimeoutRaw != nil || l.MaxConnections != 0 || l.IdleTimeout != 0 {
+			return errors.New("auth_mount, default_transit_mount, max_connections and idle_timeout are only valid on kmip listeners")
+		}
+		return nil
+	}
+
+	if l.MaxConnectionsRaw != nil {
+		n, err := parseutil.ParseInt(l.MaxConnectionsRaw)
+		if err != nil {
+			return fmt.Errorf("error parsing max_connections: %w", err)
+		}
+		l.MaxConnections = int(n)
+		l.MaxConnectionsRaw = nil
+	}
+	if l.IdleTimeoutRaw != nil {
+		d, err := parseutil.ParseDurationSecond(l.IdleTimeoutRaw)
+		if err != nil {
+			return fmt.Errorf("error parsing idle_timeout: %w", err)
+		}
+		l.IdleTimeout = d
+		l.IdleTimeoutRaw = nil
+	}
+	if l.MaxConnections < 0 || l.IdleTimeout < 0 || l.MaxRequestSize < 0 {
+		return errors.New("kmip max_connections, idle_timeout and max_request_size cannot be negative")
+	}
+	if l.MaxConnections == 0 {
+		l.MaxConnections = 1024
+	}
+	if l.IdleTimeout == 0 {
+		l.IdleTimeout = 10 * time.Minute
+	}
+	l.AuthMount = strings.Trim(l.AuthMount, "/")
+	l.DefaultTransitMount = strings.Trim(l.DefaultTransitMount, "/")
+	segments := strings.Split(l.AuthMount, "/")
+	authAt := slices.Index(segments, "auth")
+
+	switch {
+	case l.AuthMount == "":
+		return errors.New("kmip listener requires auth_mount")
+	case authAt < 0 || authAt == len(segments)-1:
+		return fmt.Errorf("auth_mount %q must name a mount under auth/, such as auth/cert or ns1/auth/cert", l.AuthMount)
+	case l.TLSDisable:
+		return errors.New("kmip listener cannot set tls_disable")
+	case l.TLSDisableClientCerts:
+		return errors.New("kmip listener cannot set tls_disable_client_certs: KMIP clients authenticate with certificates")
+	case l.TLSCertFile == "" || l.TLSKeyFile == "":
+		// Without a certificate file the TCP listener falls back to ACME.
+		return errors.New("kmip listener requires tls_cert_file and tls_key_file")
+	case l.TLSClientCAFile == "":
+		return errors.New("kmip listener requires tls_client_ca_file")
+	case l.ClusterAddress != "":
+		return errors.New("kmip listener cannot set cluster_address")
+	case l.usesACME():
+		return errors.New("kmip listener cannot use tls_acme_* settings")
+	}
+	return nil
+}
+
+func (l *Listener) usesACME() bool {
+	return l.TLSACMECachePath != "" || l.TLSACMECADirectory != "" || l.TLSACMETestCADirectory != "" ||
+		l.TLSACMECARoot != "" || l.TLSACMEEABKeyId != "" || l.TLSACMEEABMacKey != "" ||
+		l.TLSACMEKeyType != "" || l.TLSACMEEmail != "" || len(l.TLSACMEDomains) > 0 ||
+		l.TLSACMEDisableHttpChallenge || l.TLSACMEDisableAlpnChallenge
 }
 
 // ParseSingleIPTemplate is used as a helper function to parse out a single IP

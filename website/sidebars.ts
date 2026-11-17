@@ -128,6 +128,7 @@ const sidebars: SidebarsConfig = {
                         "configuration/listener/shared",
                         "configuration/listener/unix",
                         "configuration/listener/tcp",
+                        "configuration/listener/kmip",
                     ],
                     seal: [
                         "configuration/seal/index",

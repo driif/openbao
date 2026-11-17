@@ -290,6 +290,9 @@ func (kt KeyType) MLDSAParams() mldsa.Parameters {
 type KeyData struct {
 	Policy       *Policy       `json:"policy"`
 	ArchivedKeys *archivedKeys `json:"archived_keys"`
+	// Metadata is the key's metadata record, absent when the key has none
+	// and in backups taken before metadata existed.
+	Metadata *MetadataRecord `json:"metadata,omitempty"`
 }
 
 // KeyEntry stores the key and metadata
@@ -621,6 +624,59 @@ func (p *Policy) storeArchive(ctx context.Context, storage logical.Storage, arch
 	}
 
 	return nil
+}
+
+// MetadataRecord holds a key's custom metadata and its write version.
+// An absent record differs from a present record with empty Data.
+type MetadataRecord struct {
+	Version uint64            `json:"version"`
+	Data    map[string]string `json:"data"`
+}
+
+// LoadMetadata returns the record stored beside the policy and archive,
+// or nil when absent. It is never cached or loaded with the policy.
+func (p *Policy) LoadMetadata(ctx context.Context, storage logical.Storage) (*MetadataRecord, error) {
+	raw, err := storage.Get(ctx, path.Join(p.StoragePrefix, "metadata", p.Name))
+	if err != nil || raw == nil {
+		return nil, err
+	}
+	var record MetadataRecord
+	if err := raw.DecodeJSON(&record); err != nil {
+		return nil, err
+	}
+	// A stored record has version 1 or more. Version 0 counts as absent, so
+	// that a cas of 0 can replace it.
+	if record.Version == 0 {
+		return nil, nil
+	}
+	if record.Data == nil {
+		record.Data = map[string]string{}
+	}
+	return &record, nil
+}
+
+// StoreMetadata writes the record, including empty Data and its version.
+// The caller must hold the policy's exclusive lock. Deleting a key and
+// creating it again with the same name starts its metadata version at 0.
+func (p *Policy) StoreMetadata(ctx context.Context, storage logical.Storage, record *MetadataRecord) error {
+	// A caller can hold a policy that a delete finished with while it waited
+	// for the lock. A key created since under the same name has its own
+	// record, which this write would replace.
+	if p.deleted.Load() {
+		return errors.New("key has been deleted, not storing metadata")
+	}
+	if record == nil {
+		return errors.New("metadata record must not be nil")
+	}
+	stored := *record
+	if stored.Data == nil {
+		stored.Data = map[string]string{}
+	}
+	entry, err := logical.StorageEntryJSON(path.Join(p.StoragePrefix, "metadata", p.Name), &stored)
+	if err != nil {
+		return err
+	}
+	return storage.Put(ctx, entry)
 }
 
 // handleArchiving manages the movement of keys to and from the policy archive.
@@ -2161,9 +2217,15 @@ func (p *Policy) Backup(ctx context.Context, storage logical.Storage) (out strin
 		return "", err
 	}
 
+	metadata, err := p.LoadMetadata(ctx, storage)
+	if err != nil {
+		return "", err
+	}
+
 	keyData := &KeyData{
 		Policy:       p,
 		ArchivedKeys: archivedKeys,
+		Metadata:     metadata,
 	}
 
 	encodedBackup, err := jsonutil.EncodeJSON(keyData)

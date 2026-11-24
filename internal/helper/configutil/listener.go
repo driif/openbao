@@ -179,6 +179,13 @@ type Listener struct {
 	// `disable_unauthed_generate_root_endpoints` value has to be set to false.
 	DisableUnauthedGenerateRootEndpoints    *bool `hcl:"-"`
 	DisableUnauthedGenerateRootEndpointsRaw any   `hcl:"disable_unauthed_generate_root_endpoints"`
+
+	// Settings for listeners of type "kmip", which serve KMIP 1.0-1.4
+	// (TTLV over mutual TLS) backed by a Transit mount.
+	KMIPTransitMount string `hcl:"kmip_transit_mount"`
+	KMIPAuthMount    string `hcl:"kmip_auth_mount"`
+	KMIPAuthRole     string `hcl:"kmip_auth_role"`
+	KMIPNamespace    string `hcl:"kmip_namespace"`
 }
 
 // AgentAPI allows users to select which parts of the Agent API they want enabled.
@@ -238,7 +245,7 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 
 			l.Type = strings.ToLower(l.Type)
 			switch l.Type {
-			case "tcp", "unix":
+			case "tcp", "unix", "kmip":
 				result.found(l.Type, l.Type)
 			default:
 				return multierror.Prefix(fmt.Errorf("unsupported listener type %q", l.Type), fmt.Sprintf("listeners.%d:", i))
@@ -625,6 +632,26 @@ func ParseListeners(result *SharedConfig, list *ast.ObjectList) error {
 			case "RFC9440", "URL", "PEM":
 			default:
 				return multierror.Prefix(fmt.Errorf("invalid value for x_forwarded_for_client_cert_decoders: %v", decoder), fmt.Sprintf("listeners.%d", i))
+			}
+		}
+
+		// KMIP Parameters validation
+		{
+			l.Type = strings.ToLower(l.Type)
+			if l.Type == "kmip" {
+				if l.TLSDisableRaw != nil {
+					if disable, err := parseutil.ParseBool(l.TLSDisableRaw); err != nil || disable {
+						return multierror.Prefix(errors.New("kmip listeners require TLS; tls_disable is not allowed"), fmt.Sprintf("listeners.%d:", i))
+					}
+				}
+				if l.TLSDisableClientCertsRaw != nil {
+					if disable, err := parseutil.ParseBool(l.TLSDisableClientCertsRaw); err != nil || disable {
+						return multierror.Prefix(errors.New("kmip listeners authenticate with client certificates; tls_disable_client_certs is not allowed"), fmt.Sprintf("listeners.%d:", i))
+					}
+				}
+				if l.ClusterAddress != "" {
+					return multierror.Prefix(errors.New("cluster_address is not supported on kmip listeners"), fmt.Sprintf("listeners.%d:", i))
+				}
 			}
 		}
 
